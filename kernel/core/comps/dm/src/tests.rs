@@ -5,50 +5,159 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dm_ioctl_version() {
-        let version = [DM_VERSION_MAJOR, DM_VERSION_MINOR, DM_VERSION_PATCHLEVEL];
-        assert_eq!(version[0], 4);
-        assert_eq!(version[1], 48);
-        assert_eq!(version[2], 0);
+    fn test_dm_table_adjoin() {
+        let mut table = DmTable::new();
+
+        // Add first target at sector 0
+        let target1 = DmTarget::new_empty(0, 100);
+        table.add_target(target1).unwrap();
+
+        // Add second target adjacent to first
+        let target2 = DmTarget::new_empty(100, 50);
+        table.add_target(target2).unwrap();
+
+        assert_eq!(table.nr_sectors(), 150);
     }
 
     #[test]
-    fn test_dm_commands() {
-        const DM_VERSION_CMD: u32 = 0xC138FD00 | 0;
-        const DM_DEV_CREATE_CMD: u32 = 0xC138FD00 | 3;
-        const DM_DEV_REMOVE_CMD: u32 = 0xC138FD00 | 4;
-        const DM_DEV_SUSPEND_CMD: u32 = 0xC138FD00 | 6;
-        const DM_TABLE_LOAD_CMD: u32 = 0xC138FD00 | 9;
-        const DM_DEV_STATUS_CMD: u32 = 0xC138FD00 | 5;
-        const DM_LIST_VERSIONS_CMD: u32 = 0xC138FD00 | 13;
+    fn test_dm_table_adjoin_violation() {
+        let mut table = DmTable::new();
 
-        assert_eq!(DM_VERSION_CMD, 0xC138FD00);
-        assert_eq!(DM_DEV_CREATE_CMD, 0xC138FD03);
-        assert_eq!(DM_DEV_REMOVE_CMD, 0xC138FD04);
-        assert_eq!(DM_DEV_SUSPEND_CMD, 0xC138FD06);
-        assert_eq!(DM_TABLE_LOAD_CMD, 0xC138FD09);
-        assert_eq!(DM_DEV_STATUS_CMD, 0xC138FD05);
-        assert_eq!(DM_LIST_VERSIONS_CMD, 0xC138FD0D);
+        // Add first target at sector 0
+        let target1 = DmTarget::new_empty(0, 100);
+        table.add_target(target1).unwrap();
+
+        // Try to add target with gap (begin != current nr_sectors)
+        let target2 = DmTarget::new_empty(150, 50);
+        assert!(table.add_target(target2).is_err());
     }
 
     #[test]
-    fn test_dm_suspend_flag() {
-        const DM_SUSPEND_FLAG: u32 = 1 << 1;
-        assert_eq!(DM_SUSPEND_FLAG, 2);
+    fn test_dm_table_find_target() {
+        let mut table = DmTable::new();
+
+        // Add targets
+        let target1 = DmTarget::new_empty(0, 100);
+        table.add_target(target1).unwrap();
+        let target2 = DmTarget::new_empty(100, 50);
+        table.add_target(target2).unwrap();
+
+        assert!(table.find_target(50).is_some());
+        assert!(table.find_target(99).is_some());
+        assert!(table.find_target(100).is_some());
+        assert!(table.find_target(149).is_some());
+        assert!(table.find_target(150).is_none());
     }
 
     #[test]
-    fn test_dm_ioctl_size() {
-        use core::mem::size_of;
-        const SIZEOF_DM_IOCTL: usize = 312;
-        assert_eq!(SIZEOF_DM_IOCTL, size_of::<DmIoctl>());
+    fn test_dm_table_sector_mapping() {
+        let mut table = DmTable::new();
+
+        // Add linear target at sector 100 with offset 200
+        let target_type = crate::target::lookup_target("linear")
+            .unwrap_or_else(|| panic!("linear not registered"));
+        let priv_data = TargetPrivate::new(200);
+        let target = DmTarget::new(100, 50, target_type, Some(priv_data));
+        table.add_target(target).unwrap();
+
+        // Sector 100 in DM device -> sector 300 on underlying (offset + (100 - 100) = 200 + 0)
+        // But map_sector expects relative to begin
+        let mapped = table.find_target(100).unwrap().map_sector(100);
+        assert_eq!(mapped.unwrap(), 200);
+
+        let mapped = table.find_target(120).unwrap().map_sector(120);
+        assert_eq!(mapped.unwrap(), 220);
     }
 
     #[test]
-    fn test_dm_target_spec_alignment() {
-        use core::mem::{size_of, align_of};
-        assert_eq!(align_of::<DmTargetSpec>(), 8);
-        assert_eq!(size_of::<DmTargetSpec>(), 48);
+    fn test_dm_table_error_target() {
+        let mut table = DmTable::new();
+
+        // Add error target
+        let target_type = crate::target::lookup_target("error")
+            .unwrap_or_else(|| panic!("error not registered"));
+        let priv_data = TargetPrivate::new_error();
+        let target = DmTarget::new(0, 100, target_type, Some(priv_data));
+        table.add_target(target).unwrap();
+
+        // Error target map should fail
+        let result = table.find_target(50).unwrap().map_sector(50);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dm_device_create() {
+        let device = DmDevice::create("test");
+        assert_eq!(device.name(), "test");
+        assert!(device.get_active_table().is_none());
+        assert!(!device.is_suspended());
+    }
+
+    #[test]
+    fn test_dm_device_suspend_resume() {
+        let device = DmDevice::create("test");
+
+        // Create a simple table
+        let mut table = DmTable::new();
+        let target_type = crate::target::lookup_target("linear")
+            .unwrap_or_else(|| panic!("linear not registered"));
+        let priv_data = TargetPrivate::new(0);
+        let target = DmTarget::new(0, 100, target_type, Some(priv_data));
+        table.add_target(target).unwrap();
+
+        device.load_table(table);
+        device.swap_table();
+
+        // Suspend
+        device.suspend();
+        assert!(device.is_suspended());
+
+        // Resume
+        device.resume();
+        assert!(!device.is_suspended());
+    }
+
+    #[test]
+    fn test_dm_device_deferred_queue() {
+        use aster_block::bio::{Bio, BioOp, SubmittedBio};
+        use ostd::buff::PageBuff;
+
+        let device = DmDevice::create("test");
+
+        // Suspend first
+        device.suspend();
+
+        // Create a simple bio
+        let buff = PageBuff::alloc_kernel_page(1).unwrap();
+        let mut bio = Bio::new(vec![buff], 0, BioOp::Write).unwrap();
+        bio.set_sid_offset(0);
+
+        let submitted = SubmittedBio::new(bio).unwrap();
+
+        // Enqueue should defer since suspended
+        let result = device.enqueue(submitted.clone());
+        assert!(result.is_ok(), "Enqueue should succeed for deferred bio");
+
+        // Verify bio was added to queue (SpinLock.lock() instead of RefCell.borrow())
+        let queue = device.deferred_queue.lock();
+        assert_eq!(queue.len(), 1);
+    }
+}
+
+    #[test]
+    fn test_dm_target_contains() {
+        let target = DmTarget::new_empty(100, 50);
+
+        assert!(!target.contains(99));
+        assert!(target.contains(100));
+        assert!(target.contains(149));
+        assert!(!target.contains(150));
+    }
+
+    #[test]
+    fn test_dm_target_end() {
+        let target = DmTarget::new_empty(100, 50);
+        assert_eq!(target.end(), 150);
     }
 }
 

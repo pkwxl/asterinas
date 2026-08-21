@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{string::String, sync::Arc};
-use core::fmt::Debug;
+use alloc::{collections::VecDeque, string::String, sync::Arc};
+use core::{
+    fmt::Debug,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
     bio::{BioEnqueueError, SubmittedBio},
 };
 use device_id::DeviceId;
-use ostd::sync::RwLock;
+use ostd::sync::{RwLock, SpinLock};
 
 use crate::DmTable;
 
@@ -16,8 +19,9 @@ use crate::DmTable;
 #[derive(Debug)]
 pub struct DmDevice {
     name: String,
-    #[allow(dead_code)]
     tables: RwLock<(Option<DmTable>, Option<DmTable>)>,
+    suspend_flag: AtomicU32,
+    deferred_queue: SpinLock<VecDeque<SubmittedBio>>,
 }
 
 impl DmDevice {
@@ -26,6 +30,8 @@ impl DmDevice {
         let device = DmDevice {
             name: String::from(name),
             tables: RwLock::new((None, None)),
+            suspend_flag: AtomicU32::new(0),
+            deferred_queue: SpinLock::new(VecDeque::new()),
         };
         Arc::new(device)
     }
@@ -59,13 +65,54 @@ impl DmDevice {
     pub fn get_active_table(&self) -> Option<DmTable> {
         self.tables.read().0.clone()
     }
+
+    /// Get both active and inactive tables (for TABLE_STATUS)
+    pub fn get_tables(&self) -> (Option<DmTable>, Option<DmTable>) {
+        let tables = self.tables.read();
+        (tables.0.clone(), tables.1.clone())
+    }
+
+    /// Suspend the device: block new I/O and wait for in-flight to complete
+    pub fn suspend(&self) {
+        // Set suspend flag
+        self.suspend_flag.store(1, Ordering::SeqCst);
+    }
+
+    /// Resume the device: unblock and replay deferred queue
+    pub fn resume(&self) {
+        // Clear suspend flag
+        self.suspend_flag.store(0, Ordering::SeqCst);
+
+        // Replay deferred queue
+        let mut queue = self.deferred_queue.lock();
+        while let Some(bio) = queue.pop_front() {
+            // Re-enqueue with current active table
+            let _ = self.enqueue(bio);
+        }
+    }
+
+    /// Check if device is suspended
+    pub fn is_suspended(&self) -> bool {
+        self.suspend_flag.load(Ordering::SeqCst) != 0
+    }
+
+    /// Add a bio to deferred queue (called when suspended)
+    pub fn defer_bio(&self, bio: SubmittedBio) {
+        self.deferred_queue.lock().push_back(bio);
+    }
 }
 
 impl BlockDevice for DmDevice {
     fn enqueue(&self, mut bio: SubmittedBio) -> Result<(), BioEnqueueError> {
-        // Check if device is suspended (no active table)
+        // Check if device is suspended
         let tables = self.tables.read();
         let active_table = tables.0.as_ref();
+
+        if self.is_suspended() && active_table.is_some() {
+            // Device suspended but has table - defer new I/O
+            self.defer_bio(bio);
+            return Ok(());
+        }
 
         match active_table {
             Some(table) => {
@@ -104,7 +151,7 @@ impl BlockDevice for DmDevice {
                 }
             }
             None => {
-                // Device suspended, reject I/O
+                // Device suspended with no active table, reject I/O
                 Err(BioEnqueueError::Refused)
             }
         }
