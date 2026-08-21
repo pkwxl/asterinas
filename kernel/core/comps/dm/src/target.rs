@@ -2,7 +2,9 @@
 
 //! Target type abstraction and registry for DM
 
-use alloc::{boxed::Box, string::String, string::ToString, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
+
+use crate::alloc::string::ToString;
 
 /// The name of a target type (e.g., "linear", "error")
 pub type TargetTypeName = str;
@@ -42,22 +44,19 @@ pub trait TargetType: Send + Sync {
     ///
     /// Parameters are space-separated tokens from the ctr table line.
     /// Returns Ok(target_private_data) on success, Err(error_str) on failure.
-    fn ctr(&self, params: &[&str]) -> Result<Box<dyn TargetPrivate>, &'static str>;
+    fn ctr(&self, params: &[&str]) -> Result<Box<dyn core::any::Any>, &'static str>;
 
-    /// Destruct a target instances
-    fn dtr(&self, private: &mut dyn TargetPrivate);
+    /// Destruct a target instance
+    fn dtr(&self, private: &mut dyn core::any::Any);
 
-    /// Map a bio to the underlying device
+    /// Map a sector through this target
     ///
     /// Returns Ok(new_sector) on success, Err(error_str) on failure.
-    fn map(&self, private: &dyn TargetPrivate, sector: u64) -> Result<u64, &'static str>;
+    fn map(&self, private: &dyn core::any::Any, sector: u64) -> Result<u64, &'static str>;
 
     /// Get the status string for this target instance
-    fn status(&self, private: &dyn TargetPrivate) -> &'static str;
+    fn status(&self, private: &dyn core::any::Any) -> &'static str;
 }
-
-/// Private data for a target instance
-pub trait TargetPrivate: Send {}
 
 /// Global registry of target types
 struct Registry {
@@ -103,4 +102,3 @@ pub fn lookup_target(_name: &str) -> Option<&'static dyn TargetType> {
     // This will be fixed in T-003 with proper design
     None
 }
-
