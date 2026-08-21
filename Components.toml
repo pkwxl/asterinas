@@ -1,6 +1,7 @@
 # template
 [components]
 block = { name = "aster-block" }
+dm = { name = "aster-dm" }
 cmdline = { name = "aster-cmdline" }
 console = { name = "aster-console" }
 core = { name = "aster-core" }
