@@ -7,7 +7,7 @@ use core::fmt::Debug;
 
 use aster_block::{BlockDevice, BlockDeviceMeta};
 
-use crate::target::{TargetType, TargetVersion};
+use crate::target::TargetType;
 
 /// Private data for a target instance
 #[derive(Clone)]
@@ -22,8 +22,8 @@ pub struct TargetPrivate {
 impl TargetPrivate {
     /// Create new private data with offset
     pub fn new(offset: u64) -> Self {
-        Self { 
-            offset, 
+        Self {
+            offset,
             underlying: None,
         }
     }
@@ -66,7 +66,12 @@ impl DmTarget {
         target_type: &'static dyn TargetType,
         private: Option<TargetPrivate>,
     ) -> Self {
-        Self { begin, len, target_type, private }
+        Self {
+            begin,
+            len,
+            target_type,
+            private,
+        }
     }
 
     /// Get the end sector (exclusive)

@@ -21,4 +21,5 @@ impl DmError {
 }
 
 /// Result type for DM operations (currently unused but kept for future use)
+#[expect(dead_code)]
 pub type Result<T> = core::result::Result<T, DmError>;

@@ -23,7 +23,11 @@ pub struct TargetVersion {
 impl TargetVersion {
     /// Create a new version
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 
     /// Convert to Linux DM version format: (major << 16) | (minor << 8) | patch
@@ -73,6 +77,7 @@ impl Registry {
         Ok(())
     }
 
+    #[expect(dead_code)]
     fn lookup<'a>(&'a self, name: &'a str) -> Option<&'a dyn TargetType> {
         self.targets
             .iter()

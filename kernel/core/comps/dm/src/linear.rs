@@ -2,7 +2,7 @@
 
 //! Linear target implementation
 
-use alloc::{boxed::Box, sync::Arc};
+use alloc::boxed::Box;
 
 use crate::target::{TargetType, TargetVersion};
 
@@ -59,7 +59,8 @@ impl TargetType for LinearTargetType {
     }
 
     fn map(&self, private: &dyn core::any::Any, sector: u64) -> Result<u64, &'static str> {
-        let priv_data = private.downcast_ref::<crate::table::TargetPrivate>()
+        let priv_data = private
+            .downcast_ref::<crate::table::TargetPrivate>()
             .ok_or("invalid target private type")?;
         Ok(priv_data.map_sector(sector))
     }

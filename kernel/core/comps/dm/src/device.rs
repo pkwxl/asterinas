@@ -2,7 +2,6 @@
 
 use alloc::{string::String, sync::Arc};
 use core::fmt::Debug;
-use core::ops::Range;
 
 use aster_block::{
     BlockDevice, BlockDeviceMeta, SECTOR_SIZE,
@@ -72,22 +71,23 @@ impl BlockDevice for DmDevice {
             Some(table) => {
                 // Find target for this sector
                 let sector = bio.sid_range().start.to_offset() as u64 / SECTOR_SIZE as u64;
-                
+
                 if let Some(target) = table.find_target(sector) {
                     // Calculate the offset on underlying device
-                    let offset_on_underlying = 
-                        target.begin + (sector - target.begin);
-                    
+                    let offset_on_underlying = target.begin + (sector - target.begin);
+
                     // Set sid offset for sector remapping
                     bio.set_sid_offset(offset_on_underlying * SECTOR_SIZE as u64);
-                    
+
                     // Forward to underlying device if available
                     match &target.private {
                         Some(priv_data) => {
                             let offset = priv_data.offset;
                             match priv_data.underlying() {
                                 Some(underlying) => {
-                                    bio.set_sid_offset((offset_on_underlying + offset) * SECTOR_SIZE as u64);
+                                    bio.set_sid_offset(
+                                        (offset_on_underlying + offset) * SECTOR_SIZE as u64,
+                                    );
                                     return underlying.enqueue(bio);
                                 }
                                 None => {}
@@ -95,7 +95,7 @@ impl BlockDevice for DmDevice {
                         }
                         None => {}
                     }
-                    
+
                     // No valid private data or underlying device found
                     Err(BioEnqueueError::Refused)
                 } else {

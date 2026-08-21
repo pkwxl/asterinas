@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+mod dm;
 mod evdev;
 mod fb;
 mod mem;
@@ -166,6 +167,7 @@ pub fn init_in_first_kthread() {
     registry::init_in_first_kthread();
     mem::init_in_first_kthread();
     misc::init_in_first_kthread();
+    dm::init_in_first_kthread();
     evdev::init_in_first_kthread();
     fb::init_in_first_kthread();
 }
