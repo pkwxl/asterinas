@@ -4,4 +4,6 @@ SUBDIRS := \
 	pty \
 	vt
 
+C_SRCS += dm_linear.c
+
 include ../common/Makefile
