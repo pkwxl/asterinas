@@ -9,6 +9,7 @@ edition.workspace = true
 aster-block.workspace = true
 device-id.workspace = true
 hashbrown.workspace = true
+io-util.workspace = true
 ostd.workspace = true
 spin.workspace = true
 

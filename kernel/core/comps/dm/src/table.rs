@@ -141,7 +141,9 @@ impl DmTable {
     /// Get metadata (nr_sectors only for now)
     pub fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
-            max_nr_segments_per_bio: 1,
+            // The DM core accepts bios with any number of segments; see
+            // `DmDevice::metadata` for the rationale.
+            max_nr_segments_per_bio: usize::MAX,
             nr_sectors: self.nr_sectors as usize,
         }
     }

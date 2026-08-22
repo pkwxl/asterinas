@@ -226,6 +226,24 @@ impl SubmittedBio {
         self.sid_offset = offset;
     }
 
+    /// Adds a hook that will run right before the current completion
+    /// callback (if any) when the bio is completed.
+    ///
+    /// Stacked devices (e.g., device mapper) use this to observe the
+    /// completion of a bio that they forward to an underlying device.
+    /// Note that the hook is dropped without running if the bio is dropped
+    /// without being completed (e.g., when the underlying device refuses
+    /// the bio).
+    pub fn add_complete_hook(&mut self, hook: BioCompleteFn) {
+        let prev = self.complete_fn.take();
+        self.complete_fn = Some(Box::new(move |status| {
+            hook(status);
+            if let Some(prev) = prev {
+                prev(status);
+            }
+        }));
+    }
+
     /// Returns the slice to the memory segments.
     pub fn segments(&self) -> &[BioSegment] {
         &self.segments
@@ -395,6 +413,19 @@ impl BioSegment {
     /// the bio direction.
     pub fn alloc(nblocks: usize, direction: BioDirection) -> Self {
         Self::alloc_inner(nblocks, 0, nblocks * BLOCK_SIZE, direction)
+    }
+
+    /// Allocates a new `BioSegment` covering exactly `nsectors` sectors
+    /// with the given bio direction.
+    ///
+    /// Unlike [`BioSegment::alloc`], the segment length does not need to be
+    /// block-aligned (but it is always sector-aligned). Stacked devices that
+    /// split a bio on sector boundaries (e.g., device mapper) need this to
+    /// construct child segments with an exact length.
+    pub fn alloc_sectors(nsectors: usize, direction: BioDirection) -> Self {
+        let len = nsectors * SECTOR_SIZE;
+        let nblocks = len.div_ceil(BLOCK_SIZE);
+        Self::alloc_inner(nblocks, 0, len, direction)
     }
 
     /// The inner function that do the real segment allocation.
