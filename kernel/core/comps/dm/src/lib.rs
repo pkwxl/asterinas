@@ -5,7 +5,7 @@
 //! This crate provides the data-plane logic for DM:
 //! - Target type registration and lookup
 //! - DmTable with target management
-//! - Linear and error targets
+//! - Linear, error and striped targets
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -18,6 +18,7 @@ mod device;
 mod error;
 mod linear;
 mod split;
+mod striped;
 mod table;
 mod target;
 
@@ -27,6 +28,7 @@ mod tests;
 pub use device::DmDevice;
 pub use error::{DmError, ErrorTargetType};
 pub use linear::LinearTargetType;
+pub use striped::StripedTargetType;
 pub use table::{DmTable, DmTarget};
 pub use target::{
     CtrOutcome, MappedIo, TargetType, TargetVersion, lookup_target, register_target,
@@ -40,4 +42,5 @@ pub use target::{
 pub fn init() {
     register_target(Arc::new(LinearTargetType::new())).expect("failed to register linear target");
     register_target(Arc::new(ErrorTargetType::new())).expect("failed to register error target");
+    register_target(Arc::new(StripedTargetType::new())).expect("failed to register striped target");
 }
