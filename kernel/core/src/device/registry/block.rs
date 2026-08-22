@@ -253,8 +253,19 @@ pub(super) fn lookup(id: DeviceId) -> Option<Arc<dyn Device>> {
     let block_device = aster_block::lookup(id)?;
 
     let mut registry = DEVICE_REGISTRY.lock();
+    let key = id.to_raw();
+    // A device id may be recycled after the original device is unregistered
+    // (e.g. DM minors are freed on DEV_REMOVE and handed out again). If the
+    // cached file wraps a different device than the one currently registered
+    // under `id`, the entry is stale and must be rebuilt.
+    if registry
+        .get(&key)
+        .is_some_and(|file| !Arc::ptr_eq(&file.0, &block_device))
+    {
+        registry.remove(&key);
+    }
     let block_device_file = registry
-        .entry(id.to_raw())
+        .entry(key)
         .or_insert_with(move || Arc::new(BlockFile::new(block_device)))
         .clone();
     Some(block_device_file)
@@ -262,4 +273,4 @@ pub(super) fn lookup(id: DeviceId) -> Option<Arc<dyn Device>> {
 
 // TODO: Merge the two mapping tables, one is here and the other is in the block component.
 // Maintaining two mapping tables is undesirable due to duplication and (potential) inconsistency.
-static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<dyn Device>>> = Mutex::new(BTreeMap::new());
+static DEVICE_REGISTRY: Mutex<BTreeMap<u32, Arc<BlockFile>>> = Mutex::new(BTreeMap::new());

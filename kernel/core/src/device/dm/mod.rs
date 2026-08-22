@@ -409,6 +409,11 @@ impl DmControlFile {
         let dev = device.id().as_encoded_u64();
 
         DmControlDevice::remove_device(name)?;
+        // Clear the tables so that any stale references to the device
+        // (e.g. a cached device file for a since-recycled minor number)
+        // fail with an I/O error instead of silently serving I/O through
+        // the removed device's table (cf. Linux `dev_destroy`).
+        device.remove();
 
         // Report the final device state (`dm_ioctl.open_count` and
         // `dm_ioctl.dev`), same as `dev_status`.

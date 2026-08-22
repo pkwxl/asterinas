@@ -51,6 +51,7 @@
 #define DM_VERSION_PATCH 0
 
 #define DM_SUSPEND_FLAG (1 << 1)
+#define DM_QUERY_INACTIVE_TABLE_FLAG (1 << 12)
 
 #define DM_NAME_LEN 128
 #define DM_UUID_LEN 129
@@ -260,15 +261,15 @@ FN_TEST(dm_stripe_bad_tables) {
 	TEST_RES(do_create_device(fd, DM_TEST_DEV), _ret != 0);
 
 	/* length not divisible by stripes: 4095 % 2 != 0 */
-	TEST_RES(do_load_striped_table(fd, DM_TEST_DEV, 4095, STRIPE_PARAMS),
-		 _ret < 0);
+	TEST_ERRNO(do_load_striped_table(fd, DM_TEST_DEV, 4095, STRIPE_PARAMS),
+		   EINVAL);
 	/* width (len / stripes) not divisible by chunk_size: 12 % 8 != 0 */
-	TEST_RES(do_load_striped_table(fd, DM_TEST_DEV, 24, STRIPE_PARAMS),
-		 _ret < 0);
+	TEST_ERRNO(do_load_striped_table(fd, DM_TEST_DEV, 24, STRIPE_PARAMS),
+		   EINVAL);
 	/* missing one leg: argc (3) != 2 + 2 * stripes (6) */
-	TEST_RES(do_load_striped_table(fd, DM_TEST_DEV, TABLE_SECTORS,
-				       "2 8 vdd 0"),
-		 _ret < 0);
+	TEST_ERRNO(do_load_striped_table(fd, DM_TEST_DEV, TABLE_SECTORS,
+					 "2 8 vdd 0"),
+		   EINVAL);
 
 	/* The failed loads must not prevent removing the device. */
 	TEST_RES(do_remove_device(fd, DM_TEST_DEV), _ret == 0);
@@ -291,6 +292,9 @@ FN_TEST(dm_stripe_table_status) {
 
 	io = (struct dm_ioctl *)buf;
 	dm_ioctl_init(io, DM_TEST_DEV, sizeof(buf));
+	/* The device is still suspended (no resume yet), so the live table
+	 * is empty; query the inactive table explicitly, as Linux requires. */
+	io->flags = DM_QUERY_INACTIVE_TABLE_FLAG;
 	TEST_SUCC(ioctl(fd, DM_CMD(DM_IOCTL_TABLE_STATUS), io));
 
 	TEST_RES(io->target_count, _ret == 1);
