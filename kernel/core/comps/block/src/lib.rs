@@ -86,6 +86,18 @@ pub trait BlockDevice: Send + Sync + Any + Debug {
     fn partitions(&self) -> Option<Vec<Arc<dyn BlockDevice>>> {
         None
     }
+
+    /// Called when the block device is opened via its device file.
+    ///
+    /// Stacked devices (e.g., Device Mapper) can override this to track the
+    /// number of open handles. The default implementation does nothing.
+    fn on_open(&self) {}
+
+    /// Called when the last reference to an opened device file is dropped.
+    ///
+    /// This pairs with [`BlockDevice::on_open`]; the default implementation
+    /// does nothing.
+    fn on_close(&self) {}
 }
 
 /// Metadata for a block device.

@@ -120,6 +120,7 @@ impl Device for BlockFile {
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
+        self.0.on_open();
         Ok(Box::new(OpenBlockFile(self.0.clone())))
     }
 }
@@ -130,6 +131,12 @@ impl Device for BlockFile {
 // `PerOpenFileOps` trait. It leads to redundant vtable dispatch and heap allocation. We should
 // devise a better strategy to eliminate the unnecessary intermediate `Box`.
 struct OpenBlockFile(Arc<dyn BlockDevice>);
+
+impl Drop for OpenBlockFile {
+    fn drop(&mut self) {
+        self.0.on_close();
+    }
+}
 
 impl FileOps for OpenBlockFile {
     fn read_at(

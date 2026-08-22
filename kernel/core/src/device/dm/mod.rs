@@ -303,7 +303,23 @@ impl DmControlFile {
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
         let name = name_str.split('\0').next().unwrap_or("");
 
+        let device = DmControlDevice::lookup_device(name)
+            .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
+
+        // A device with open handles cannot be removed (Linux returns
+        // -EBUSY from `__dev_destroy` in this case).
+        let open_count = device.open_count();
+        if open_count != 0 {
+            return_errno_with_message!(Errno::EBUSY, "device still has open handles");
+        }
+        let dev = device.id().as_encoded_u64();
+
         DmControlDevice::remove_device(name)?;
+
+        // Report the final device state (`dm_ioctl.open_count` at offset
+        // 24 and `dm_ioctl.dev` at offset 40), same as `dev_status`.
+        current_userspace!().write_bytes(arg + 24, &open_count.to_le_bytes())?;
+        current_userspace!().write_bytes(arg + 40, &dev.to_le_bytes())?;
 
         Ok(())
     }

@@ -90,9 +90,9 @@ impl DmDevice {
 
     /// Returns the number of open handles on this device.
     ///
-    /// The counter is currently never incremented (always zero); the
-    /// `BlockDevice` open/close hooks that maintain it are added in a
-    /// follow-up change (T-010 subtask 5).
+    /// The counter is maintained via the `BlockDevice::on_open`/`on_close`
+    /// hooks, which the device-file layer (`BlockFile`/`OpenBlockFile` in
+    /// aster-core) invokes around each open and the final close.
     pub fn open_count(&self) -> i32 {
         self.open_count.load(Ordering::SeqCst)
     }
@@ -286,5 +286,13 @@ impl BlockDevice for DmDevice {
 
     fn id(&self) -> DeviceId {
         self.id
+    }
+
+    fn on_open(&self) {
+        self.open_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_close(&self) {
+        self.open_count.fetch_sub(1, Ordering::SeqCst);
     }
 }
