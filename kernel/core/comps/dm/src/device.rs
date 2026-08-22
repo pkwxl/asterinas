@@ -9,7 +9,7 @@ use alloc::{
 };
 use core::{
     fmt::Debug,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering},
 };
 
 use aster_block::{
@@ -28,6 +28,8 @@ use crate::{
 #[derive(Debug)]
 pub struct DmDevice {
     name: String,
+    id: DeviceId,
+    open_count: AtomicI32,
     tables: RwLock<(Option<DmTable>, Option<DmTable>)>,
     suspend_flag: AtomicU32,
     deferred_queue: SpinLock<VecDeque<SubmittedBio>>,
@@ -68,16 +70,31 @@ impl InFlight {
 }
 
 impl DmDevice {
-    /// Create a new dm device with the given name (suspended state, no table)
-    pub fn create(name: &str) -> Arc<Self> {
+    /// Create a new dm device with the given name and device ID
+    /// (suspended state, no table).
+    ///
+    /// The device ID (major 253, minor N) is allocated by the
+    /// control-plane glue; this crate only stores it.
+    pub fn create(name: &str, id: DeviceId) -> Arc<Self> {
         let device = DmDevice {
             name: String::from(name),
+            id,
+            open_count: AtomicI32::new(0),
             tables: RwLock::new((None, None)),
             suspend_flag: AtomicU32::new(0),
             deferred_queue: SpinLock::new(VecDeque::new()),
             in_flight: Arc::new(InFlight::new()),
         };
         Arc::new(device)
+    }
+
+    /// Returns the number of open handles on this device.
+    ///
+    /// The counter is currently never incremented (always zero); the
+    /// `BlockDevice` open/close hooks that maintain it are added in a
+    /// follow-up change (T-010 subtask 5).
+    pub fn open_count(&self) -> i32 {
+        self.open_count.load(Ordering::SeqCst)
     }
 
     /// Load a table into the inactive slot
@@ -268,7 +285,6 @@ impl BlockDevice for DmDevice {
     }
 
     fn id(&self) -> DeviceId {
-        // TODO: allocate proper device ID
-        unimplemented!("DmDevice ID allocation not yet implemented")
+        self.id
     }
 }

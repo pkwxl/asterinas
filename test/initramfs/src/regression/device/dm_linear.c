@@ -1,26 +1,24 @@
 // SPDX-License-Identifier: MPL-2.0
 
 /*
- * Regression tests for dm-linear target.
+ * Regression tests for the dm-linear target.
  *
  * Tests the complete workflow: create device, load table, resume, read/write,
- * verify data, cleanup.
+ * verify data, cleanup. All ioctls use the real Linux DM ABI (see
+ * include/uapi/linux/dm-ioctl.h).
  */
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../common/test.h"
@@ -28,43 +26,53 @@
 #define DM_CONTROL_PATH "/dev/mapper/control"
 #define DM_DIR "/dev/mapper"
 #define DM_TEST_DEV "dmtest"
-#define DM_TEST_NODE "/dev/mapper/dmtest"
 #define TEST_PARTITION "/dev/vdd"
 
 #define DM_IOCTL_VERSION 0
 #define DM_IOCTL_DEV_CREATE 3
 #define DM_IOCTL_DEV_REMOVE 4
-#define DM_IOCTL_TABLE_LOAD 9
+#define DM_IOCTL_DEV_STATUS 5
 #define DM_IOCTL_DEV_SUSPEND 6
+#define DM_IOCTL_TABLE_LOAD 9
 
 #define DM_VERSION_MAJOR 4
 #define DM_VERSION_MINOR 48
 #define DM_VERSION_PATCH 0
 
 #define DM_SUSPEND_FLAG (1 << 1)
+#define DM_ACTIVE_PRESENT_FLAG (1 << 5)
+#define DM_INACTIVE_PRESENT_FLAG (1 << 6)
 
 #define DM_NAME_LEN 128
-#define DM_UUID_LEN 128
-#define DM_MAX_TARGETS 256
+#define DM_UUID_LEN 129
 
+#define DM_CTL_MAJOR 10
+#define DM_CTL_MINOR 236
+
+#define DM_BLOCK_MAJOR 253
+
+/* _IOR(0x12, 114, u64); <linux/fs.h> is not available in this build env. */
+#define BLKGETSIZE64 0x80081272
+
+/* struct dm_ioctl, exactly as in linux/include/uapi/linux/dm-ioctl.h
+ * (sizeof == 312). */
 struct dm_ioctl {
 	uint32_t version[3];
 	uint32_t data_size;
 	uint32_t data_start;
 	uint32_t target_count;
-	uint32_t open_count;
-	int32_t flags;
+	int32_t open_count;
+	uint32_t flags;
 	uint32_t event_nr;
-	uint64_t sector_start;
-	uint64_t nr_sectors;
-	uint32_t error_cnt;
-	uint32_t target_count_extra;
-	uint32_t reserved[5];
+	uint32_t padding;
+	uint64_t dev;
 	char name[DM_NAME_LEN];
 	char uuid[DM_UUID_LEN];
-	char data[4];
+	char data[7];
 };
 
+/* struct dm_target_spec (sizeof == 40), immediately followed by the
+ * NUL-terminated parameter string, 8-byte aligned. */
 struct dm_target_spec {
 	uint64_t sector_start;
 	uint64_t length;
@@ -73,154 +81,145 @@ struct dm_target_spec {
 	char target_type[16];
 };
 
-#define DM_CTL_MAJOR 10
-#define DM_CTL_MINOR 236
+#define DM_CMD(nr) (0xC138FD00 | (nr))
 
-static char *dm_ioctl_data(struct dm_ioctl *dev) { return dev->data; }
-
-static int open_dm_control(void) {
-	int fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
-	struct stat st;
-
-	TEST_RES(fstat(fd, &st), S_ISCHR(st.st_mode) &&
-					 major(st.st_rdev) == DM_CTL_MAJOR &&
-					 minor(st.st_rdev) == DM_CTL_MINOR);
-
-	return fd;
-}
-
-static void version_check(int fd) {
-	struct dm_ioctl *dev;
-	char buf[4096];
-
-	dev = (struct dm_ioctl *)buf;
+/* Fills the common header fields every DM ioctl needs. */
+static void dm_ioctl_init(struct dm_ioctl *dev, const char *name,
+			  size_t data_size) {
 	memset(dev, 0, sizeof(*dev));
-	dev->data_size = sizeof(buf);
 	dev->version[0] = DM_VERSION_MAJOR;
 	dev->version[1] = DM_VERSION_MINOR;
 	dev->version[2] = DM_VERSION_PATCH;
-
-	TEST_RES(ioctl(fd, 0xC138FD00 | DM_IOCTL_VERSION, dev), _ret == 0);
-	TEST_RES(dev->version[0], _ret == DM_VERSION_MAJOR);
-	TEST_RES(dev->version[1] <= DM_VERSION_MINOR, _ret);
+	dev->data_size = data_size;
+	dev->data_start = sizeof(struct dm_ioctl);
+	if (name)
+		strncpy(dev->name, name, DM_NAME_LEN - 1);
 }
 
-static int create_device(int fd, const char *name, uint64_t *dev_number) {
+/*
+ * The helpers below are plain functions (not FN_TEST bodies), so they must
+ * not use the TEST_*() macros; they return -1/0 on failure and leave the
+ * assertions to their callers.
+ */
+
+static int do_version_check(int fd) {
 	struct dm_ioctl *dev;
-	char buf[4096];
+	char buf[512];
 
 	dev = (struct dm_ioctl *)buf;
-	memset(dev, 0, sizeof(*dev));
-	dev->data_size = sizeof(buf);
-	strncpy(dev->name, name, DM_NAME_LEN - 1);
+	dm_ioctl_init(dev, NULL, sizeof(buf));
 
-	TEST_RES(ioctl(fd, 0xC138FD00 | DM_IOCTL_DEV_CREATE, dev), _ret == 0);
-
-	if (dev_number)
-		*dev_number = dev->dev;
-
+	if (ioctl(fd, DM_CMD(DM_IOCTL_VERSION), dev) < 0)
+		return -1;
+	if (dev->version[0] != DM_VERSION_MAJOR ||
+	    dev->version[1] > DM_VERSION_MINOR)
+		return -1;
 	return 0;
 }
 
-static int remove_device(int fd, const char *name) {
+/* Creates a DM device and returns the kernel-reported device number,
+ * or 0 on failure. */
+static uint64_t do_create_device(int fd, const char *name) {
 	struct dm_ioctl *dev;
-	char buf[4096];
+	char buf[512];
 
 	dev = (struct dm_ioctl *)buf;
-	memset(dev, 0, sizeof(*dev));
-	dev->data_size = sizeof(buf);
-	strncpy(dev->name, name, DM_NAME_LEN - 1);
+	dm_ioctl_init(dev, name, sizeof(buf));
 
-	return TEST_RES(ioctl(fd, 0xC138FD00 | DM_IOCTL_DEV_REMOVE, dev), _ret == 0);
-}
-
-static int load_table(int fd, const char *name, uint64_t sector_start,
-					  uint64_t nr_sectors, const char *target_type,
-					  const char *target_params) {
-	struct dm_ioctl *dev;
-	char buf[8192];
-	struct dm_target_spec *spec;
-	char *data;
-
-	dev = (struct dm_ioctl *)buf;
-	memset(dev, 0, sizeof(*dev));
-	dev->data_size = sizeof(buf);
-	dev->sector_start = sector_start;
-	dev->nr_sectors = nr_sectors;
-	dev->target_count = 1;
-	strncpy(dev->name, name, DM_NAME_LEN - 1);
-
-	data = dm_ioctl_data(dev);
-	spec = (struct dm_target_spec *)data;
-
-	spec->sector_start = 0;
-	spec->length = nr_sectors;
-	spec->next = sizeof(struct dm_target_spec) + strlen(target_type) + 1 +
-				 ((8 - (strlen(target_type) + 1)) & 7);
-	strncpy(spec->target_type, target_type, sizeof(spec->target_type) - 1);
-
-	char *params = data + spec->next;
-	strcpy(params, target_params);
-
-	return TEST_RES(ioctl(fd, 0xC138FD00 | DM_IOCTL_TABLE_LOAD, dev), _ret == 0);
-}
-
-static int resume_device(int fd, const char *name) {
-	struct dm_ioctl *dev;
-	char buf[4096];
-
-	dev = (struct dm_ioctl *)buf;
-	memset(dev, 0, sizeof(*dev));
-	dev->data_size = sizeof(buf);
-	dev->flags = DM_SUSPEND_FLAG;
-	strncpy(dev->name, name, DM_NAME_LEN - 1);
-
-	return TEST_RES(ioctl(fd, 0xC138FD00 | DM_IOCTL_DEV_SUSPEND, dev), _ret == 0);
-}
-
-static int create_dm_node(uint64_t major, uint64_t minor) {
-	char path[256];
-	struct stat st;
-
-	snprintf(path, sizeof(path), "/dev/dm-%lu", minor);
-
-	if (stat(path, &st) == 0 && S_ISBLK(st.st_mode))
+	if (ioctl(fd, DM_CMD(DM_IOCTL_DEV_CREATE), dev) < 0)
 		return 0;
 
-	return TEST_ERRNO(mknod(path, S_IFBLK | 0644, makedev(major, minor)), EEXIST);
+	return dev->dev;
 }
 
-static void write_test_pattern(int fd, uint64_t offset, const char *pattern) {
-	lseek(fd, offset, SEEK_SET);
-	TEST_RES(write(fd, pattern, strlen(pattern)), _ret == strlen(pattern));
+static int do_remove_device(int fd, const char *name) {
+	struct dm_ioctl *dev;
+	char buf[512];
+
+	dev = (struct dm_ioctl *)buf;
+	dm_ioctl_init(dev, name, sizeof(buf));
+
+	return ioctl(fd, DM_CMD(DM_IOCTL_DEV_REMOVE), dev);
 }
 
-static bool read_verify_pattern(int fd, uint64_t offset, const char *pattern,
-								int len) {
-	char buf[256];
+/* Queries DEV_STATUS, returning the reported flags via `flags` and the
+ * device number via `dev_number` (both may be NULL). */
+static int do_status_device(int fd, const char *name, uint32_t *flags,
+			    uint64_t *dev_number) {
+	struct dm_ioctl *dev;
+	char buf[512];
 
-	lseek(fd, offset, SEEK_SET);
-	memset(buf, 0, sizeof(buf));
-	TEST_RES(read(fd, buf, len), _ret == len);
+	dev = (struct dm_ioctl *)buf;
+	dm_ioctl_init(dev, name, sizeof(buf));
 
-	return memcmp(buf, pattern, strlen(pattern)) == 0;
+	if (ioctl(fd, DM_CMD(DM_IOCTL_DEV_STATUS), dev) < 0)
+		return -1;
+
+	if (flags)
+		*flags = dev->flags;
+	if (dev_number)
+		*dev_number = dev->dev;
+	return 0;
 }
 
-static void cleanup_dm_device(int fd, const char *name) {
-	int status_fd;
-	char path[256];
-	struct stat st;
+static int do_load_linear_table(int fd, const char *name, uint64_t nr_sectors,
+				const char *target_params) {
+	struct dm_ioctl *dev;
+	char buf[4096];
+	struct dm_target_spec *spec;
+	char *data, *params;
+	size_t params_len;
 
-	snprintf(path, sizeof(path), "/dev/mapper/%s", name);
-	status_fd = open(path, O_RDONLY);
-	if (status_fd >= 0) {
-		close(status_fd);
-		remove_device(fd, name);
-	}
+	dev = (struct dm_ioctl *)buf;
+	dm_ioctl_init(dev, name, sizeof(buf));
+	dev->target_count = 1;
 
-	snprintf(path, sizeof(path), "/dev/dm-%lu", 0);
-	if (stat(path, &st) == 0)
-		unlink(path);
+	data = buf + dev->data_start;
+	spec = (struct dm_target_spec *)data;
+	spec->sector_start = 0;
+	spec->length = nr_sectors;
+	spec->status = 0;
+	strncpy(spec->target_type, "linear", sizeof(spec->target_type) - 1);
+
+	params = data + sizeof(*spec);
+	strcpy(params, target_params);
+	params_len = strlen(params) + 1;
+	spec->next = (sizeof(*spec) + params_len + 7) & ~7UL;
+
+	return ioctl(fd, DM_CMD(DM_IOCTL_TABLE_LOAD), dev);
+}
+
+/* Resumes the device (promotes the inactive table to active). */
+static int do_resume_device(int fd, const char *name) {
+	struct dm_ioctl *dev;
+	char buf[512];
+
+	dev = (struct dm_ioctl *)buf;
+	dm_ioctl_init(dev, name, sizeof(buf));
+	dev->flags = 0; /* no DM_SUSPEND_FLAG: this is a resume */
+
+	return ioctl(fd, DM_CMD(DM_IOCTL_DEV_SUSPEND), dev);
+}
+
+/* mknod(2) that tolerates an already-existing node. */
+static int mknod_or_exist(const char *path, mode_t mode, dev_t dev) {
+	if (mknod(path, mode, dev) < 0 && errno != EEXIST)
+		return -1;
+	return 0;
+}
+
+static uint64_t get_partition_nr_sectors(void) {	int fd = open(TEST_PARTITION, O_RDWR);
+	uint64_t size_bytes = 0;
+
+	if (fd < 0)
+		return 0;
+	/* fstat() does not report the size of a block device; ask the
+	 * driver via BLKGETSIZE64 instead. */
+	if (ioctl(fd, BLKGETSIZE64, &size_bytes) < 0)
+		size_bytes = 0;
+	close(fd);
+
+	return size_bytes / 512;
 }
 
 FN_SETUP(dm_linear_prepare_test_env) {
@@ -229,144 +228,171 @@ FN_SETUP(dm_linear_prepare_test_env) {
 	fd = open(TEST_PARTITION, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		fprintf(stderr, "dm-linear tests skipped: %s unavailable\n",
-				TEST_PARTITION);
+			TEST_PARTITION);
 		exit(EXIT_SUCCESS);
 	}
 	close(fd);
 
 	fd = open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
-		if (errno == ENOENT || errno == ENODEV) {
-			fprintf(stderr, "dm-linear tests skipped: %s unavailable\n",
-					DM_CONTROL_PATH);
+		if (errno == ENOENT) {
+			/* The devtmpfs node may be missing; mknod it. */
+			mkdir(DM_DIR, 0755);
+			CHECK(mknod(DM_CONTROL_PATH, S_IFCHR | 0600,
+				    makedev(DM_CTL_MAJOR, DM_CTL_MINOR)));
+			fd = CHECK(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+		} else if (errno == ENODEV) {
+			fprintf(stderr,
+				"dm-linear tests skipped: %s unavailable\n",
+				DM_CONTROL_PATH);
 			exit(EXIT_SUCCESS);
+		} else {
+			CHECK(fd);
 		}
-		CHECK(fd);
 	}
 	close(fd);
-
-	mkdir(DM_DIR, 0755);
 }
 
 END_SETUP()
 
 FN_TEST(dm_linear_version_check) {
-	int fd = open_dm_control();
-	version_check(fd);
+	int fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	struct stat st;
+
+	TEST_RES(fstat(fd, &st), S_ISCHR(st.st_mode) &&
+					 major(st.st_rdev) == DM_CTL_MAJOR &&
+					 minor(st.st_rdev) == DM_CTL_MINOR);
+	TEST_RES(do_version_check(fd), _ret == 0);
 	close(fd);
 }
 END_TEST()
 
-FN_TEST(dm_linear_create_device) {
-	int fd = open_dm_control();
-	uint64_t dev_number;
+FN_TEST(dm_linear_create_status_remove) {
+	int fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	uint64_t dev_number, status_dev = 0;
+	uint32_t flags = 0;
 
-	create_device(fd, DM_TEST_DEV, &dev_number);
-	TEST_RES(dev_number, _ret > 0);
+	TEST_RES(do_version_check(fd), _ret == 0);
 
-	remove_device(fd, DM_TEST_DEV);
+	dev_number = do_create_device(fd, DM_TEST_DEV);
+	TEST_RES(dev_number, _ret != 0);
+	/* The major is 253 if DM could acquire it, otherwise a dynamic one;
+	 * user space must use whatever DEV_CREATE reports. */
+	TEST_RES(minor(dev_number), _ret == 0);
+
+	TEST_RES(do_status_device(fd, DM_TEST_DEV, &flags, &status_dev),
+		 _ret == 0);
+	TEST_RES(status_dev, _ret == dev_number);
+	TEST_RES(flags,
+		 (_ret & (DM_ACTIVE_PRESENT_FLAG | DM_INACTIVE_PRESENT_FLAG)) ==
+			 0);
+
+	TEST_RES(do_remove_device(fd, DM_TEST_DEV), _ret == 0);
 	close(fd);
 }
 END_TEST()
 
 FN_TEST(dm_linear_load_table_and_resume) {
-	int control_fd, test_disk_fd;
-	struct stat st;
+	int control_fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
 	uint64_t nr_sectors;
+	uint32_t flags = 0;
 
-	control_fd = open_dm_control();
-	version_check(control_fd);
+	TEST_RES(do_version_check(control_fd), _ret == 0);
 
-	create_device(control_fd, DM_TEST_DEV, NULL);
+	TEST_RES(do_create_device(control_fd, DM_TEST_DEV), _ret != 0);
 
-	test_disk_fd = TEST_SUCC(open(TEST_PARTITION, O_RDWR));
-	TEST_RES(fstat(test_disk_fd, &st), S_ISBLK(st.st_mode));
-	nr_sectors = st.st_size / 512;
+	nr_sectors = get_partition_nr_sectors();
+	TEST_RES(nr_sectors, _ret > 0);
+	TEST_RES(do_load_linear_table(control_fd, DM_TEST_DEV, nr_sectors,
+				      TEST_PARTITION " 0"),
+		 _ret == 0);
 
-	close(test_disk_fd);
+	TEST_RES(do_status_device(control_fd, DM_TEST_DEV, &flags, NULL),
+		 _ret == 0);
+	TEST_RES(flags, (_ret & DM_INACTIVE_PRESENT_FLAG) != 0);
 
-	load_table(control_fd, DM_TEST_DEV, 0, nr_sectors, "linear",
-			   (char[]){TEST_PARTITION, ' ', '0', '\0'});
+	TEST_RES(do_resume_device(control_fd, DM_TEST_DEV), _ret == 0);
 
-	resume_device(control_fd, DM_TEST_DEV);
-	remove_device(control_fd, DM_TEST_DEV);
+	TEST_RES(do_status_device(control_fd, DM_TEST_DEV, &flags, NULL),
+		 _ret == 0);
+	TEST_RES(flags, (_ret & DM_ACTIVE_PRESENT_FLAG) != 0);
+
+	TEST_RES(do_remove_device(control_fd, DM_TEST_DEV), _ret == 0);
 	close(control_fd);
 }
 END_TEST()
 
 FN_TEST(dm_linear_io) {
 	int control_fd, dm_fd, test_disk_fd;
-	struct stat st;
-	uint64_t nr_sectors, dev_major, dev_minor;
-	char pattern[256];
-	const char *test_pattern = "dm-linear-test-data-2024";
-	char dm_path[256];
+	uint64_t nr_sectors, dev_number;
+	const char *test_pattern = "dm-linear-test-data-2026";
+	const char *test_pattern2 = "dm-linear-second-write!";
+	char buf[512];
+	char dm_path[64];
 
-	control_fd = open_dm_control();
-	version_check(control_fd);
+	control_fd = TEST_SUCC(open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC));
+	TEST_RES(do_version_check(control_fd), _ret == 0);
 
-	create_device(control_fd, DM_TEST_DEV, &dev_number);
-	test_disk_fd = TEST_SUCC(open(TEST_PARTITION, O_RDWR));
-	TEST_RES(fstat(test_disk_fd, &st), S_ISBLK(st.st_mode));
-	nr_sectors = st.st_size / 512;
-	close(test_disk_fd);
+	dev_number = do_create_device(control_fd, DM_TEST_DEV);
+	TEST_RES(dev_number, _ret != 0);
 
-	load_table(control_fd, DM_TEST_DEV, 0, nr_sectors, "linear",
-			   (char[]){TEST_PARTITION, ' ', '0', '\0'});
+	nr_sectors = get_partition_nr_sectors();
+	TEST_RES(nr_sectors, _ret > 0);
+	TEST_RES(do_load_linear_table(control_fd, DM_TEST_DEV, nr_sectors,
+				      TEST_PARTITION " 0"),
+		 _ret == 0);
+	TEST_RES(do_resume_device(control_fd, DM_TEST_DEV), _ret == 0);
 
-	resume_device(control_fd, DM_TEST_DEV);
+	/* Runtime-registered DM devices do not get a devtmpfs node
+	 * automatically; mknod it with the device number from DEV_CREATE. */
+	snprintf(dm_path, sizeof(dm_path), "/dev/dm-%u", minor(dev_number));
+	TEST_SUCC(mknod_or_exist(dm_path, S_IFBLK | 0644, dev_number));
 
-	snprintf(dm_path, sizeof(dm_path), "/dev/mapper/%s", DM_TEST_DEV);
 	dm_fd = TEST_SUCC(open(dm_path, O_RDWR));
 
-	write_test_pattern(dm_fd, 4096, test_pattern);
+	/* Write via the dm device, verify on the underlying disk. */
+	TEST_RES(pwrite(dm_fd, test_pattern, strlen(test_pattern), 4096),
+		 _ret == (ssize_t)strlen(test_pattern));
 
 	test_disk_fd = TEST_SUCC(open(TEST_PARTITION, O_RDWR));
-	TEST_RES(read_verify_pattern(test_disk_fd, 4096, test_pattern,
-								 strlen(test_pattern)),
-			 _ret);
-	close(test_disk_fd);
-	close(dm_fd);
+	memset(buf, 0, sizeof(buf));
+	TEST_RES(pread(test_disk_fd, buf, strlen(test_pattern), 4096),
+		 _ret == (ssize_t)strlen(test_pattern));
+	TEST_RES(memcmp(buf, test_pattern, strlen(test_pattern)), _ret == 0);
 
-	snprintf(dm_path, sizeof(dm_path), "/dev/dm-%lu", dev_minor);
-	create_dm_node(dev_major, dev_minor);
-
-	snprintf(dm_path, sizeof(dm_path), "/dev/dm-%lu", dev_minor);
-	dm_fd = TEST_SUCC(open(dm_path, O_RDWR));
-
-	memset(pattern, 0, sizeof(pattern));
-	strncpy(pattern, test_pattern, strlen(test_pattern));
-	lseek(dm_fd, 4096 + 512, SEEK_SET);
-	TEST_RES(write(dm_fd, pattern, strlen(pattern)), _ret == strlen(pattern));
-
-	test_disk_fd = TEST_SUCC(open(TEST_PARTITION, O_RDWR));
-	TEST_RES(read_verify_pattern(test_disk_fd, 4096 + 512, pattern,
-								 strlen(pattern)),
-			 _ret);
-
-	close(dm_fd);
+	/* Write to the underlying disk, verify via the dm device. */
+	memset(buf, 0, sizeof(buf));
+	memcpy(buf, test_pattern2, strlen(test_pattern2));
+	TEST_RES(pwrite(test_disk_fd, buf, 512, 8192), _ret == 512);
 	close(test_disk_fd);
 
-	remove_device(control_fd, DM_TEST_DEV);
+	memset(buf, 0, sizeof(buf));
+	TEST_RES(pread(dm_fd, buf, strlen(test_pattern2), 8192),
+		 _ret == (ssize_t)strlen(test_pattern2));
+	TEST_RES(memcmp(buf, test_pattern2, strlen(test_pattern2)), _ret == 0);
+
+	close(dm_fd);
+
+	TEST_RES(do_remove_device(control_fd, DM_TEST_DEV), _ret == 0);
 	close(control_fd);
 
-	snprintf(dm_path, sizeof(dm_path), "/dev/dm-%lu", dev_minor);
 	unlink(dm_path);
 }
 END_TEST()
 
 FN_TEST(dm_linear_cleanup) {
-	int control_fd;
-	char path[256];
+	/* Best-effort cleanup in case a previous test aborted midway. */
+	int control_fd = open(DM_CONTROL_PATH, O_RDWR | O_CLOEXEC);
+	if (control_fd >= 0) {
+		struct dm_ioctl *dev;
+		char buf[512];
 
-	control_fd = open_dm_control();
-	remove_device(control_fd, DM_TEST_DEV);
-	close(control_fd);
+		dev = (struct dm_ioctl *)buf;
+		dm_ioctl_init(dev, DM_TEST_DEV, sizeof(buf));
+		ioctl(control_fd, DM_CMD(DM_IOCTL_DEV_REMOVE), dev);
+		close(control_fd);
+	}
 
-	snprintf(path, sizeof(path), "/dev/mapper/%s", DM_TEST_DEV);
-	unlink(path);
-
-	snprintf(path, sizeof(path), "/dev/dm-%lu", 0);
-	unlink(path);
+	unlink("/dev/dm-0");
 }
 END_TEST()

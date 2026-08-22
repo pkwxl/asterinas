@@ -14,6 +14,7 @@ use core::str;
 
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::mm::VmIo;
+use spin::Once;
 
 use crate::{
     context::current_userspace,
@@ -23,10 +24,27 @@ use crate::{
     process::signal::{PollHandle, Pollable},
 };
 
+use aster_block::BlockDevice;
 use aster_dm::{DmDevice, DmTable};
 
 const MISC_MAJOR: u32 = 10;
 const DM_MINOR: u32 = 236;
+
+/// The block-device major number of Device Mapper devices (`/dev/dm-N`),
+/// same as in Linux.
+///
+/// Note that in Asterinas the block majors 254 and downward are allocated
+/// dynamically (e.g., 254 to virtio-blk, 253 to NVMe), so DM may fail to
+/// acquire 253; in that case a dynamically allocated major is used instead.
+/// User space learns the real major/minor from `dm_ioctl.dev`, so either
+/// way works.
+const DM_BLOCK_MAJOR: u16 = 253;
+/// The maximum number of DM devices (minors) that can exist at once.
+const MAX_DM_MINORS: u32 = 256;
+/// The maximum `data_size` accepted for a TABLE_LOAD ioctl, as a
+/// denial-of-service guard on the heap allocation (tables are tiny; the
+/// Linux tools use a 16 KiB buffer by default).
+const MAX_TABLE_LOAD_SIZE: usize = 1 << 20;
 
 const DM_VERSION_MAJOR: u32 = 4;
 const DM_VERSION_MINOR: u32 = 48;
@@ -45,9 +63,65 @@ const DM_LIST_VERSIONS_CMD: u32 = 13;
 const DM_TABLE_STATUS_CMD: u32 = 12;
 
 const DM_SUSPEND_FLAG: u32 = 1 << 1;
+const DM_ACTIVE_PRESENT_FLAG: u32 = 1 << 5;
+const DM_INACTIVE_PRESENT_FLAG: u32 = 1 << 6;
 const DM_QUERY_INACTIVE_TABLE_FLAG: u32 = 1 << 12;
 
-static DEVICE_REGISTRY: Mutex<BTreeMap<String, Arc<DmDevice>>> = Mutex::new(BTreeMap::new());
+/// A DM device tracked by the control plane.
+struct DmDevEntry {
+    device: Arc<DmDevice>,
+    /// The device ID allocated at DEV_CREATE time (see `dm_block_major`).
+    id: DeviceId,
+    /// Whether the device has been registered in the block-device
+    /// registry (this happens on the first resume, when the device
+    /// becomes live).
+    registered: bool,
+}
+
+/// The ownership of the DM block-device major number (kept alive so that
+/// the major is never reused by another driver).
+static DM_BLOCK_MAJOR_OWNER: Once<aster_block::MajorIdOwner> = Once::new();
+
+/// Returns the DM block-device major, acquiring it on first use.
+///
+/// The conventional DM major (253) is preferred; if another driver has
+/// already taken it (block majors 254 and downward are dynamically
+/// allocated in Asterinas), a fresh dynamic major is used instead.
+fn dm_block_major() -> MajorId {
+    DM_BLOCK_MAJOR_OWNER
+        .call_once(|| {
+            aster_block::acquire_major(MajorId::new(DM_BLOCK_MAJOR))
+                .or_else(|_| aster_block::allocate_major())
+                .expect("failed to allocate a block major for DM")
+        })
+        .get()
+}
+
+static DEVICE_REGISTRY: Mutex<BTreeMap<String, DmDevEntry>> = Mutex::new(BTreeMap::new());
+
+/// A bitmap of allocated DM minor numbers (one bit per minor).
+static MINOR_BITMAP: Mutex<[u64; (MAX_DM_MINORS / 64) as usize]> =
+    Mutex::new([0; (MAX_DM_MINORS / 64) as usize]);
+
+/// Allocates a free DM minor number, or `None` if all are in use.
+fn alloc_minor() -> Option<u32> {
+    let mut bitmap = MINOR_BITMAP.lock();
+    for (word_idx, word) in bitmap.iter_mut().enumerate() {
+        if *word != u64::MAX {
+            let bit = (!*word).trailing_zeros();
+            *word |= 1u64 << bit;
+            return Some(word_idx as u32 * 64 + bit);
+        }
+    }
+    None
+}
+
+/// Returns a DM minor number to the free pool.
+fn free_minor(minor: u32) {
+    debug_assert!(minor < MAX_DM_MINORS);
+    let mut bitmap = MINOR_BITMAP.lock();
+    bitmap[minor as usize / 64] &= !(1u64 << (minor % 64));
+}
 
 #[derive(Debug)]
 struct DmControlDevice;
@@ -58,25 +132,41 @@ impl DmControlDevice {
     }
 
     fn lookup_device(name: &str) -> Option<Arc<DmDevice>> {
-        DEVICE_REGISTRY.lock().get(name).cloned()
+        DEVICE_REGISTRY
+            .lock()
+            .get(name)
+            .map(|entry| entry.device.clone())
     }
 
-    fn create_device(name: &str) -> Result<Arc<DmDevice>> {
+    fn create_device(name: &str) -> Result<(Arc<DmDevice>, DeviceId)> {
         let mut registry = DEVICE_REGISTRY.lock();
         if registry.contains_key(name) {
             return_errno_with_message!(Errno::EEXIST, "device already exists");
         }
-        let device = DmDevice::create(name);
-        registry.insert(String::from(name), device.clone());
-        Ok(device)
+        let minor = alloc_minor()
+            .ok_or_else(|| Error::with_message(Errno::ENOSPC, "no free DM minor"))?;
+        let id = DeviceId::new(dm_block_major(), MinorId::new(minor));
+        let device = DmDevice::create(name, id);
+        registry.insert(
+            String::from(name),
+            DmDevEntry {
+                device: device.clone(),
+                id,
+                registered: false,
+            },
+        );
+        Ok((device, id))
     }
 
     fn remove_device(name: &str) -> Result<()> {
         let mut registry = DEVICE_REGISTRY.lock();
-        if !registry.contains_key(name) {
+        let Some(entry) = registry.remove(name) else {
             return_errno_with_message!(Errno::ENODEV, "device not found");
+        };
+        if entry.registered {
+            let _ = aster_block::unregister(entry.id);
         }
-        registry.remove(name);
+        free_minor(entry.id.minor().get());
         Ok(())
     }
 }
@@ -193,7 +283,13 @@ impl DmControlFile {
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
         let name = name_str.split('\0').next().unwrap_or("");
 
-        DmControlDevice::create_device(name)?;
+        let (_device, id) = DmControlDevice::create_device(name)?;
+
+        // Write back the allocated device number (`dm_ioctl.dev`, offset
+        // 40) so that user space can `mknod /dev/dm-N` with it.
+        const DEV_FIELD_OFFSET: usize = 40;
+        current_userspace!()
+            .write_bytes(arg + DEV_FIELD_OFFSET, &id.as_encoded_u64().to_le_bytes())?;
 
         Ok(())
     }
@@ -214,7 +310,21 @@ impl DmControlFile {
 
     fn handle_table_load(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
         let arg = raw_ioctl.arg();
-        let mut data = [0u8; 312];
+        let mut header = [0u8; 312];
+        current_userspace!().read_bytes(arg, &mut header)?;
+
+        // Parse data_size and data_start
+        let data_size = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        let data_start = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+
+        if data_size < 312 || data_size > MAX_TABLE_LOAD_SIZE || data_start > data_size {
+            return_errno_with_message!(Errno::EINVAL, "invalid data_size or data_start");
+        }
+
+        // Read the whole payload (header + spec chain) into a heap buffer;
+        // a fixed-size stack buffer would either overflow or silently
+        // truncate large tables.
+        let mut data = alloc::vec![0u8; data_size];
         current_userspace!().read_bytes(arg, &mut data)?;
 
         let name_str = str::from_utf8(&data[48..48 + DM_NAME_LEN])
@@ -223,26 +333,6 @@ impl DmControlFile {
 
         let device = DmControlDevice::lookup_device(name)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
-
-        // Parse data_size and data_start
-        let data_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
-        let data_start = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
-
-        if data_size < 312 || data_start > data_size {
-            return_errno_with_message!(Errno::EINVAL, "invalid data_size or data_start");
-        }
-
-        // Get the table data buffer
-        let table_data = if data_size > 312 {
-            &data[312..data_size]
-        } else {
-            &[]
-        };
-
-        // Parse dm_target_spec chain
-        let mut specs_data = [0u8; 4096];
-        let specs_len = core::cmp::min(table_data.len(), specs_data.len());
-        specs_data[..specs_len].copy_from_slice(&table_data[..specs_len]);
 
         // Parse target count
         let target_count =
@@ -254,7 +344,7 @@ impl DmControlFile {
 
         // Parse dm_target_spec chain and build table
         let mut table = DmTable::new();
-        self.parse_target_specs(&specs_data[..specs_len], target_count, &mut table)?;
+        self.parse_target_specs(&data[data_start..], target_count, &mut table)?;
 
         device.load_table(table);
 
@@ -399,6 +489,25 @@ impl DmControlFile {
             // Resume (swap tables and replay deferred I/O)
             device.swap_table();
             device.resume();
+
+            // Register the device in the block-device registry when it
+            // becomes live (has an active table) for the first time.
+            //
+            // Note: block devices registered at runtime do not get a
+            // /dev node automatically (the devtmpfs nodes are created in
+            // the first-process stage, before any DM device exists), so
+            // user space is expected to `mknod /dev/dm-N` with the
+            // device number reported by DEV_CREATE/DEV_STATUS. This is an
+            // intentional simplification.
+            let mut registry = DEVICE_REGISTRY.lock();
+            if let Some(entry) = registry.get_mut(name) {
+                if !entry.registered && entry.device.get_active_table().is_some() {
+                    aster_block::register(entry.device.clone()).map_err(|_| {
+                        Error::with_message(Errno::EIO, "block register failed")
+                    })?;
+                    entry.registered = true;
+                }
+            }
         }
 
         Ok(())
@@ -413,11 +522,27 @@ impl DmControlFile {
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
         let name = name_str.split('\0').next().unwrap_or("");
 
-        DmControlDevice::lookup_device(name)
+        let device = DmControlDevice::lookup_device(name)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
 
-        let dev_field_offset = 40;
-        current_userspace!().write_bytes(arg + dev_field_offset, &0u64.to_le_bytes())?;
+        // Report the real open count (`dm_ioctl.open_count`, offset 24).
+        current_userspace!()
+            .write_bytes(arg + 24, &device.open_count().to_le_bytes())?;
+
+        // Report the table-presence flags (`dm_ioctl.flags`, offset 28).
+        let (active_table, inactive_table) = device.get_tables();
+        let mut out_flags = 0u32;
+        if active_table.is_some() {
+            out_flags |= DM_ACTIVE_PRESENT_FLAG;
+        }
+        if inactive_table.is_some() {
+            out_flags |= DM_INACTIVE_PRESENT_FLAG;
+        }
+        current_userspace!().write_bytes(arg + 28, &out_flags.to_le_bytes())?;
+
+        // Report the real device number (`dm_ioctl.dev`, offset 40).
+        current_userspace!()
+            .write_bytes(arg + 40, &device.id().as_encoded_u64().to_le_bytes())?;
 
         Ok(())
     }

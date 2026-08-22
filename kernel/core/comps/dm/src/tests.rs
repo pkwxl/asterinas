@@ -429,7 +429,8 @@ fn ensure_chunked_target() {
 
 /// Creates a `DmDevice` with `table` as the active table.
 fn create_dm_with_table(table: DmTable) -> Arc<DmDevice> {
-    let dm = DmDevice::create("dmtest-split");
+    let id = DeviceId::new(MajorId::new(253), MinorId::new(7));
+    let dm = DmDevice::create("dmtest-split", id);
     dm.load_table(table);
     dm.swap_table();
     dm
