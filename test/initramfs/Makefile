@@ -31,6 +31,7 @@ EXT2_IMAGE := $(BUILD_DIR)/ext2.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
 LTP_DEV_IMAGE := $(BUILD_DIR)/ltp_dev.img
 DM_TEST_IMAGE := $(BUILD_DIR)/dm_test.img
+DM_TEST2_IMAGE := $(BUILD_DIR)/dm_test2.img
 SSD_IMAGE := $(BUILD_DIR)/nvme0n1.img
 XFSTESTS_TEST_IMAGE := $(BUILD_DIR)/xfstests_test.img
 XFSTESTS_SCRATCH_IMAGE := $(BUILD_DIR)/xfstests_scratch.img
@@ -64,9 +65,9 @@ build: $(EXT2_IMAGE) $(EXFAT_IMAGE)
 	@echo "For loongarch, we generate a fake initramfs to successfully test or build."
 	@touch $(INITRAMFS_IMAGE)
 else ifeq ($(BUILD_XFSTESTS_IMAGES), true)
-build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(DM_TEST_IMAGE) $(SSD_IMAGE) $(XFSTESTS_TEST_IMAGE) $(XFSTESTS_SCRATCH_IMAGE)
+build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(DM_TEST_IMAGE) $(DM_TEST2_IMAGE) $(SSD_IMAGE) $(XFSTESTS_TEST_IMAGE) $(XFSTESTS_SCRATCH_IMAGE)
 else
-build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(DM_TEST_IMAGE) $(SSD_IMAGE)
+build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(DM_TEST_IMAGE) $(DM_TEST2_IMAGE) $(SSD_IMAGE)
 endif
 
 .PHONY: $(INITRAMFS_IMAGE)
@@ -187,6 +188,12 @@ $(DM_TEST_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@dd if=/dev/zero of=$(DM_TEST_IMAGE) bs=256M count=1
 	@mke2fs -t ext2 -F $(DM_TEST_IMAGE)
+
+# Raw disk without a filesystem; used as the second stripe leg by the
+# dm-striped regression test.
+$(DM_TEST2_IMAGE):
+	@mkdir -p $(BUILD_DIR)
+	@dd if=/dev/zero of=$(DM_TEST2_IMAGE) bs=256M count=1
 
 $(SSD_IMAGE):
 	@mkdir -p $(BUILD_DIR)

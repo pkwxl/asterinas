@@ -150,6 +150,7 @@ COMMON_QEMU_ARGS="\
     -drive if=none,format=raw,id=x1,file=./test/initramfs/build/exfat.img \
     -drive if=none,format=raw,id=x2,file=./test/initramfs/build/ltp_dev.img \
     -drive if=none,format=raw,id=x3,file=./test/initramfs/build/dm_test.img \
+    -drive if=none,format=raw,id=x9,file=./test/initramfs/build/dm_test2.img \
 "
 
 # Add xfstests drives when the selected conformance suite is `xfstests`.
@@ -183,6 +184,7 @@ if [ "$1" = "microvm" ]; then
         -device virtio-blk-device,drive=x1,serial=vexfat \
         -device virtio-blk-device,drive=x2,serial=vltpdev \
         -device virtio-blk-device,drive=x3,serial=vdmtest \
+        -device virtio-blk-device,drive=x9,serial=vdmtest2 \
         -device virtio-keyboard-device \
         -device virtio-net-device,netdev=net01 \
         -device virtio-serial-device \
