@@ -22,3 +22,4 @@ set -e
 ./nvme
 ./random
 ./dm_linear
+./dm_stripe

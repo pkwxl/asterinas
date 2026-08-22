@@ -5,5 +5,6 @@ SUBDIRS := \
 	vt
 
 C_SRCS += dm_linear.c
+C_SRCS += dm_stripe.c
 
 include ../common/Makefile
