@@ -2,9 +2,11 @@
 
 //! Target type abstraction and registry for DM
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::any::Any;
 
-use crate::alloc::string::ToString;
+use aster_block::BlockDevice;
+use ostd::sync::SpinLock;
 
 /// The name of a target type (e.g., "linear", "error")
 pub type TargetTypeName = str;
@@ -36,6 +38,25 @@ impl TargetVersion {
     }
 }
 
+/// The outcome of a target constructor (`TargetType::ctr`):
+/// the target's private data plus its per-target `max_io_len`
+/// (in sectors; 0 means "no limit", cf. Linux `dm_set_target_max_io_len`).
+pub struct CtrOutcome {
+    /// Private data of the constructed target instance.
+    pub private: Box<dyn Any + Send + Sync>,
+    /// Maximum I/O length in sectors for this target instance (0 = unlimited).
+    pub max_io_len: u64,
+}
+
+/// The result of mapping a sector through a target:
+/// the underlying device to forward to and the absolute sector on it.
+pub struct MappedIo {
+    /// The underlying block device selected by the target.
+    pub device: Arc<dyn BlockDevice>,
+    /// The absolute sector on the underlying device.
+    pub sector: u64,
+}
+
 /// Target type definition
 pub trait TargetType: Send + Sync {
     /// Return the name of this target type
@@ -44,66 +65,83 @@ pub trait TargetType: Send + Sync {
     /// Return the version of this target type
     fn version(&self) -> TargetVersion;
 
-    /// Construct a new target instance with the given parameters
+    /// Construct a new target instance.
     ///
-    /// Parameters are space-separated tokens from the ctr table line.
-    /// Returns Ok(target_private_data) on success, Err(error_str) on failure.
-    fn ctr(&self, params: &[&str]) -> Result<Box<dyn core::any::Any>, &'static str>;
-
-    /// Destruct a target instance
-    fn dtr(&self, private: &mut dyn core::any::Any);
-
-    /// Map a sector through this target
+    /// - `len`: the length (in sectors) of this target in the DM device
+    ///   (needed by e.g. striped ctr validation, cf. Linux `ti->len`).
+    /// - `params`: space-separated tokens from the ctr table line.
     ///
-    /// Returns Ok(new_sector) on success, Err(error_str) on failure.
-    fn map(&self, private: &dyn core::any::Any, sector: u64) -> Result<u64, &'static str>;
+    /// Returns the private data and the per-target `max_io_len` on success.
+    fn ctr(&self, len: u64, params: &[&str]) -> Result<CtrOutcome, &'static str>;
 
-    /// Get the status string for this target instance
-    fn status(&self, private: &dyn core::any::Any) -> &'static str;
+    /// Destruct a target instance. The default implementation simply drops
+    /// the private data.
+    fn dtr(&self, _private: Box<dyn Any + Send + Sync>) {}
+
+    /// Map a sector through this target.
+    ///
+    /// `sector_in_target` is relative to the target's begin sector (the caller
+    /// has already subtracted `begin` and verified the sector is in range),
+    /// matching Linux's `map(sector - ti->begin)` semantics.
+    ///
+    /// Returns the underlying device and the absolute sector on it;
+    /// error targets return `Err` here.
+    fn map(&self, private: &dyn Any, sector_in_target: u64) -> Result<MappedIo, &'static str>;
+
+    /// Get the STATUSTYPE_TABLE parameter string for this target instance
+    /// (without the target type name itself), e.g. "vdd 2048" for linear.
+    fn status(&self, private: &dyn Any) -> String;
 }
 
 /// Global registry of target types
 struct Registry {
-    targets: Vec<(String, Box<dyn TargetType>)>,
+    targets: Vec<Arc<dyn TargetType>>,
 }
 
 impl Registry {
-    fn register(&mut self, target_type: Box<dyn TargetType>) -> Result<(), &'static str> {
-        let name = target_type.name().to_string();
-        if self.targets.iter().any(|(n, _)| n == &name) {
+    fn register(&mut self, target_type: Arc<dyn TargetType>) -> Result<(), &'static str> {
+        if self
+            .targets
+            .iter()
+            .any(|t| t.name() == target_type.name())
+        {
             return Err("Target type already registered");
         }
-        self.targets.push((name, target_type));
+        self.targets.push(target_type);
         Ok(())
-    }
-
-    #[expect(dead_code)]
-    fn lookup<'a>(&'a self, name: &'a str) -> Option<&'a dyn TargetType> {
-        self.targets
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, b)| b.as_ref())
     }
 }
 
-/// Use a static registry with interior mutability via SpinLock
-/// Initialize with empty Vec directly to avoid calling new() in const context
-use ostd::sync::SpinLock;
 static REGISTRY: SpinLock<Registry> = SpinLock::new(Registry {
     targets: Vec::new(),
 });
 
 /// Register a target type globally
-pub fn register_target(target_type: Box<dyn TargetType>) -> Result<(), &'static str> {
-    let mut registry = REGISTRY.lock();
-    registry.register(target_type)
+pub fn register_target(target_type: Arc<dyn TargetType>) -> Result<(), &'static str> {
+    REGISTRY.lock().register(target_type)
 }
 
-/// Lookup a target type by name
-/// Returns None because we can't return a reference that outlives the lock guard.
-/// In practice, targets are looked up only during init phase when the system is single-threaded.
-pub fn lookup_target(_name: &str) -> Option<&'static dyn TargetType> {
-    // For now, return None as we can't safely return a reference from within the lock
-    // This will be fixed in T-003 with proper design
-    None
+/// Lookup a target type by name.
+///
+/// The `Arc` is cloned while holding the lock and returned to the caller,
+/// so there is no lifetime tied to the registry lock.
+pub fn lookup_target(name: &str) -> Option<Arc<dyn TargetType>> {
+    REGISTRY
+        .lock()
+        .targets
+        .iter()
+        .find(|t| t.name() == name)
+        .cloned()
+}
+
+/// Take a snapshot of the registry as (name, version) pairs.
+///
+/// Used by the control plane to implement DM_LIST_VERSIONS.
+pub fn snapshot_targets() -> Vec<(String, TargetVersion)> {
+    REGISTRY
+        .lock()
+        .targets
+        .iter()
+        .map(|t| (String::from(t.name()), t.version()))
+        .collect()
 }

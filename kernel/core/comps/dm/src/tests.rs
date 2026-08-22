@@ -1,189 +1,282 @@
 // SPDX-License-Identifier: MPL-2.0
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+//! Kernel-mode unit tests (ktest) for the DM core.
+//!
+//! Contract under test: `TargetType::map` receives a sector that has already
+//! been translated into target-relative form (`abs_sector - begin`) and
+//! returns a `MappedIo` (underlying device + absolute sector on it).
 
-    #[test]
-    fn test_dm_table_adjoin() {
-        let mut table = DmTable::new();
+use alloc::{string::String, sync::Arc};
 
-        // Add first target at sector 0
-        let target1 = DmTarget::new_empty(0, 100);
-        table.add_target(target1).unwrap();
+use aster_block::{
+    BlockDevice, BlockDeviceMeta,
+    bio::{BioEnqueueError, BioStatus, SubmittedBio},
+};
+use device_id::{DeviceId, MajorId, MinorId};
+use ostd::prelude::*;
 
-        // Add second target adjacent to first
-        let target2 = DmTarget::new_empty(100, 50);
-        table.add_target(target2).unwrap();
+use crate::{
+    DmTable, ErrorTargetType, LinearTargetType, TargetType, TargetVersion, lookup_target,
+    register_target, snapshot_targets,
+};
 
-        assert_eq!(table.nr_sectors(), 150);
+/// The global target registry is shared by all tests in one ktest run, so
+/// every registration helper here must be idempotent.
+fn ensure_builtin_targets() {
+    // Ignore "already registered" errors.
+    let _ = register_target(Arc::new(LinearTargetType::new()));
+    let _ = register_target(Arc::new(ErrorTargetType::new()));
+}
+
+/// A minimal in-memory block device used to satisfy linear ctr's device
+/// resolution. It never actually stores data.
+#[derive(Debug)]
+struct DummyDisk {
+    name: String,
+    id: DeviceId,
+}
+
+impl BlockDevice for DummyDisk {
+    fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        bio.complete(BioStatus::Complete);
+        Ok(())
     }
 
-    #[test]
-    fn test_dm_table_adjoin_violation() {
-        let mut table = DmTable::new();
-
-        // Add first target at sector 0
-        let target1 = DmTarget::new_empty(0, 100);
-        table.add_target(target1).unwrap();
-
-        // Try to add target with gap (begin != current nr_sectors)
-        let target2 = DmTarget::new_empty(150, 50);
-        assert!(table.add_target(target2).is_err());
+    fn metadata(&self) -> BlockDeviceMeta {
+        BlockDeviceMeta {
+            max_nr_segments_per_bio: 1,
+            nr_sectors: 4096,
+        }
     }
 
-    #[test]
-    fn test_dm_table_find_target() {
-        let mut table = DmTable::new();
-
-        // Add targets
-        let target1 = DmTarget::new_empty(0, 100);
-        table.add_target(target1).unwrap();
-        let target2 = DmTarget::new_empty(100, 50);
-        table.add_target(target2).unwrap();
-
-        assert!(table.find_target(50).is_some());
-        assert!(table.find_target(99).is_some());
-        assert!(table.find_target(100).is_some());
-        assert!(table.find_target(149).is_some());
-        assert!(table.find_target(150).is_none());
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    #[test]
-    fn test_dm_table_sector_mapping() {
-        let mut table = DmTable::new();
-
-        // Add linear target at sector 100 with offset 200
-        let target_type = crate::target::lookup_target("linear")
-            .unwrap_or_else(|| panic!("linear not registered"));
-        let priv_data = TargetPrivate::new(200);
-        let target = DmTarget::new(100, 50, target_type, Some(priv_data));
-        table.add_target(target).unwrap();
-
-        // Sector 100 in DM device -> sector 300 on underlying (offset + (100 - 100) = 200 + 0)
-        // But map_sector expects relative to begin
-        let mapped = table.find_target(100).unwrap().map_sector(100);
-        assert_eq!(mapped.unwrap(), 200);
-
-        let mapped = table.find_target(120).unwrap().map_sector(120);
-        assert_eq!(mapped.unwrap(), 220);
-    }
-
-    #[test]
-    fn test_dm_table_error_target() {
-        let mut table = DmTable::new();
-
-        // Add error target
-        let target_type = crate::target::lookup_target("error")
-            .unwrap_or_else(|| panic!("error not registered"));
-        let priv_data = TargetPrivate::new_error();
-        let target = DmTarget::new(0, 100, target_type, Some(priv_data));
-        table.add_target(target).unwrap();
-
-        // Error target map should fail
-        let result = table.find_target(50).unwrap().map_sector(50);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_dm_device_create() {
-        let device = DmDevice::create("test");
-        assert_eq!(device.name(), "test");
-        assert!(device.get_active_table().is_none());
-        assert!(!device.is_suspended());
-    }
-
-    #[test]
-    fn test_dm_device_suspend_resume() {
-        let device = DmDevice::create("test");
-
-        // Create a simple table
-        let mut table = DmTable::new();
-        let target_type = crate::target::lookup_target("linear")
-            .unwrap_or_else(|| panic!("linear not registered"));
-        let priv_data = TargetPrivate::new(0);
-        let target = DmTarget::new(0, 100, target_type, Some(priv_data));
-        table.add_target(target).unwrap();
-
-        device.load_table(table);
-        device.swap_table();
-
-        // Suspend
-        device.suspend();
-        assert!(device.is_suspended());
-
-        // Resume
-        device.resume();
-        assert!(!device.is_suspended());
-    }
-
-    #[test]
-    fn test_dm_device_deferred_queue() {
-        use aster_block::bio::{Bio, BioOp, SubmittedBio};
-        use ostd::buff::PageBuff;
-
-        let device = DmDevice::create("test");
-
-        // Suspend first
-        device.suspend();
-
-        // Create a simple bio
-        let buff = PageBuff::alloc_kernel_page(1).unwrap();
-        let mut bio = Bio::new(vec![buff], 0, BioOp::Write).unwrap();
-        bio.set_sid_offset(0);
-
-        let submitted = SubmittedBio::new(bio).unwrap();
-
-        // Enqueue should defer since suspended
-        let result = device.enqueue(submitted.clone());
-        assert!(result.is_ok(), "Enqueue should succeed for deferred bio");
-
-        // Verify bio was added to queue (SpinLock.lock() instead of RefCell.borrow())
-        let queue = device.deferred_queue.lock();
-        assert_eq!(queue.len(), 1);
+    fn id(&self) -> DeviceId {
+        self.id
     }
 }
 
-    #[test]
-    fn test_dm_target_contains() {
-        let target = DmTarget::new_empty(100, 50);
+const DUMMY_DEV_NAME: &str = "dmtestdummy0";
 
-        assert!(!target.contains(99));
-        assert!(target.contains(100));
-        assert!(target.contains(149));
-        assert!(!target.contains(150));
+/// Register the dummy block device (idempotent) and return it.
+fn ensure_dummy_device() -> Arc<dyn BlockDevice> {
+    if let Some(dev) = aster_block::collect_all()
+        .into_iter()
+        .find(|d| d.name() == DUMMY_DEV_NAME)
+    {
+        return dev;
+    }
+    let dev = Arc::new(DummyDisk {
+        name: String::from(DUMMY_DEV_NAME),
+        id: DeviceId::new(MajorId::new(250), MinorId::new(250)),
+    });
+    aster_block::register(dev.clone()).unwrap();
+    dev
+}
+
+fn linear_type() -> Arc<dyn TargetType> {
+    ensure_builtin_targets();
+    lookup_target("linear").expect("linear target should be registered")
+}
+
+fn error_type() -> Arc<dyn TargetType> {
+    ensure_builtin_targets();
+    lookup_target("error").expect("error target should be registered")
+}
+
+struct DummyTargetType;
+
+impl TargetType for DummyTargetType {
+    fn name(&self) -> &str {
+        "t010_dummy"
     }
 
-    #[test]
-    fn test_dm_target_end() {
-        let target = DmTarget::new_empty(100, 50);
-        assert_eq!(target.end(), 150);
+    fn version(&self) -> TargetVersion {
+        TargetVersion::new(9, 8, 7)
+    }
+
+    fn ctr(
+        &self,
+        _len: u64,
+        _params: &[&str],
+    ) -> Result<crate::CtrOutcome, &'static str> {
+        Err("dummy: not constructible")
+    }
+
+    fn map(
+        &self,
+        _private: &dyn core::any::Any,
+        _sector_in_target: u64,
+    ) -> Result<crate::MappedIo, &'static str> {
+        Err("dummy: not mappable")
+    }
+
+    fn status(&self, _private: &dyn core::any::Any) -> String {
+        String::new()
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct DmIoctl {
-    version: [u32; 3],
-    data_size: u32,
-    data_start: u32,
-    target_count: u32,
-    open_count: i32,
-    flags: u32,
-    event_nr: u32,
-    padding: u32,
-    dev: u64,
-    name: [u8; 128],
-    uuid: [u8; 129],
-    data: [u8; 7],
+#[ktest]
+fn registry_register_lookup_snapshot() {
+    // Registering a fresh target type succeeds.
+    let first = register_target(Arc::new(DummyTargetType));
+    assert!(
+        first.is_ok() || first == Err("Target type already registered"),
+        "unexpected register error"
+    );
+
+    // Duplicate registration is rejected.
+    let dup = register_target(Arc::new(DummyTargetType));
+    assert_eq!(dup, Err("Target type already registered"));
+
+    // Lookup returns a usable Arc clone.
+    let looked_up = lookup_target("t010_dummy").expect("dummy target should be registered");
+    assert_eq!(looked_up.name(), "t010_dummy");
+    assert_eq!(looked_up.version().to_dm_version(), (9 << 16) | (8 << 8) | 7);
+
+    // Unknown names yield None instead of panicking.
+    assert!(lookup_target("no_such_target_xyz").is_none());
+
+    // The snapshot covers the registered target.
+    let snapshot = snapshot_targets();
+    assert!(
+        snapshot
+            .iter()
+            .any(|(name, ver)| name == "t010_dummy" && ver.to_dm_version() == (9 << 16) | (8 << 8) | 7)
+    );
 }
 
-#[repr(C, align(8))]
-#[derive(Debug, Clone, Copy)]
-struct DmTargetSpec {
-    sector_start: u64,
-    length: u64,
-    status: i32,
-    next: u32,
-    target_type: [u8; 16],
+#[ktest]
+fn linear_ctr_rejects_bad_params() {
+    let dev = ensure_dummy_device();
+    let linear = linear_type();
+
+    // Wrong parameter counts.
+    assert!(linear.ctr(100, &[]).is_err());
+    assert!(linear.ctr(100, &["onlyone"]).is_err());
+    assert!(linear.ctr(100, &[DUMMY_DEV_NAME, "2048", "extra"]).is_err());
+
+    // Non-decimal / negative offsets.
+    assert!(linear.ctr(100, &[DUMMY_DEV_NAME, "12a3"]).is_err());
+    assert!(linear.ctr(100, &[DUMMY_DEV_NAME, "-5"]).is_err());
+    assert!(linear.ctr(100, &[DUMMY_DEV_NAME, ""]).is_err());
+
+    // Unknown underlying device.
+    assert!(linear.ctr(100, &["no_such_dev_xyz", "0"]).is_err());
+
+    // Valid forms: bare name and "/dev/"-prefixed name.
+    let outcome = linear.ctr(100, &[DUMMY_DEV_NAME, "2048"]).unwrap();
+    assert_eq!(outcome.max_io_len, 0);
+    let outcome_prefixed = linear.ctr(100, &["/dev/dmtestdummy0", "2048"]).unwrap();
+    assert_eq!(outcome_prefixed.max_io_len, 0);
+
+    // Sanity: the resolved device is the dummy disk.
+    let mapped = linear.map(&*outcome.private, 0).unwrap();
+    assert_eq!(mapped.device.name(), dev.name());
+}
+
+#[ktest]
+fn linear_map_formula() {
+    ensure_dummy_device();
+    let linear = linear_type();
+    let outcome = linear.ctr(100, &[DUMMY_DEV_NAME, "2048"]).unwrap();
+
+    // map receives a target-relative sector: dev_sector = offset + sector_in_target.
+    assert_eq!(linear.map(&*outcome.private, 0).unwrap().sector, 2048);
+    assert_eq!(linear.map(&*outcome.private, 7).unwrap().sector, 2055);
+    assert_eq!(linear.map(&*outcome.private, 99).unwrap().sector, 2147);
+}
+
+#[ktest]
+fn error_target_behaves() {
+    let error = error_type();
+
+    // ctr takes no parameters and reports no max_io_len limit.
+    assert!(error.ctr(64, &["unexpected"]).is_err());
+    let outcome = error.ctr(64, &[]).unwrap();
+    assert_eq!(outcome.max_io_len, 0);
+
+    // map always fails.
+    assert!(error.map(&*outcome.private, 0).is_err());
+    assert!(error.map(&*outcome.private, 63).is_err());
+
+    // status is an empty parameter string.
+    assert_eq!(error.status(&*outcome.private), "");
+}
+
+#[ktest]
+fn table_add_target_adjoin_rules() {
+    ensure_builtin_targets();
+
+    let mut table = DmTable::new();
+    table.add_target(0, 100, "error", "").unwrap();
+    table.add_target(100, 50, "error", "").unwrap();
+    assert_eq!(table.nr_sectors(), 150);
+
+    // Gap: begin must equal the current nr_sectors.
+    assert!(table.add_target(200, 10, "error", "").is_err());
+    // Zero length is rejected.
+    assert!(table.add_target(150, 0, "error", "").is_err());
+    // The table is unchanged by the rejected additions.
+    assert_eq!(table.nr_sectors(), 150);
+    assert_eq!(table.targets().len(), 2);
+}
+
+#[ktest]
+fn table_add_target_unknown_type() {
+    ensure_builtin_targets();
+
+    let mut table = DmTable::new();
+    assert!(table.add_target(0, 10, "nonexistent_xyz", "").is_err());
+    assert_eq!(table.nr_sectors(), 0);
+    assert!(table.targets().is_empty());
+}
+
+#[ktest]
+fn table_find_target_bounds() {
+    ensure_builtin_targets();
+
+    let mut table = DmTable::new();
+    table.add_target(0, 100, "error", "").unwrap();
+    table.add_target(100, 50, "error", "").unwrap();
+
+    assert_eq!(table.find_target(0).unwrap().begin, 0);
+    assert_eq!(table.find_target(99).unwrap().begin, 0);
+    assert_eq!(table.find_target(100).unwrap().begin, 100);
+    assert_eq!(table.find_target(149).unwrap().begin, 100);
+    assert!(table.find_target(150).is_none());
+
+    // max_io_len is recorded on the target (error target: unlimited).
+    assert_eq!(table.find_target(0).unwrap().max_io_len, 0);
+}
+
+#[ktest]
+fn table_map_and_status_via_target() {
+    ensure_builtin_targets();
+    ensure_dummy_device();
+
+    let mut table = DmTable::new();
+    table.add_target(0, 100, "linear", "dmtestdummy0 2048").unwrap();
+    table.add_target(100, 50, "error", "").unwrap();
+
+    // DmTarget::map takes an absolute sector, subtracts begin internally.
+    let linear_target = table.find_target(5).unwrap();
+    let mapped = linear_target.map(5).unwrap();
+    assert_eq!(mapped.sector, 2048 + 5);
+    assert_eq!(mapped.device.name(), DUMMY_DEV_NAME);
+
+    // Second target: absolute sector 120 -> target-relative 20.
+    let error_target = table.find_target(120).unwrap();
+    assert!(error_target.map(120).is_err());
+
+    // Out-of-range absolute sector is rejected by DmTarget::map.
+    assert!(table.find_target(150).is_none());
+
+    // status_params comes from TargetType::status.
+    assert_eq!(linear_target.status_params(), "dmtestdummy0 2048");
+    assert_eq!(error_target.status_params(), "");
+    assert_eq!(linear_target.type_name(), "linear");
+    assert_eq!(error_target.type_name(), "error");
 }

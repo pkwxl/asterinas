@@ -82,6 +82,7 @@ default-members = [
     "kernel/core/comps/block",
     "kernel/core/comps/cmdline",
     "kernel/core/comps/console",
+    "kernel/core/comps/dm",
     "kernel/core/comps/framebuffer",
     "kernel/core/comps/i8042",
     "kernel/core/comps/input",

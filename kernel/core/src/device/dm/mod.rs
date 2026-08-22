@@ -372,15 +372,9 @@ impl DmControlFile {
         target_type_str: &str,
         params_str: &str,
     ) -> Result<()> {
-        match target_type_str {
-            "linear" => table.add_linear_target(sector_start, length, params_str)
-                .map_err(|e| Error::with_message(Errno::EINVAL, e)),
-            "error" => table.add_error_target(sector_start, length)
-                .map_err(|e| Error::with_message(Errno::EINVAL, e)),
-            _ => {
-                return_errno_with_message!(Errno::EINVAL, "unsupported target type")
-            }
-        }
+        table
+            .add_target(sector_start, length, target_type_str, params_str)
+            .map_err(|e| Error::with_message(Errno::EINVAL, e))
     }
 
     fn handle_dev_suspend(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
@@ -466,19 +460,9 @@ impl DmControlFile {
                 let begin = target.begin;
                 let len = target.len;
                 let type_name = target.type_name();
-                
-                // Build params
-                let mut params_str = String::new();
-                match &target.private {
-                    Some(priv_data) => {
-                        params_str.push_str("none ");
-                        params_str.push_str(&priv_data.offset.to_string());
-                        params_str.push(' ');
-                    }
-                    None => {
-                        params_str.push_str("none");
-                    }
-                }
+
+                // Build params from the target's own status output
+                let params_str = target.status_params();
 
                 // Build target string: "<begin> <len> <type_name> <params>"
                 status_str.push_str(&begin.to_string());
@@ -506,5 +490,6 @@ impl DmControlFile {
 }
 
 pub(super) fn init_in_first_kthread() {
+    aster_dm::init();
     char::register(DmControlDevice::new()).unwrap();
 }

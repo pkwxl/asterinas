@@ -9,10 +9,10 @@
 
 #![no_std]
 #![deny(unsafe_code)]
-// Temporarily allow unsafe until we refactor to avoid it
-#![allow(unsafe_code)]
 
 extern crate alloc;
+
+use alloc::sync::Arc;
 
 mod device;
 mod error;
@@ -20,10 +20,23 @@ mod linear;
 mod table;
 mod target;
 
-// Debug is required by BlockDevice trait - implemented in table.rs
+#[cfg(ktest)]
+mod tests;
 
 pub use device::DmDevice;
-pub use error::DmError;
-pub use linear::{LinearTargetType, register_linear_target};
-pub use table::{DmTable, DmTarget, TargetPrivate};
-pub use target::{TargetType, TargetVersion, lookup_target, register_target};
+pub use error::{DmError, ErrorTargetType};
+pub use linear::LinearTargetType;
+pub use table::{DmTable, DmTarget};
+pub use target::{
+    CtrOutcome, MappedIo, TargetType, TargetVersion, lookup_target, register_target,
+    snapshot_targets,
+};
+
+/// Register all built-in target types.
+///
+/// Called once by the control-plane glue (`device::dm`) during the
+/// first_kthread init stage.
+pub fn init() {
+    register_target(Arc::new(LinearTargetType::new())).expect("failed to register linear target");
+    register_target(Arc::new(ErrorTargetType::new())).expect("failed to register error target");
+}
