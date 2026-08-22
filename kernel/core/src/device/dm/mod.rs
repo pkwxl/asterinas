@@ -8,8 +8,10 @@
 //! - DM_DEV_REMOVE: remove mapped device
 //! - DM_TABLE_LOAD: load inactive table
 //! - DM_DEV_SUSPEND: suspend/resume device
+//! - DM_DEV_STATUS: query device status
+//! - DM_LIST_VERSIONS: list registered target types
+//! - DM_TABLE_STATUS: dump the (in)active table in the DM ABI format
 
-use alloc::{string::String, sync::Arc};
 use core::str;
 
 use device_id::{DeviceId, MajorId, MinorId};
@@ -22,6 +24,7 @@ use crate::{
     fs::{file::PerOpenFileOps, vfs::inode::FileOps},
     prelude::*,
     process::signal::{PollHandle, Pollable},
+    util::ioctl::RawIoctl,
 };
 
 use aster_block::BlockDevice;
@@ -51,21 +54,96 @@ const DM_VERSION_MINOR: u32 = 48;
 const DM_VERSION_PATCHLEVEL: u32 = 0;
 
 const DM_NAME_LEN: usize = 128;
-const DM_UUID_LEN: usize = 129;
 const DM_TARGET_TYPE_LEN: usize = 16;
+
+/// `sizeof(struct dm_ioctl)`: the fixed-size header every DM ioctl carries.
+const DM_IOCTL_HEADER_LEN: usize = 312;
+/// `sizeof(struct dm_target_spec)`: sector_start + length + status + next
+/// + target_type[16]; the parameter string follows immediately after.
+const DM_TARGET_SPEC_LEN: usize = 40;
+/// `sizeof(struct dm_target_versions)` without the flexible `name[]`
+/// member: next + version[3].
+const DM_TARGET_VERSIONS_HEADER_LEN: usize = 16;
+
+/// The full encoding of every DM ioctl command on x86_64:
+/// `_IOWR(0xfd, nr, struct dm_ioctl)` == `0xC138FD00 | nr`.
+const DM_IOCTL_CMD_BASE: u32 = 0xC138FD00;
+
+// Field offsets in `struct dm_ioctl` (see linux/include/uapi/linux/dm-ioctl.h).
+const OFF_VERSION: usize = 0;
+const OFF_DATA_SIZE: usize = 12;
+const OFF_DATA_START: usize = 16;
+const OFF_TARGET_COUNT: usize = 20;
+const OFF_OPEN_COUNT: usize = 24;
+const OFF_FLAGS: usize = 28;
+const OFF_DEV: usize = 40;
+const OFF_NAME: usize = 48;
 
 const DM_DEV_CREATE_CMD: u32 = 3;
 const DM_DEV_REMOVE_CMD: u32 = 4;
+const DM_DEV_STATUS_CMD: u32 = 5;
 const DM_DEV_SUSPEND_CMD: u32 = 6;
 const DM_TABLE_LOAD_CMD: u32 = 9;
-const DM_DEV_STATUS_CMD: u32 = 5;
-const DM_LIST_VERSIONS_CMD: u32 = 13;
 const DM_TABLE_STATUS_CMD: u32 = 12;
+const DM_LIST_VERSIONS_CMD: u32 = 13;
 
 const DM_SUSPEND_FLAG: u32 = 1 << 1;
 const DM_ACTIVE_PRESENT_FLAG: u32 = 1 << 5;
 const DM_INACTIVE_PRESENT_FLAG: u32 = 1 << 6;
+const DM_BUFFER_FULL_FLAG: u32 = 1 << 8;
 const DM_QUERY_INACTIVE_TABLE_FLAG: u32 = 1 << 12;
+
+/// Reads a little-endian `u32` field from a `dm_ioctl` header buffer.
+fn get_u32(header: &[u8; DM_IOCTL_HEADER_LEN], offset: usize) -> u32 {
+    u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap())
+}
+
+/// Reads the fixed-size `dm_ioctl` header from user space.
+fn read_header(arg: usize) -> Result<[u8; DM_IOCTL_HEADER_LEN]> {
+    let mut header = [0u8; DM_IOCTL_HEADER_LEN];
+    current_userspace!().read_bytes(arg, &mut header)?;
+    Ok(header)
+}
+
+/// Extracts the NUL-terminated device name from a `dm_ioctl` header.
+fn parse_name(header: &[u8; DM_IOCTL_HEADER_LEN]) -> Result<&str> {
+    let name_bytes = &header[OFF_NAME..OFF_NAME + DM_NAME_LEN];
+    let name_str = str::from_utf8(name_bytes)
+        .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
+    Ok(name_str.split('\0').next().unwrap_or(""))
+}
+
+/// Writes the kernel's interface version (4.48.0) back to user space,
+/// as Linux's `check_version` does for every DM ioctl.
+fn write_back_version(arg: usize) -> Result<()> {
+    let mut out = [0u8; 12];
+    out[0..4].copy_from_slice(&DM_VERSION_MAJOR.to_le_bytes());
+    out[4..8].copy_from_slice(&DM_VERSION_MINOR.to_le_bytes());
+    out[8..12].copy_from_slice(&DM_VERSION_PATCHLEVEL.to_le_bytes());
+    current_userspace!().write_bytes(arg, &out)?;
+    Ok(())
+}
+
+/// Writes the table-presence flags (`dm_ioctl.flags`) back to user space,
+/// as `__dev_status` does in Linux.
+fn write_back_present_flags(arg: usize, device: &DmDevice, extra_flags: u32) -> Result<()> {
+    let (active_table, inactive_table) = device.get_tables();
+    let mut out_flags = extra_flags;
+    if active_table.is_some() {
+        out_flags |= DM_ACTIVE_PRESENT_FLAG;
+    }
+    if inactive_table.is_some() {
+        out_flags |= DM_INACTIVE_PRESENT_FLAG;
+    }
+    current_userspace!().write_bytes(arg + OFF_FLAGS, &out_flags.to_le_bytes())?;
+    Ok(())
+}
+
+/// Rounds `n` up to the next 8-byte boundary (the alignment of
+/// `dm_target_spec`/`dm_target_versions` entries in the data area).
+const fn align8(n: usize) -> usize {
+    (n + 7) & !7
+}
 
 /// A DM device tracked by the control plane.
 struct DmDevEntry {
@@ -232,76 +310,92 @@ impl PerOpenFileOps for DmControlFile {
         false
     }
 
-    fn ioctl(
-        &self,
-        _path: &crate::fs::vfs::path::Path,
-        raw_ioctl: crate::util::ioctl::RawIoctl,
-    ) -> Result<i32> {
-        let nr = raw_ioctl.cmd() & 0xFF;
+    fn ioctl(&self, _path: &crate::fs::vfs::path::Path, raw_ioctl: RawIoctl) -> Result<i32> {
+        let cmd = raw_ioctl.cmd();
+        let nr = cmd & 0xFF;
+
+        // The full command encoding must be `_IOWR(0xfd, nr, struct
+        // dm_ioctl)` (`0xC138FD00 | nr` on x86_64); matching only the low
+        // byte would interpret any unrelated ioctl whose low byte collides
+        // with a DM command number as a DM command.
+        let is_known_nr = matches!(
+            nr,
+            0 | DM_DEV_CREATE_CMD
+                | DM_DEV_REMOVE_CMD
+                | DM_DEV_STATUS_CMD
+                | DM_DEV_SUSPEND_CMD
+                | DM_TABLE_LOAD_CMD
+                | DM_TABLE_STATUS_CMD
+                | DM_LIST_VERSIONS_CMD
+        );
+        if !is_known_nr || cmd != DM_IOCTL_CMD_BASE | nr {
+            return_errno_with_message!(Errno::ENOTTY, "unknown DM ioctl command");
+        }
+
+        // Every DM ioctl carries the fixed-size header with the interface
+        // version; validate it (and write back the kernel version) before
+        // dispatching, as `check_version`/`copy_params` do in Linux.
+        self.check_version(&raw_ioctl)?;
 
         match nr {
-            0 => self.handle_version(raw_ioctl)?,
+            // The version query is fully handled by `check_version`.
+            0 => {}
             DM_DEV_CREATE_CMD => self.handle_dev_create(raw_ioctl)?,
             DM_DEV_REMOVE_CMD => self.handle_dev_remove(raw_ioctl)?,
             DM_TABLE_LOAD_CMD => self.handle_table_load(raw_ioctl)?,
             DM_DEV_SUSPEND_CMD => self.handle_dev_suspend(raw_ioctl)?,
             DM_DEV_STATUS_CMD => self.handle_dev_status(raw_ioctl)?,
-            DM_LIST_VERSIONS_CMD => self.handle_list_versions()?,
+            DM_LIST_VERSIONS_CMD => self.handle_list_versions(raw_ioctl)?,
             DM_TABLE_STATUS_CMD => self.handle_table_status(raw_ioctl)?,
-            _ => return_errno_with_message!(Errno::ENOTTY, "unknown DM ioctl command"),
+            _ => unreachable!(),
         }
         Ok(0)
     }
 }
 
 impl DmControlFile {
-    fn handle_version(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
+    /// Validates the header every DM ioctl carries (see Linux's
+    /// `check_version` + `copy_params`): the interface major version must
+    /// be 4, the minor version must not exceed 48, and the declared data
+    /// area must at least cover the fixed header. The kernel's interface
+    /// version is always written back.
+    fn check_version(&self, raw_ioctl: &RawIoctl) -> Result<()> {
         let arg = raw_ioctl.arg();
-        let version = [DM_VERSION_MAJOR, DM_VERSION_MINOR, DM_VERSION_PATCHLEVEL];
-        let mut buf = [0u8; 12];
-        buf[..4].copy_from_slice(&version[0].to_le_bytes());
-        buf[4..8].copy_from_slice(&version[1].to_le_bytes());
-        buf[8..12].copy_from_slice(&version[2].to_le_bytes());
-        current_userspace!().write_bytes(arg, &buf)?;
-        Ok(())
-    }
+        let header = read_header(arg)?;
 
-    fn handle_dev_create(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
-        let arg = raw_ioctl.arg();
-        let mut data = [0u8; 312];
-        current_userspace!().read_bytes(arg, &mut data)?;
-
-        let version = u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ]);
-        let major = (version & 0xFFFFFFFF) as u32;
-        if major != DM_VERSION_MAJOR {
-            return_errno_with_message!(Errno::EINVAL, "DM version major mismatch");
+        let major = get_u32(&header, OFF_VERSION);
+        let minor = get_u32(&header, OFF_VERSION + 4);
+        if major != DM_VERSION_MAJOR || minor > DM_VERSION_MINOR {
+            return_errno_with_message!(Errno::EINVAL, "DM ioctl interface version mismatch");
         }
 
-        let name_str = str::from_utf8(&data[48..48 + DM_NAME_LEN])
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
-        let name = name_str.split('\0').next().unwrap_or("");
+        let data_size = get_u32(&header, OFF_DATA_SIZE) as usize;
+        let data_start = get_u32(&header, OFF_DATA_START) as usize;
+        if data_size < DM_IOCTL_HEADER_LEN || data_start > data_size {
+            return_errno_with_message!(Errno::EINVAL, "invalid data_size or data_start");
+        }
+
+        write_back_version(arg)
+    }
+
+    fn handle_dev_create(&self, raw_ioctl: RawIoctl) -> Result<()> {
+        let arg = raw_ioctl.arg();
+        let header = read_header(arg)?;
+        let name = parse_name(&header)?;
 
         let (_device, id) = DmControlDevice::create_device(name)?;
 
-        // Write back the allocated device number (`dm_ioctl.dev`, offset
-        // 40) so that user space can `mknod /dev/dm-N` with it.
-        const DEV_FIELD_OFFSET: usize = 40;
-        current_userspace!()
-            .write_bytes(arg + DEV_FIELD_OFFSET, &id.as_encoded_u64().to_le_bytes())?;
+        // Write back the allocated device number (`dm_ioctl.dev`) so that
+        // user space can `mknod /dev/dm-N` with it.
+        current_userspace!().write_bytes(arg + OFF_DEV, &id.as_encoded_u64().to_le_bytes())?;
 
         Ok(())
     }
 
-    fn handle_dev_remove(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
+    fn handle_dev_remove(&self, raw_ioctl: RawIoctl) -> Result<()> {
         let arg = raw_ioctl.arg();
-        let mut data = [0u8; 312];
-        current_userspace!().read_bytes(arg, &mut data)?;
-
-        let name_str = str::from_utf8(&data[48..48 + DM_NAME_LEN])
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
-        let name = name_str.split('\0').next().unwrap_or("");
+        let header = read_header(arg)?;
+        let name = parse_name(&header)?;
 
         let device = DmControlDevice::lookup_device(name)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
@@ -316,25 +410,23 @@ impl DmControlFile {
 
         DmControlDevice::remove_device(name)?;
 
-        // Report the final device state (`dm_ioctl.open_count` at offset
-        // 24 and `dm_ioctl.dev` at offset 40), same as `dev_status`.
-        current_userspace!().write_bytes(arg + 24, &open_count.to_le_bytes())?;
-        current_userspace!().write_bytes(arg + 40, &dev.to_le_bytes())?;
+        // Report the final device state (`dm_ioctl.open_count` and
+        // `dm_ioctl.dev`), same as `dev_status`.
+        current_userspace!().write_bytes(arg + OFF_OPEN_COUNT, &open_count.to_le_bytes())?;
+        current_userspace!().write_bytes(arg + OFF_DEV, &dev.to_le_bytes())?;
 
         Ok(())
     }
 
-    fn handle_table_load(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
+    fn handle_table_load(&self, raw_ioctl: RawIoctl) -> Result<()> {
         let arg = raw_ioctl.arg();
-        let mut header = [0u8; 312];
-        current_userspace!().read_bytes(arg, &mut header)?;
+        let header = read_header(arg)?;
 
-        // Parse data_size and data_start
-        let data_size = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
-        let data_start = u32::from_le_bytes([header[16], header[17], header[18], header[19]]) as usize;
+        let data_size = get_u32(&header, OFF_DATA_SIZE) as usize;
+        let data_start = get_u32(&header, OFF_DATA_START) as usize;
 
-        if data_size < 312 || data_size > MAX_TABLE_LOAD_SIZE || data_start > data_size {
-            return_errno_with_message!(Errno::EINVAL, "invalid data_size or data_start");
+        if data_size > MAX_TABLE_LOAD_SIZE {
+            return_errno_with_message!(Errno::EINVAL, "TABLE_LOAD data_size too large");
         }
 
         // Read the whole payload (header + spec chain) into a heap buffer;
@@ -343,7 +435,7 @@ impl DmControlFile {
         let mut data = alloc::vec![0u8; data_size];
         current_userspace!().read_bytes(arg, &mut data)?;
 
-        let name_str = str::from_utf8(&data[48..48 + DM_NAME_LEN])
+        let name_str = str::from_utf8(&data[OFF_NAME..OFF_NAME + DM_NAME_LEN])
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
         let name = name_str.split('\0').next().unwrap_or("");
 
@@ -367,133 +459,83 @@ impl DmControlFile {
         Ok(())
     }
 
+    /// Parses the `dm_target_spec` chain in `specs` (which starts at
+    /// `data_start`) and appends exactly `target_count` targets to `table`.
+    ///
+    /// On DM_TABLE_LOAD, each spec's `next` field is the offset from the
+    /// *current* spec to the following one (see the comment in
+    /// dm-ioctl.h), so the chain is walked with `offset += next`.
     fn parse_target_specs(
         &self,
         specs: &[u8],
         target_count: usize,
         table: &mut DmTable,
     ) -> Result<()> {
-        let mut offset = 0;
+        let mut offset = 0usize;
 
-        for _ in 0..target_count {
-            if offset + 48 > specs.len() {
-                return_errno_with_message!(Errno::EINVAL, "dm_target_spec incomplete");
+        for i in 0..target_count {
+            if offset + DM_TARGET_SPEC_LEN > specs.len() {
+                return_errno_with_message!(Errno::EINVAL, "dm_target_spec out of bounds");
             }
+            let spec = &specs[offset..offset + DM_TARGET_SPEC_LEN];
 
-            // Parse sector_start (u64 at offset 0)
-            let sector_start = u64::from_le_bytes([
-                specs[offset],
-                specs[offset + 1],
-                specs[offset + 2],
-                specs[offset + 3],
-                specs[offset + 4],
-                specs[offset + 5],
-                specs[offset + 6],
-                specs[offset + 7],
-            ]);
+            let sector_start = u64::from_le_bytes(spec[0..8].try_into().unwrap());
+            let length = u64::from_le_bytes(spec[8..16].try_into().unwrap());
+            let next = u32::from_le_bytes(spec[20..24].try_into().unwrap()) as usize;
 
-            // Parse length (u64 at offset 8)
-            let length = u64::from_le_bytes([
-                specs[offset + 8],
-                specs[offset + 9],
-                specs[offset + 10],
-                specs[offset + 11],
-                specs[offset + 12],
-                specs[offset + 13],
-                specs[offset + 14],
-                specs[offset + 15],
-            ]);
-
-            // Parse status (s32 at offset 16)
-            let _status = i32::from_le_bytes([
-                specs[offset + 16],
-                specs[offset + 17],
-                specs[offset + 18],
-                specs[offset + 19],
-            ]);
-
-            // Parse next (u32 at offset 20) - bytes to next spec
-            let next = u32::from_le_bytes([
-                specs[offset + 20],
-                specs[offset + 21],
-                specs[offset + 22],
-                specs[offset + 23],
-            ]) as usize;
-
-            // Parse target_type (16 bytes at offset 24)
-            let type_start = offset + 24;
-            if type_start + DM_TARGET_TYPE_LEN > specs.len() {
-                return_errno_with_message!(Errno::EINVAL, "target_type incomplete");
-            }
-
-            let null_pos = specs[type_start..type_start + DM_TARGET_TYPE_LEN]
+            // target_type: NUL-padded 16-byte field at offset 24.
+            let type_field = &spec[24..24 + DM_TARGET_TYPE_LEN];
+            let type_len = type_field
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(DM_TARGET_TYPE_LEN);
-            let target_type_str = str::from_utf8(&specs[type_start..type_start + null_pos])
+            let target_type_str = str::from_utf8(&type_field[..type_len])
                 .map_err(|_| Error::with_message(Errno::EINVAL, "invalid target_type"))?;
 
-            // Parse params (8-byte aligned after spec)
-            let params_offset = (next + 7) & !7;
-            if params_offset > next || params_offset >= specs.len() {
-                return_errno_with_message!(Errno::EINVAL, "params offset invalid");
+            // The parameter string starts right after the spec and must be
+            // NUL-terminated within the data area (as in Linux's
+            // `populate_table`).
+            let params_start = offset + DM_TARGET_SPEC_LEN;
+            if params_start >= specs.len() {
+                return_errno_with_message!(Errno::EINVAL, "target params out of bounds");
             }
-
-            let params_start = type_start + DM_TARGET_TYPE_LEN;
-            if params_start >= next {
-                return_errno_with_message!(Errno::EINVAL, "params out of bounds");
-            }
-
-            // Find NUL terminator for params
-            let mut params_len = 0;
-            while params_start + params_len < next && specs[params_start + params_len] != 0 {
-                params_len += 1;
-            }
-
-            if params_start + params_len > next {
-                return_errno_with_message!(Errno::EINVAL, "params extend beyond spec");
-            }
-
+            let Some(params_len) = specs[params_start..].iter().position(|&b| b == 0) else {
+                return_errno_with_message!(Errno::EINVAL, "target params not NUL-terminated");
+            };
             let params_str = str::from_utf8(&specs[params_start..params_start + params_len])
-                .map_err(|_| Error::with_message(Errno::EINVAL, "invalid params"))?;
+                .map_err(|_| Error::with_message(Errno::EINVAL, "invalid target params"))?;
 
-            // Add target to table
-            self.add_target_to_table(table, sector_start, length, target_type_str, params_str)?;
+            table
+                .add_target(sector_start, length, target_type_str, params_str)
+                .map_err(|e| Error::with_message(Errno::EINVAL, e))?;
 
-            // Move to next spec
-            if next == 0 {
-                break;
+            // Advance to the next spec. The last spec's `next` is unused,
+            // same as in Linux. For a non-final spec, `next` must cover
+            // the current spec plus its NUL-terminated params and keep the
+            // next spec 8-byte aligned.
+            if i + 1 < target_count {
+                let min_next = DM_TARGET_SPEC_LEN + params_len + 1;
+                if next < min_next || next % 8 != 0 {
+                    return_errno_with_message!(
+                        Errno::EINVAL,
+                        "invalid dm_target_spec next offset"
+                    );
+                }
+                offset = offset.checked_add(next).ok_or_else(|| {
+                    Error::with_message(Errno::EINVAL, "dm_target_spec next overflow")
+                })?;
             }
-            offset = next;
         }
 
         Ok(())
     }
 
-    fn add_target_to_table(
-        &self,
-        table: &mut DmTable,
-        sector_start: u64,
-        length: u64,
-        target_type_str: &str,
-        params_str: &str,
-    ) -> Result<()> {
-        table
-            .add_target(sector_start, length, target_type_str, params_str)
-            .map_err(|e| Error::with_message(Errno::EINVAL, e))
-    }
-
-    fn handle_dev_suspend(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
+    fn handle_dev_suspend(&self, raw_ioctl: RawIoctl) -> Result<()> {
         let arg = raw_ioctl.arg();
-        let mut data = [0u8; 312];
-        current_userspace!().read_bytes(arg, &mut data)?;
+        let header = read_header(arg)?;
 
-        let flags =
-            u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
-
-        let name_str = str::from_utf8(&data[48..48 + DM_NAME_LEN])
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
-        let name = name_str.split('\0').next().unwrap_or("");
+        let flags = get_u32(&header, OFF_FLAGS);
+        let name = parse_name(&header)?;
 
         let device = DmControlDevice::lookup_device(name)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
@@ -502,8 +544,13 @@ impl DmControlFile {
             // Suspend
             device.suspend();
         } else {
-            // Resume (swap tables and replay deferred I/O)
-            device.swap_table();
+            // Resume. Promote the inactive table only if one exists; an
+            // unconditional swap would move the *active* table into the
+            // inactive slot and leave the device without a live table
+            // (e.g., on a repeated resume).
+            if device.get_tables().1.is_some() {
+                device.swap_table();
+            }
             device.resume();
 
             // Register the device in the block-device registry when it
@@ -526,66 +573,102 @@ impl DmControlFile {
             }
         }
 
-        Ok(())
+        // Report the table-presence flags (`dm_ioctl.flags`), as
+        // `__dev_status` does in Linux.
+        write_back_present_flags(arg, &device, 0)
     }
 
-    fn handle_dev_status(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
+    fn handle_dev_status(&self, raw_ioctl: RawIoctl) -> Result<()> {
         let arg = raw_ioctl.arg();
-        let mut data = [0u8; 312];
-        current_userspace!().read_bytes(arg, &mut data)?;
-
-        let name_str = str::from_utf8(&data[48..48 + DM_NAME_LEN])
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
-        let name = name_str.split('\0').next().unwrap_or("");
+        let header = read_header(arg)?;
+        let name = parse_name(&header)?;
 
         let device = DmControlDevice::lookup_device(name)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
 
-        // Report the real open count (`dm_ioctl.open_count`, offset 24).
-        current_userspace!()
-            .write_bytes(arg + 24, &device.open_count().to_le_bytes())?;
+        // Report the real open count (`dm_ioctl.open_count`).
+        current_userspace!().write_bytes(arg + OFF_OPEN_COUNT, &device.open_count().to_le_bytes())?;
 
-        // Report the table-presence flags (`dm_ioctl.flags`, offset 28).
-        let (active_table, inactive_table) = device.get_tables();
-        let mut out_flags = 0u32;
-        if active_table.is_some() {
-            out_flags |= DM_ACTIVE_PRESENT_FLAG;
-        }
-        if inactive_table.is_some() {
-            out_flags |= DM_INACTIVE_PRESENT_FLAG;
-        }
-        current_userspace!().write_bytes(arg + 28, &out_flags.to_le_bytes())?;
+        // Report the table-presence flags (`dm_ioctl.flags`).
+        write_back_present_flags(arg, &device, 0)?;
 
-        // Report the real device number (`dm_ioctl.dev`, offset 40).
+        // Report the real device number (`dm_ioctl.dev`).
         current_userspace!()
-            .write_bytes(arg + 40, &device.id().as_encoded_u64().to_le_bytes())?;
+            .write_bytes(arg + OFF_DEV, &device.id().as_encoded_u64().to_le_bytes())?;
 
         Ok(())
     }
 
-    fn handle_list_versions(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn handle_table_status(&self, raw_ioctl: crate::util::ioctl::RawIoctl) -> Result<()> {
+    fn handle_list_versions(&self, raw_ioctl: RawIoctl) -> Result<()> {
         let arg = raw_ioctl.arg();
-        let mut data = [0u8; 312];
-        current_userspace!().read_bytes(arg, &mut data)?;
+        let header = read_header(arg)?;
 
-        let flags =
-            u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
+        let data_size = get_u32(&header, OFF_DATA_SIZE) as usize;
+        let data_start = get_u32(&header, OFF_DATA_START) as usize;
 
-        // Check if querying inactive table
+        let targets = aster_dm::snapshot_targets();
+
+        // Build the `struct dm_target_versions` chain in the data area:
+        // each entry is the 16-byte header (next + version[3]) followed by
+        // the NUL-terminated name, padded to an 8-byte boundary; `next` is
+        // the offset from the current entry to the following one (0 for
+        // the last entry), as in Linux's `list_versions`.
+        let mut out: Vec<u8> = Vec::new();
+        let mut entry_offsets: Vec<usize> = Vec::new();
+        for (name, version) in &targets {
+            let entry_offset = out.len();
+            entry_offsets.push(entry_offset);
+            out.resize(entry_offset + DM_TARGET_VERSIONS_HEADER_LEN, 0);
+            out[entry_offset + 4..entry_offset + 8]
+                .copy_from_slice(&version.major.to_le_bytes());
+            out[entry_offset + 8..entry_offset + 12]
+                .copy_from_slice(&version.minor.to_le_bytes());
+            out[entry_offset + 12..entry_offset + 16]
+                .copy_from_slice(&version.patch.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            let aligned = align8(out.len());
+            out.resize(aligned, 0);
+        }
+        for (i, &entry_offset) in entry_offsets.iter().enumerate() {
+            let next = if i + 1 < entry_offsets.len() {
+                (entry_offsets[i + 1] - entry_offset) as u32
+            } else {
+                0
+            };
+            out[entry_offset..entry_offset + 4].copy_from_slice(&next.to_le_bytes());
+        }
+
+        // `data_start <= data_size` was validated by `check_version`.
+        let avail = data_size - data_start;
+        if out.len() > avail {
+            // Not enough room: report DM_BUFFER_FULL_FLAG, same as Linux.
+            let flags = get_u32(&header, OFF_FLAGS) | DM_BUFFER_FULL_FLAG;
+            current_userspace!().write_bytes(arg + OFF_FLAGS, &flags.to_le_bytes())?;
+            return Ok(());
+        }
+
+        if !out.is_empty() {
+            current_userspace!().write_bytes(arg + data_start, &out)?;
+        }
+        // Report the size actually used, as Linux does.
+        let used = (data_start + out.len()) as u32;
+        current_userspace!().write_bytes(arg + OFF_DATA_SIZE, &used.to_le_bytes())?;
+
+        Ok(())
+    }
+
+    fn handle_table_status(&self, raw_ioctl: RawIoctl) -> Result<()> {
+        let arg = raw_ioctl.arg();
+        let header = read_header(arg)?;
+
+        let flags = get_u32(&header, OFF_FLAGS);
         let query_inactive = (flags & DM_QUERY_INACTIVE_TABLE_FLAG) != 0;
-
-        let name_str = str::from_utf8(&data[48..48 + DM_NAME_LEN])
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
-        let name = name_str.split('\0').next().unwrap_or("");
+        let name = parse_name(&header)?;
 
         let device = DmControlDevice::lookup_device(name)
             .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
 
-        // Get appropriate table
         let (active_table, inactive_table) = device.get_tables();
         let table = if query_inactive {
             inactive_table.as_ref()
@@ -593,38 +676,74 @@ impl DmControlFile {
             active_table.as_ref()
         };
 
-        // Build status output
-        let mut status_str = String::new();
-
+        // Serialize the table as a `struct dm_target_spec` chain (the DM
+        // ABI, cf. Linux's `retrieve_status`): each spec is followed by
+        // its NUL-terminated parameter string, padded to an 8-byte
+        // boundary. On TABLE_STATUS, a spec's `next` field is the offset
+        // from the *first* spec (i.e., from `data_start`) to the following
+        // spec; for the last spec it points one past the end of the chain.
+        //
+        // The parameter string always uses the STATUSTYPE_TABLE form
+        // (the ctr parameters), regardless of whether the caller set
+        // DM_STATUS_TABLE_FLAG; this matches what DM tables are usually
+        // queried for and keeps the target interface simple.
+        let mut out: Vec<u8> = Vec::new();
+        let mut spec_offsets: Vec<usize> = Vec::new();
+        let nr_targets = table.map_or(0, |table| table.targets().len());
         if let Some(table) = table {
             for target in table.targets() {
-                let begin = target.begin;
-                let len = target.len;
-                let type_name = target.type_name();
-
-                // Build params from the target's own status output
-                let params_str = target.status_params();
-
-                // Build target string: "<begin> <len> <type_name> <params>"
-                status_str.push_str(&begin.to_string());
-                status_str.push(' ');
-                status_str.push_str(&len.to_string());
-                status_str.push(' ');
-                status_str.push_str(type_name);
-                status_str.push(' ');
-                status_str.push_str(&params_str);
+                let spec_offset = out.len();
+                spec_offsets.push(spec_offset);
+                out.resize(spec_offset + DM_TARGET_SPEC_LEN, 0);
+                out[spec_offset..spec_offset + 8]
+                    .copy_from_slice(&target.begin.to_le_bytes());
+                out[spec_offset + 8..spec_offset + 16]
+                    .copy_from_slice(&target.len.to_le_bytes());
+                // status (offset 16): always 0; per-target error reporting
+                // is not implemented yet.
+                let type_name = target.type_name().as_bytes();
+                let name_len = type_name.len().min(DM_TARGET_TYPE_LEN);
+                out[spec_offset + 24..spec_offset + 24 + name_len]
+                    .copy_from_slice(&type_name[..name_len]);
+                out.extend_from_slice(target.status_params().as_bytes());
+                out.push(0);
+                let aligned = align8(out.len());
+                out.resize(aligned, 0);
             }
         }
-
-        // Write back to user buffer
-        let data_start =
-            u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
-        let data_size =
-            u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
-
-        if data_start + status_str.len() <= data_size {
-            current_userspace!().write_bytes(arg as usize + data_start, status_str.as_bytes())?;
+        for (i, &spec_offset) in spec_offsets.iter().enumerate() {
+            let next = if i + 1 < spec_offsets.len() {
+                spec_offsets[i + 1] as u32
+            } else {
+                out.len() as u32
+            };
+            out[spec_offset + 20..spec_offset + 24].copy_from_slice(&next.to_le_bytes());
         }
+
+        // Write back `target_count`, as Linux does.
+        current_userspace!()
+            .write_bytes(arg + OFF_TARGET_COUNT, &(nr_targets as u32).to_le_bytes())?;
+
+        let data_size = get_u32(&header, OFF_DATA_SIZE) as usize;
+        let data_start = get_u32(&header, OFF_DATA_START) as usize;
+        let avail = data_size - data_start;
+
+        if out.len() > avail {
+            // The buffer cannot hold the whole chain: report
+            // DM_BUFFER_FULL_FLAG instead of writing a truncated chain
+            // (a deliberate simplification; Linux emits the prefix that
+            // fits).
+            write_back_present_flags(arg, &device, DM_BUFFER_FULL_FLAG)?;
+            return Ok(());
+        }
+
+        if !out.is_empty() {
+            current_userspace!().write_bytes(arg + data_start, &out)?;
+        }
+        write_back_present_flags(arg, &device, 0)?;
+        // Report the size actually used, as Linux does.
+        let used = (data_start + out.len()) as u32;
+        current_userspace!().write_bytes(arg + OFF_DATA_SIZE, &used.to_le_bytes())?;
 
         Ok(())
     }
