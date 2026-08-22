@@ -22,9 +22,11 @@ use ostd::{
 };
 
 use crate::{
-    CtrOutcome, DmDevice, DmTable, ErrorTargetType, LinearTargetType, MappedIo, TargetType,
-    TargetVersion, lookup_target, register_target, snapshot_targets,
+    CtrOutcome, DmDevice, DmTable, ErrorTargetType, LinearTargetType, MappedIo, StripedTargetType,
+    TargetType, TargetVersion,
     linear::{LinearPrivate, resolve_device},
+    lookup_target, register_target, snapshot_targets,
+    striped::StripedPrivate,
 };
 
 /// The global target registry is shared by all tests in one ktest run, so
@@ -67,20 +69,33 @@ impl BlockDevice for DummyDisk {
 
 const DUMMY_DEV_NAME: &str = "dmtestdummy0";
 
-/// Register the dummy block device (idempotent) and return it.
-fn ensure_dummy_device() -> Arc<dyn BlockDevice> {
+/// Register a dummy block device with the given name (idempotent) and
+/// return it.
+fn ensure_dummy_device_named(name: &str, minor: u32) -> Arc<dyn BlockDevice> {
     if let Some(dev) = aster_block::collect_all()
         .into_iter()
-        .find(|d| d.name() == DUMMY_DEV_NAME)
+        .find(|d| d.name() == name)
     {
         return dev;
     }
     let dev = Arc::new(DummyDisk {
-        name: String::from(DUMMY_DEV_NAME),
-        id: DeviceId::new(MajorId::new(250), MinorId::new(250)),
+        name: String::from(name),
+        id: DeviceId::new(MajorId::new(250), MinorId::new(minor)),
     });
     aster_block::register(dev.clone()).unwrap();
     dev
+}
+
+/// Register the dummy block device (idempotent) and return it.
+fn ensure_dummy_device() -> Arc<dyn BlockDevice> {
+    ensure_dummy_device_named(DUMMY_DEV_NAME, 250)
+}
+
+const DUMMY_DEV_NAME1: &str = "dmtestdummy1";
+
+/// Register a second dummy block device (idempotent) and return it.
+fn ensure_dummy_device1() -> Arc<dyn BlockDevice> {
+    ensure_dummy_device_named(DUMMY_DEV_NAME1, 251)
 }
 
 fn linear_type() -> Arc<dyn TargetType> {
@@ -104,11 +119,7 @@ impl TargetType for DummyTargetType {
         TargetVersion::new(9, 8, 7)
     }
 
-    fn ctr(
-        &self,
-        _len: u64,
-        _params: &[&str],
-    ) -> Result<CtrOutcome, &'static str> {
+    fn ctr(&self, _len: u64, _params: &[&str]) -> Result<CtrOutcome, &'static str> {
         Err("dummy: not constructible")
     }
 
@@ -141,7 +152,10 @@ fn registry_register_lookup_snapshot() {
     // Lookup returns a usable Arc clone.
     let looked_up = lookup_target("t010_dummy").expect("dummy target should be registered");
     assert_eq!(looked_up.name(), "t010_dummy");
-    assert_eq!(looked_up.version().to_dm_version(), (9 << 16) | (8 << 8) | 7);
+    assert_eq!(
+        looked_up.version().to_dm_version(),
+        (9 << 16) | (8 << 8) | 7
+    );
 
     // Unknown names yield None instead of panicking.
     assert!(lookup_target("no_such_target_xyz").is_none());
@@ -151,7 +165,8 @@ fn registry_register_lookup_snapshot() {
     assert!(
         snapshot
             .iter()
-            .any(|(name, ver)| name == "t010_dummy" && ver.to_dm_version() == (9 << 16) | (8 << 8) | 7)
+            .any(|(name, ver)| name == "t010_dummy"
+                && ver.to_dm_version() == (9 << 16) | (8 << 8) | 7)
     );
 }
 
@@ -265,7 +280,9 @@ fn table_map_and_status_via_target() {
     ensure_dummy_device();
 
     let mut table = DmTable::new();
-    table.add_target(0, 100, "linear", "dmtestdummy0 2048").unwrap();
+    table
+        .add_target(0, 100, "linear", "dmtestdummy0 2048")
+        .unwrap();
     table.add_target(100, 50, "error", "").unwrap();
 
     // DmTarget::map takes an absolute sector, subtracts begin internally.
@@ -408,7 +425,11 @@ impl TargetType for ChunkedTargetType {
         })
     }
 
-    fn map(&self, private: &dyn core::any::Any, sector_in_target: u64) -> Result<MappedIo, &'static str> {
+    fn map(
+        &self,
+        private: &dyn core::any::Any,
+        sector_in_target: u64,
+    ) -> Result<MappedIo, &'static str> {
         let p = private
             .downcast_ref::<LinearPrivate>()
             .ok_or("chunked: invalid target private type")?;
@@ -506,7 +527,9 @@ fn enqueue_split_across_targets() {
 
     let mut table = DmTable::new();
     table.add_target(0, 16, "linear", "dmt010md1 0").unwrap();
-    table.add_target(16, 16, "linear", "dmt010md1 1024").unwrap();
+    table
+        .add_target(16, 16, "linear", "dmt010md1 1024")
+        .unwrap();
     let dm = create_dm_with_table(table);
 
     // Write 16 sectors at DM sector 8: covers [8, 16) on target 0 (mapped
@@ -575,7 +598,9 @@ fn enqueue_negative_remap_uses_slow_path() {
     let mut table = DmTable::new();
     // Filler target so that the second target can start at sector 1000
     // (tables must be adjoined); it maps far away and is never touched.
-    table.add_target(0, 1000, "linear", "dmt010md3 2048").unwrap();
+    table
+        .add_target(0, 1000, "linear", "dmt010md3 2048")
+        .unwrap();
     table.add_target(1000, 16, "linear", "dmt010md3 0").unwrap();
     let dm = create_dm_with_table(table);
 
@@ -655,4 +680,268 @@ fn suspended_bio_replayed_on_resume() {
     let mut buf = vec![0u8; BLOCK_SIZE];
     md.read_bytes(40 * 512, &mut buf);
     assert_eq!(buf, pattern);
+}
+
+// ==================================================================
+// Striped target tests (T-011)
+// ==================================================================
+
+fn ensure_striped_target() {
+    // Ignore "already registered" errors.
+    let _ = register_target(Arc::new(StripedTargetType::new()));
+}
+
+fn striped_type() -> Arc<dyn TargetType> {
+    ensure_striped_target();
+    lookup_target("striped").expect("striped target should be registered")
+}
+
+#[ktest]
+fn striped_ctr_rejects_bad_params() {
+    let striped = striped_type();
+    ensure_dummy_device();
+    ensure_dummy_device1();
+
+    // Too few arguments.
+    assert!(striped.ctr(16, &[]).is_err());
+    assert!(striped.ctr(16, &["2"]).is_err());
+
+    // stripes == 0 (must be rejected before any division by `stripes`).
+    assert!(striped.ctr(16, &["0", "8"]).is_err());
+    // Non-decimal / negative stripe counts.
+    assert!(striped.ctr(16, &["x2", "8"]).is_err());
+    assert!(striped.ctr(16, &["-2", "8"]).is_err());
+    // Stripe count overflowing u32.
+    assert!(striped.ctr(16, &["4294967296", "8"]).is_err());
+
+    // chunk_size == 0 (must be rejected before any division by it).
+    assert!(striped.ctr(16, &["2", "0"]).is_err());
+    // Non-decimal chunk size.
+    assert!(striped.ctr(16, &["2", "8x"]).is_err());
+
+    // Target length not divisible by the number of stripes.
+    assert!(
+        striped
+            .ctr(
+                10,
+                &[
+                    "3",
+                    "1",
+                    DUMMY_DEV_NAME,
+                    "0",
+                    DUMMY_DEV_NAME,
+                    "0",
+                    DUMMY_DEV_NAME,
+                    "0"
+                ]
+            )
+            .is_err()
+    );
+
+    // Stripe width not divisible by the chunk size (width = 16/2 = 8, 8 % 5 != 0).
+    assert!(
+        striped
+            .ctr(16, &["2", "5", DUMMY_DEV_NAME, "0", DUMMY_DEV_NAME1, "0"])
+            .is_err()
+    );
+
+    // argc != 2 + 2 * stripes: too few legs / too many legs.
+    assert!(striped.ctr(16, &["2", "8", DUMMY_DEV_NAME, "0"]).is_err());
+    assert!(
+        striped
+            .ctr(
+                16,
+                &[
+                    "2",
+                    "8",
+                    DUMMY_DEV_NAME,
+                    "0",
+                    DUMMY_DEV_NAME1,
+                    "0",
+                    DUMMY_DEV_NAME,
+                    "0"
+                ]
+            )
+            .is_err()
+    );
+
+    // Non-decimal / negative / empty leg offsets.
+    assert!(
+        striped
+            .ctr(
+                16,
+                &["2", "8", DUMMY_DEV_NAME, "12a3", DUMMY_DEV_NAME1, "0"]
+            )
+            .is_err()
+    );
+    assert!(
+        striped
+            .ctr(16, &["2", "8", DUMMY_DEV_NAME, "-1", DUMMY_DEV_NAME1, "0"])
+            .is_err()
+    );
+    assert!(
+        striped
+            .ctr(16, &["2", "8", DUMMY_DEV_NAME, "", DUMMY_DEV_NAME1, "0"])
+            .is_err()
+    );
+
+    // Unknown underlying device.
+    assert!(
+        striped
+            .ctr(
+                16,
+                &["2", "8", "no_such_dev_xyz", "0", DUMMY_DEV_NAME1, "0"]
+            )
+            .is_err()
+    );
+}
+
+#[ktest]
+fn striped_ctr_success() {
+    let striped = striped_type();
+    ensure_dummy_device();
+    ensure_dummy_device1();
+
+    let outcome = striped
+        .ctr(
+            64,
+            &["2", "8", DUMMY_DEV_NAME, "100", DUMMY_DEV_NAME1, "200"],
+        )
+        .unwrap();
+    // The per-target max_io_len equals the chunk size (cf. Linux
+    // `dm_set_target_max_io_len`).
+    assert_eq!(outcome.max_io_len, 8);
+
+    let p = outcome
+        .private
+        .downcast_ref::<StripedPrivate>()
+        .expect("striped ctr should produce StripedPrivate");
+    assert_eq!(p.stripes, 2);
+    assert_eq!(p.chunk_size, 8);
+    assert_eq!(p.legs.len(), 2);
+    assert_eq!(p.legs[0].dev.name(), DUMMY_DEV_NAME);
+    assert_eq!(p.legs[0].physical_start, 100);
+    assert_eq!(p.legs[1].dev.name(), DUMMY_DEV_NAME1);
+    assert_eq!(p.legs[1].physical_start, 200);
+
+    // "/dev/"-prefixed device names are accepted too.
+    assert!(
+        striped
+            .ctr(
+                64,
+                &["2", "8", "/dev/dmtestdummy0", "0", "/dev/dmtestdummy1", "0"]
+            )
+            .is_ok()
+    );
+}
+
+/// Striped mapping with a power-of-2 geometry (stripes = 2, chunk = 8).
+#[ktest]
+fn striped_map_formula_pow2() {
+    let striped = striped_type();
+    ensure_dummy_device();
+    ensure_dummy_device1();
+
+    let outcome = striped
+        .ctr(
+            64,
+            &["2", "8", DUMMY_DEV_NAME, "100", DUMMY_DEV_NAME1, "200"],
+        )
+        .unwrap();
+    let p = &*outcome.private;
+
+    // (sector_in_target, expected leg device, expected absolute sector)
+    let cases: &[(u64, &str, u64)] = &[
+        (0, DUMMY_DEV_NAME, 100),   // stripe 0, dev_sector 0
+        (7, DUMMY_DEV_NAME, 107),   // last sector of chunk 0
+        (8, DUMMY_DEV_NAME1, 200),  // stripe 1, dev_sector 0
+        (15, DUMMY_DEV_NAME1, 207), // last sector of chunk 1
+        (16, DUMMY_DEV_NAME, 108),  // stripe wraps to 0, dev_sector 8
+        (24, DUMMY_DEV_NAME1, 208), // stripe 1, dev_sector 8
+        (63, DUMMY_DEV_NAME1, 231), // stripe 1, dev_sector 31
+    ];
+    for &(sector, dev_name, expected) in cases {
+        let mapped = striped.map(p, sector).unwrap();
+        assert_eq!(mapped.device.name(), dev_name, "sector {}", sector);
+        assert_eq!(mapped.sector, expected, "sector {}", sector);
+    }
+}
+
+/// Striped mapping with a non-power-of-2 geometry (stripes = 3, chunk = 10),
+/// exercising the div/mod path (Linux's `sector_div` fallback).
+#[ktest]
+fn striped_map_formula_non_pow2() {
+    let striped = striped_type();
+    ensure_dummy_device();
+    ensure_dummy_device1();
+    ensure_dummy_device_named("dmtestdummy2", 252);
+
+    let outcome = striped
+        .ctr(
+            90,
+            &[
+                "3",
+                "10",
+                DUMMY_DEV_NAME,
+                "0",
+                DUMMY_DEV_NAME1,
+                "1000",
+                "dmtestdummy2",
+                "2000",
+            ],
+        )
+        .unwrap();
+    let p = &*outcome.private;
+
+    // (sector_in_target, expected leg device, expected absolute sector)
+    let cases: &[(u64, &str, u64)] = &[
+        (0, DUMMY_DEV_NAME, 0),      // stripe 0, dev_sector 0
+        (9, DUMMY_DEV_NAME, 9),      // last sector of chunk 0
+        (10, DUMMY_DEV_NAME1, 1000), // stripe 1, dev_sector 0
+        (19, DUMMY_DEV_NAME1, 1009), // last sector of chunk 1
+        (20, "dmtestdummy2", 2000),  // stripe 2, dev_sector 0
+        (29, "dmtestdummy2", 2009),  // last sector of chunk 2
+        (30, DUMMY_DEV_NAME, 10),    // stripe wraps to 0, dev_sector 10
+        (40, DUMMY_DEV_NAME1, 1010), // stripe 1, dev_sector 10
+        (89, "dmtestdummy2", 2029),  // stripe 2, dev_sector 29
+    ];
+    for &(sector, dev_name, expected) in cases {
+        let mapped = striped.map(p, sector).unwrap();
+        assert_eq!(mapped.device.name(), dev_name, "sector {}", sector);
+        assert_eq!(mapped.sector, expected, "sector {}", sector);
+    }
+}
+
+#[ktest]
+fn striped_status_table() {
+    let striped = striped_type();
+    ensure_dummy_device();
+    ensure_dummy_device1();
+
+    let outcome = striped
+        .ctr(64, &["2", "8", DUMMY_DEV_NAME, "0", DUMMY_DEV_NAME1, "300"])
+        .unwrap();
+    // STATUSTYPE_TABLE: "<stripes> <chunk_size> [<dev_name> <physical_start>]+"
+    // with bare kernel device names (no "/dev/" prefix).
+    assert_eq!(
+        striped.status(&*outcome.private),
+        "2 8 dmtestdummy0 0 dmtestdummy1 300"
+    );
+}
+
+#[ktest]
+fn striped_registered_in_registry() {
+    ensure_striped_target();
+
+    let looked_up = lookup_target("striped").expect("striped target should be registered");
+    assert_eq!(looked_up.name(), "striped");
+    assert_eq!(looked_up.version().to_dm_version(), (1 << 16) | (6 << 8));
+
+    // The snapshot (backing DM_LIST_VERSIONS) covers striped 1.6.0.
+    let snapshot = snapshot_targets();
+    assert!(
+        snapshot
+            .iter()
+            .any(|(name, ver)| name == "striped" && ver.to_dm_version() == (1 << 16) | (6 << 8))
+    );
 }
