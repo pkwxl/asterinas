@@ -23,3 +23,4 @@ set -e
 ./random
 ./dm_linear
 ./dm_stripe
+./dm_ioctl
