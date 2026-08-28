@@ -51,6 +51,7 @@
 #define DM_VERSION_PATCH 0
 
 #define DM_SUSPEND_FLAG (1 << 1)
+#define DM_STATUS_TABLE_FLAG (1 << 4)
 #define DM_QUERY_INACTIVE_TABLE_FLAG (1 << 12)
 
 #define DM_NAME_LEN 128
@@ -293,8 +294,10 @@ FN_TEST(dm_stripe_table_status) {
 	io = (struct dm_ioctl *)buf;
 	dm_ioctl_init(io, DM_TEST_DEV, sizeof(buf));
 	/* The device is still suspended (no resume yet), so the live table
-	 * is empty; query the inactive table explicitly, as Linux requires. */
-	io->flags = DM_QUERY_INACTIVE_TABLE_FLAG;
+	 * is empty; query the inactive table explicitly, as Linux requires.
+	 * DM_STATUS_TABLE_FLAG selects the STATUSTYPE_TABLE (ctr-params)
+	 * form of the parameter string. */
+	io->flags = DM_QUERY_INACTIVE_TABLE_FLAG | DM_STATUS_TABLE_FLAG;
 	TEST_SUCC(ioctl(fd, DM_CMD(DM_IOCTL_TABLE_STATUS), io));
 
 	TEST_RES(io->target_count, _ret == 1);
