@@ -6,6 +6,7 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
 use aster_block::BlockDevice;
+use device_id::DeviceId;
 use ostd::sync::SpinLock;
 
 /// The name of a target type (e.g., "linear", "error")
@@ -30,11 +31,6 @@ impl TargetVersion {
             minor,
             patch,
         }
-    }
-
-    /// Convert to Linux DM version format: (major << 16) | (minor << 8) | patch
-    pub fn to_dm_version(&self) -> u32 {
-        (self.major << 16) | (self.minor << 8) | self.patch
     }
 }
 
@@ -91,6 +87,29 @@ pub trait TargetType: Send + Sync {
     /// Get the STATUSTYPE_TABLE parameter string for this target instance
     /// (without the target type name itself), e.g. "vdd 2048" for linear.
     fn status(&self, private: &dyn Any) -> String;
+
+    /// Return the device IDs of the underlying devices this target
+    /// instance depends on (the data source of DM_TABLE_DEPS).
+    ///
+    /// The default implementation returns an empty list (used by targets
+    /// with no underlying device, e.g. the error target).
+    fn deps(&self, _private: &dyn Any) -> Vec<DeviceId> {
+        Vec::new()
+    }
+
+    /// Handle a message addressed to this target instance (the
+    /// data-plane side of DM_TARGET_MSG, cf. Linux `ti->type->message`).
+    ///
+    /// `args` are the space-separated tokens of the message payload.
+    ///
+    /// Returns `Ok(Some(output))` when the message produced output data,
+    /// `Ok(None)` when it was accepted without output, and `Err` when the
+    /// message is not supported. The default implementation rejects all
+    /// messages; none of the built-in targets (linear/striped/error)
+    /// override it.
+    fn message(&self, _private: &dyn Any, _args: &[&str]) -> Result<Option<String>, &'static str> {
+        Err("target does not support messages")
+    }
 }
 
 /// Global registry of target types

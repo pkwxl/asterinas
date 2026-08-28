@@ -204,11 +204,9 @@ version = "0.1.0"
 dependencies = [
  "aster-block",
  "device-id",
- "hashbrown 0.14.5",
  "io-util",
  "ostd",
  "ostd-test",
- "spin",
 ]
 
 [[package]]

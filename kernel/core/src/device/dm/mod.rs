@@ -23,7 +23,11 @@ use crate::{
     device::{Device, DeviceType, DevtmpfsInodeMeta, registry::char},
     fs::{file::PerOpenFileOps, vfs::inode::FileOps},
     prelude::*,
-    process::signal::{PollHandle, Pollable},
+    process::{
+        UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread,
+        signal::{PollHandle, Pollable},
+    },
+    security::lsm::hooks as lsm_hooks,
     util::ioctl::RawIoctl,
 };
 
@@ -81,8 +85,10 @@ const OFF_NAME: usize = 48;
 
 const DM_DEV_CREATE_CMD: u32 = 3;
 const DM_DEV_REMOVE_CMD: u32 = 4;
-const DM_DEV_STATUS_CMD: u32 = 5;
+// nr 5 is DM_DEV_RENAME in the Linux ABI; it is not implemented yet and
+// deliberately falls through to the ENOTTY branch below.
 const DM_DEV_SUSPEND_CMD: u32 = 6;
+const DM_DEV_STATUS_CMD: u32 = 7;
 const DM_TABLE_LOAD_CMD: u32 = 9;
 const DM_TABLE_STATUS_CMD: u32 = 12;
 const DM_LIST_VERSIONS_CMD: u32 = 13;
@@ -113,6 +119,19 @@ fn parse_name(header: &[u8; DM_IOCTL_HEADER_LEN]) -> Result<&str> {
     Ok(name_str.split('\0').next().unwrap_or(""))
 }
 
+/// Validates a DM device name, as Linux's `check_name` does
+/// (dm-ioctl.c:767-782): the name must be non-empty and must not
+/// contain '/', nor be "control", ".", or "..". Applied to every
+/// command that takes a device name (Linux checks the name in
+/// DEV_CREATE/DEV_RENAME; validating it elsewhere as well is
+/// harmless and keeps the registry free of unusable keys).
+fn check_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || matches!(name, "control" | "." | "..") {
+        return_errno_with_message!(Errno::EINVAL, "invalid DM device name");
+    }
+    Ok(())
+}
+
 /// Writes the kernel's interface version (4.48.0) back to user space,
 /// as Linux's `check_version` does for every DM ioctl.
 fn write_back_version(arg: usize) -> Result<()> {
@@ -125,7 +144,9 @@ fn write_back_version(arg: usize) -> Result<()> {
 }
 
 /// Writes the table-presence flags (`dm_ioctl.flags`) back to user space,
-/// as `__dev_status` does in Linux.
+/// as `__dev_status` does in Linux: `DM_ACTIVE_PRESENT_FLAG` /
+/// `DM_INACTIVE_PRESENT_FLAG` according to the tables, plus
+/// `DM_SUSPEND_FLAG` while the device is suspended.
 fn write_back_present_flags(arg: usize, device: &DmDevice, extra_flags: u32) -> Result<()> {
     let (active_table, inactive_table) = device.get_tables();
     let mut out_flags = extra_flags;
@@ -134,6 +155,9 @@ fn write_back_present_flags(arg: usize, device: &DmDevice, extra_flags: u32) -> 
     }
     if inactive_table.is_some() {
         out_flags |= DM_INACTIVE_PRESENT_FLAG;
+    }
+    if device.is_suspended() {
+        out_flags |= DM_SUSPEND_FLAG;
     }
     current_userspace!().write_bytes(arg + OFF_FLAGS, &out_flags.to_le_bytes())?;
     Ok(())
@@ -219,12 +243,22 @@ impl DmControlDevice {
     fn create_device(name: &str) -> Result<(Arc<DmDevice>, DeviceId)> {
         let mut registry = DEVICE_REGISTRY.lock();
         if registry.contains_key(name) {
-            return_errno_with_message!(Errno::EEXIST, "device already exists");
+            // Linux's `dm_hash_insert` reports -EBUSY for a duplicate
+            // name (the v4 interface has no DM_EXISTS_FLAG semantics).
+            return_errno_with_message!(Errno::EBUSY, "device already exists");
         }
         let minor = alloc_minor()
             .ok_or_else(|| Error::with_message(Errno::ENOSPC, "no free DM minor"))?;
         let id = DeviceId::new(dm_block_major(), MinorId::new(minor));
         let device = DmDevice::create(name, id);
+        // A freshly created DM device starts out suspended (it has no
+        // live table yet); the first DEV_SUSPEND(resume) brings it live.
+        // Mark it suspended here so that `DmDevice::resume` — which
+        // rejects resuming a non-suspended device — accepts that initial
+        // resume. Suspending cannot fail on a fresh device.
+        device
+            .suspend()
+            .expect("a freshly created device is not suspended");
         registry.insert(
             String::from(name),
             DmDevEntry {
@@ -239,7 +273,7 @@ impl DmControlDevice {
     fn remove_device(name: &str) -> Result<()> {
         let mut registry = DEVICE_REGISTRY.lock();
         let Some(entry) = registry.remove(name) else {
-            return_errno_with_message!(Errno::ENODEV, "device not found");
+            return_errno_with_message!(Errno::ENXIO, "device not found");
         };
         if entry.registered {
             let _ = aster_block::unregister(entry.id);
@@ -311,6 +345,26 @@ impl PerOpenFileOps for DmControlFile {
     }
 
     fn ioctl(&self, _path: &crate::fs::vfs::path::Path, raw_ioctl: RawIoctl) -> Result<i32> {
+        // Only a caller with CAP_SYS_ADMIN may use the DM control device
+        // ("only root can play with this", dm-ioctl.c `ctl_ioctl`). An
+        // ioctl always comes from a user thread, so `as_posix_thread()`
+        // cannot return `None` here (same assumption as the VT driver's
+        // ioctl permission check).
+        let init_user_ns = UserNamespace::get_init_singleton();
+        let capable_result = lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+            init_user_ns.as_ref(),
+            current_thread!().as_posix_thread().unwrap(),
+            CapSet::SYS_ADMIN,
+        ));
+        if let Err(err) = capable_result {
+            // Linux reports -EACCES here while the capability LSM reports
+            // -EPERM; translate to stay ABI-compatible.
+            if err.error() == Errno::EPERM {
+                return_errno_with_message!(Errno::EACCES, "DM ioctl requires CAP_SYS_ADMIN");
+            }
+            return Err(err);
+        }
+
         let cmd = raw_ioctl.cmd();
         let nr = cmd & 0xFF;
 
@@ -382,6 +436,7 @@ impl DmControlFile {
         let arg = raw_ioctl.arg();
         let header = read_header(arg)?;
         let name = parse_name(&header)?;
+        check_name(name)?;
 
         let (_device, id) = DmControlDevice::create_device(name)?;
 
@@ -396,9 +451,10 @@ impl DmControlFile {
         let arg = raw_ioctl.arg();
         let header = read_header(arg)?;
         let name = parse_name(&header)?;
+        check_name(name)?;
 
         let device = DmControlDevice::lookup_device(name)
-            .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
+            .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
 
         // A device with open handles cannot be removed (Linux returns
         // -EBUSY from `__dev_destroy` in this case).
@@ -443,9 +499,10 @@ impl DmControlFile {
         let name_str = str::from_utf8(&data[OFF_NAME..OFF_NAME + DM_NAME_LEN])
             .map_err(|_| Error::with_message(Errno::EINVAL, "invalid device name"))?;
         let name = name_str.split('\0').next().unwrap_or("");
+        check_name(name)?;
 
         let device = DmControlDevice::lookup_device(name)
-            .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
+            .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
 
         // Parse target count
         let target_count =
@@ -541,22 +598,34 @@ impl DmControlFile {
 
         let flags = get_u32(&header, OFF_FLAGS);
         let name = parse_name(&header)?;
+        check_name(name)?;
 
         let device = DmControlDevice::lookup_device(name)
-            .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
+            .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
 
         if flags & DM_SUSPEND_FLAG != 0 {
             // Suspend
-            device.suspend();
+            device
+                .suspend()
+                .map_err(|e| Error::with_message(Errno::EINVAL, e))?;
         } else {
-            // Resume. Promote the inactive table only if one exists; an
+            // Resume. A device with no table at all (freshly DEV_CREATE'd,
+            // never TABLE_LOAD'd) cannot be resumed; Linux's `dm_resume`
+            // reports -EINVAL in this case (dm.c:3111-3125).
+            if matches!(device.get_tables(), (None, None)) {
+                return_errno_with_message!(Errno::EINVAL, "device has no table to resume");
+            }
+
+            // Promote the inactive table only if one exists; an
             // unconditional swap would move the *active* table into the
             // inactive slot and leave the device without a live table
             // (e.g., on a repeated resume).
             if device.get_tables().1.is_some() {
                 device.swap_table();
             }
-            device.resume();
+            device
+                .resume()
+                .map_err(|e| Error::with_message(Errno::EINVAL, e))?;
 
             // Register the device in the block-device registry when it
             // becomes live (has an active table) for the first time.
@@ -587,9 +656,10 @@ impl DmControlFile {
         let arg = raw_ioctl.arg();
         let header = read_header(arg)?;
         let name = parse_name(&header)?;
+        check_name(name)?;
 
         let device = DmControlDevice::lookup_device(name)
-            .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
+            .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
 
         // Report the real open count (`dm_ioctl.open_count`).
         current_userspace!().write_bytes(arg + OFF_OPEN_COUNT, &device.open_count().to_le_bytes())?;
@@ -648,8 +718,11 @@ impl DmControlFile {
         let avail = data_size - data_start;
         if out.len() > avail {
             // Not enough room: report DM_BUFFER_FULL_FLAG, same as Linux.
-            let flags = get_u32(&header, OFF_FLAGS) | DM_BUFFER_FULL_FLAG;
-            current_userspace!().write_bytes(arg + OFF_FLAGS, &flags.to_le_bytes())?;
+            // Write the flag literally instead of OR-ing it into the input
+            // flags: Linux's `validate_params` strips output-only flags
+            // from the input, so they must never be echoed back.
+            current_userspace!()
+                .write_bytes(arg + OFF_FLAGS, &DM_BUFFER_FULL_FLAG.to_le_bytes())?;
             return Ok(());
         }
 
@@ -670,9 +743,10 @@ impl DmControlFile {
         let flags = get_u32(&header, OFF_FLAGS);
         let query_inactive = (flags & DM_QUERY_INACTIVE_TABLE_FLAG) != 0;
         let name = parse_name(&header)?;
+        check_name(name)?;
 
         let device = DmControlDevice::lookup_device(name)
-            .ok_or_else(|| Error::with_message(Errno::ENODEV, "device not found"))?;
+            .ok_or_else(|| Error::with_message(Errno::ENXIO, "device not found"))?;
 
         let (active_table, inactive_table) = device.get_tables();
         let table = if query_inactive {

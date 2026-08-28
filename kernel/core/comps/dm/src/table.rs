@@ -6,6 +6,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{any::Any, fmt::Debug};
 
 use aster_block::BlockDeviceMeta;
+use device_id::DeviceId;
 
 use crate::target::{MappedIo, TargetType, lookup_target};
 
@@ -61,7 +62,24 @@ impl DmTarget {
         // See `map` for why `&*` is required here.
         self.target_type.status(&*self.private)
     }
+
+    /// Return the device IDs of the underlying devices this target
+    /// depends on (cf. `TargetType::deps`).
+    pub fn deps(&self) -> Vec<DeviceId> {
+        // See `map` for why `&*` is required here.
+        self.target_type.deps(&*self.private)
+    }
+
+    /// Send a message to this target (cf. `TargetType::message`).
+    pub fn message(&self, args: &[&str]) -> Result<Option<String>, &'static str> {
+        // See `map` for why `&*` is required here.
+        self.target_type.message(&*self.private, args)
+    }
 }
+
+/// Maximum table/target length in sectors, cf. Linux `dm_table_add_target`'s
+/// "too large device" check (`LLONG_MAX >> SECTOR_SHIFT`).
+pub(crate) const MAX_SECTORS: u64 = (i64::MAX as u64) >> 9;
 
 /// DM table consisting of multiple targets
 #[derive(Clone)]
@@ -114,6 +132,12 @@ impl DmTable {
         if len == 0 {
             return Err("Target length must be positive");
         }
+        if len > MAX_SECTORS {
+            return Err("Target length too large");
+        }
+        if begin.checked_add(len).is_none() {
+            return Err("Target end sector overflows");
+        }
         let target_type = lookup_target(type_name).ok_or("Target type not registered")?;
         let tokens: Vec<&str> = params.split_whitespace().collect();
         let outcome = target_type.ctr(len, &tokens)?;
@@ -151,5 +175,29 @@ impl DmTable {
     /// Get all targets as a slice
     pub fn targets(&self) -> &[DmTarget] {
         &self.targets
+    }
+
+    /// Return the deduplicated list of underlying device IDs this table
+    /// depends on (the data source of DM_TABLE_DEPS).
+    pub fn deps(&self) -> Vec<DeviceId> {
+        let mut deps = Vec::new();
+        for target in &self.targets {
+            for id in target.deps() {
+                if !deps.contains(&id) {
+                    deps.push(id);
+                }
+            }
+        }
+        deps
+    }
+
+    /// Send a message to the target that covers `sector` (the data-plane
+    /// side of DM_TARGET_MSG). Fails if no target covers the sector or if
+    /// the target does not support the message.
+    pub fn message(&self, sector: u64, args: &[&str]) -> Result<Option<String>, &'static str> {
+        let target = self
+            .find_target(sector)
+            .ok_or("no target covers the given sector")?;
+        target.message(args)
     }
 }

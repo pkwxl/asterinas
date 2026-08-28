@@ -26,7 +26,7 @@ mod target;
 mod tests;
 
 pub use device::DmDevice;
-pub use error::{DmError, ErrorTargetType};
+pub use error::ErrorTargetType;
 pub use linear::LinearTargetType;
 pub use striped::StripedTargetType;
 pub use table::{DmTable, DmTarget};

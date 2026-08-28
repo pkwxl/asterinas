@@ -6,10 +6,13 @@ use alloc::{
     boxed::Box,
     string::{String, ToString},
     sync::Arc,
+    vec,
+    vec::Vec,
 };
 use core::any::Any;
 
 use aster_block::BlockDevice;
+use device_id::DeviceId;
 
 use crate::target::{CtrOutcome, MappedIo, TargetType, TargetVersion};
 
@@ -55,15 +58,22 @@ impl TargetType for LinearTargetType {
     }
 
     fn version(&self) -> TargetVersion {
-        TargetVersion::new(1, 0, 0)
+        // Matches Linux dm-linear.c's target version.
+        TargetVersion::new(1, 4, 0)
     }
 
-    fn ctr(&self, _len: u64, params: &[&str]) -> Result<CtrOutcome, &'static str> {
+    fn ctr(&self, len: u64, params: &[&str]) -> Result<CtrOutcome, &'static str> {
         if params.len() != 2 {
             return Err("linear: expected \"<dev> <offset>\"");
         }
         let dev = resolve_device(params[0])?;
         let offset = parse_offset(params[1])?;
+        // Cf. Linux's `device_area_is_invalid` check done at table bind
+        // time: the target's area must fit within the underlying device.
+        match offset.checked_add(len) {
+            Some(end) if end <= dev.metadata().nr_sectors as u64 => {}
+            _ => return Err("linear: device too small for target"),
+        }
         Ok(CtrOutcome {
             private: Box::new(LinearPrivate { dev, offset }),
             max_io_len: 0,
@@ -89,6 +99,13 @@ impl TargetType for LinearTargetType {
                 s
             }
             None => String::new(),
+        }
+    }
+
+    fn deps(&self, private: &dyn Any) -> Vec<DeviceId> {
+        match private.downcast_ref::<LinearPrivate>() {
+            Some(p) => vec![p.dev.id()],
+            None => Vec::new(),
         }
     }
 }

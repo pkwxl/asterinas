@@ -7,7 +7,7 @@
 //! returns a `MappedIo` (underlying device + absolute sector on it).
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aster_block::{
     BLOCK_SIZE, BlockDevice, BlockDeviceMeta,
@@ -27,6 +27,7 @@ use crate::{
     linear::{LinearPrivate, resolve_device},
     lookup_target, register_target, snapshot_targets,
     striped::StripedPrivate,
+    table::MAX_SECTORS,
 };
 
 /// The global target registry is shared by all tests in one ktest run, so
@@ -136,6 +137,52 @@ impl TargetType for DummyTargetType {
     }
 }
 
+/// A test-only target type whose ctr succeeds but whose map always fails,
+/// used to exercise "I/O error" paths now that the error target's ctr
+/// always rejects construction (cf. Linux `io_err_ctr`).
+struct FailMapTargetType;
+
+struct FailMapPrivate;
+
+const FAILMAP_NAME: &str = "t013_failmap";
+
+impl TargetType for FailMapTargetType {
+    fn name(&self) -> &str {
+        FAILMAP_NAME
+    }
+
+    fn version(&self) -> TargetVersion {
+        TargetVersion::new(0, 1, 0)
+    }
+
+    fn ctr(&self, _len: u64, params: &[&str]) -> Result<CtrOutcome, &'static str> {
+        if !params.is_empty() {
+            return Err("failmap: expected no parameters");
+        }
+        Ok(CtrOutcome {
+            private: Box::new(FailMapPrivate),
+            max_io_len: 0,
+        })
+    }
+
+    fn map(
+        &self,
+        _private: &dyn core::any::Any,
+        _sector_in_target: u64,
+    ) -> Result<MappedIo, &'static str> {
+        Err("failmap: I/O error")
+    }
+
+    fn status(&self, _private: &dyn core::any::Any) -> String {
+        String::new()
+    }
+}
+
+fn ensure_failmap_target() {
+    // Ignore "already registered" errors.
+    let _ = register_target(Arc::new(FailMapTargetType));
+}
+
 #[ktest]
 fn registry_register_lookup_snapshot() {
     // Registering a fresh target type succeeds.
@@ -152,22 +199,17 @@ fn registry_register_lookup_snapshot() {
     // Lookup returns a usable Arc clone.
     let looked_up = lookup_target("t010_dummy").expect("dummy target should be registered");
     assert_eq!(looked_up.name(), "t010_dummy");
-    assert_eq!(
-        looked_up.version().to_dm_version(),
-        (9 << 16) | (8 << 8) | 7
-    );
+    let ver = looked_up.version();
+    assert_eq!((ver.major, ver.minor, ver.patch), (9, 8, 7));
 
     // Unknown names yield None instead of panicking.
     assert!(lookup_target("no_such_target_xyz").is_none());
 
     // The snapshot covers the registered target.
     let snapshot = snapshot_targets();
-    assert!(
-        snapshot
-            .iter()
-            .any(|(name, ver)| name == "t010_dummy"
-                && ver.to_dm_version() == (9 << 16) | (8 << 8) | 7)
-    );
+    assert!(snapshot.iter().any(|(name, ver)| {
+        name == "t010_dummy" && (ver.major, ver.minor, ver.patch) == (9, 8, 7)
+    }));
 }
 
 #[ktest]
@@ -215,32 +257,28 @@ fn linear_map_formula() {
 fn error_target_behaves() {
     let error = error_type();
 
-    // ctr takes no parameters and reports no max_io_len limit.
+    // The error target is reserved for internal use (cf. Linux
+    // `io_err_ctr`): its ctr always fails, with or without parameters.
+    assert!(error.ctr(64, &[]).is_err());
     assert!(error.ctr(64, &["unexpected"]).is_err());
-    let outcome = error.ctr(64, &[]).unwrap();
-    assert_eq!(outcome.max_io_len, 0);
-
-    // map always fails.
-    assert!(error.map(&*outcome.private, 0).is_err());
-    assert!(error.map(&*outcome.private, 63).is_err());
-
-    // status is an empty parameter string.
-    assert_eq!(error.status(&*outcome.private), "");
 }
 
 #[ktest]
 fn table_add_target_adjoin_rules() {
     ensure_builtin_targets();
+    ensure_dummy_device();
 
     let mut table = DmTable::new();
-    table.add_target(0, 100, "error", "").unwrap();
-    table.add_target(100, 50, "error", "").unwrap();
+    table.add_target(0, 100, "linear", "dmtestdummy0 0").unwrap();
+    table
+        .add_target(100, 50, "linear", "dmtestdummy0 100")
+        .unwrap();
     assert_eq!(table.nr_sectors(), 150);
 
     // Gap: begin must equal the current nr_sectors.
-    assert!(table.add_target(200, 10, "error", "").is_err());
+    assert!(table.add_target(200, 10, "linear", "dmtestdummy0 0").is_err());
     // Zero length is rejected.
-    assert!(table.add_target(150, 0, "error", "").is_err());
+    assert!(table.add_target(150, 0, "linear", "dmtestdummy0 0").is_err());
     // The table is unchanged by the rejected additions.
     assert_eq!(table.nr_sectors(), 150);
     assert_eq!(table.targets().len(), 2);
@@ -259,10 +297,13 @@ fn table_add_target_unknown_type() {
 #[ktest]
 fn table_find_target_bounds() {
     ensure_builtin_targets();
+    ensure_dummy_device();
 
     let mut table = DmTable::new();
-    table.add_target(0, 100, "error", "").unwrap();
-    table.add_target(100, 50, "error", "").unwrap();
+    table.add_target(0, 100, "linear", "dmtestdummy0 0").unwrap();
+    table
+        .add_target(100, 50, "linear", "dmtestdummy0 100")
+        .unwrap();
 
     assert_eq!(table.find_target(0).unwrap().begin, 0);
     assert_eq!(table.find_target(99).unwrap().begin, 0);
@@ -270,20 +311,21 @@ fn table_find_target_bounds() {
     assert_eq!(table.find_target(149).unwrap().begin, 100);
     assert!(table.find_target(150).is_none());
 
-    // max_io_len is recorded on the target (error target: unlimited).
+    // max_io_len is recorded on the target (linear target: unlimited).
     assert_eq!(table.find_target(0).unwrap().max_io_len, 0);
 }
 
 #[ktest]
 fn table_map_and_status_via_target() {
     ensure_builtin_targets();
+    ensure_failmap_target();
     ensure_dummy_device();
 
     let mut table = DmTable::new();
     table
         .add_target(0, 100, "linear", "dmtestdummy0 2048")
         .unwrap();
-    table.add_target(100, 50, "error", "").unwrap();
+    table.add_target(100, 50, FAILMAP_NAME, "").unwrap();
 
     // DmTarget::map takes an absolute sector, subtracts begin internally.
     let linear_target = table.find_target(5).unwrap();
@@ -291,18 +333,19 @@ fn table_map_and_status_via_target() {
     assert_eq!(mapped.sector, 2048 + 5);
     assert_eq!(mapped.device.name(), DUMMY_DEV_NAME);
 
-    // Second target: absolute sector 120 -> target-relative 20.
-    let error_target = table.find_target(120).unwrap();
-    assert!(error_target.map(120).is_err());
+    // Second target: absolute sector 120 -> target-relative 20; its map
+    // always fails.
+    let fail_target = table.find_target(120).unwrap();
+    assert!(fail_target.map(120).is_err());
 
     // Out-of-range absolute sector is rejected by DmTarget::map.
     assert!(table.find_target(150).is_none());
 
     // status_params comes from TargetType::status.
     assert_eq!(linear_target.status_params(), "dmtestdummy0 2048");
-    assert_eq!(error_target.status_params(), "");
+    assert_eq!(fail_target.status_params(), "");
     assert_eq!(linear_target.type_name(), "linear");
-    assert_eq!(error_target.type_name(), "error");
+    assert_eq!(fail_target.type_name(), FAILMAP_NAME);
 }
 
 // ==================================================================
@@ -621,17 +664,18 @@ fn enqueue_negative_remap_uses_slow_path() {
     assert_eq!(md.enqueues(), 2);
 }
 
-/// Slow path with a piece owned by an error target: the bio is completed
-/// with an error status, and the successfully mapped piece is still
-/// written.
+/// Slow path with a piece owned by a map-always-fails target: the bio is
+/// completed with an error status, and the successfully mapped piece is
+/// still written.
 #[ktest]
 fn enqueue_split_with_error_piece() {
     ensure_builtin_targets();
+    ensure_failmap_target();
     let md = MemDisk::new("dmt010md4", 4, 4096);
 
     let mut table = DmTable::new();
     table.add_target(0, 16, "linear", "dmt010md4 0").unwrap();
-    table.add_target(16, 16, "error", "").unwrap();
+    table.add_target(16, 16, FAILMAP_NAME, "").unwrap();
     let dm = create_dm_with_table(table);
 
     let pattern = vec![0x7eu8; 2 * BLOCK_SIZE];
@@ -656,7 +700,7 @@ fn suspended_bio_replayed_on_resume() {
     table.add_target(0, 256, "linear", "dmt010md5 32").unwrap();
     let dm = create_dm_with_table(table);
 
-    dm.suspend();
+    dm.suspend().unwrap();
     assert!(dm.is_suspended());
 
     let pattern = vec![0x11u8; BLOCK_SIZE];
@@ -672,7 +716,7 @@ fn suspended_bio_replayed_on_resume() {
     bio.submit(dm.as_ref(), &mut batch).unwrap();
     assert_eq!(md.enqueues(), 0);
 
-    dm.resume();
+    dm.resume().unwrap();
     batch.wait_all().unwrap();
     assert_eq!(md.enqueues(), 1);
 
@@ -935,13 +979,340 @@ fn striped_registered_in_registry() {
 
     let looked_up = lookup_target("striped").expect("striped target should be registered");
     assert_eq!(looked_up.name(), "striped");
-    assert_eq!(looked_up.version().to_dm_version(), (1 << 16) | (6 << 8));
+    let ver = looked_up.version();
+    assert_eq!((ver.major, ver.minor, ver.patch), (1, 6, 0));
 
     // The snapshot (backing DM_LIST_VERSIONS) covers striped 1.6.0.
     let snapshot = snapshot_targets();
+    assert!(snapshot.iter().any(|(name, ver)| {
+        name == "striped" && (ver.major, ver.minor, ver.patch) == (1, 6, 0)
+    }));
+}
+
+// ==================================================================
+// Robustness checks (audit follow-ups)
+// ==================================================================
+
+/// `begin + len` overflow and the `MAX_SECTORS` bound are rejected without
+/// mutating the table (cf. Linux `dm_table_add_target`'s "too large
+/// device" check).
+#[ktest]
+fn table_add_target_rejects_oversize() {
+    ensure_builtin_targets();
+    ensure_dummy_device();
+
+    let mut table = DmTable::new();
+    // Length beyond MAX_SECTORS.
     assert!(
-        snapshot
-            .iter()
-            .any(|(name, ver)| name == "striped" && ver.to_dm_version() == (1 << 16) | (6 << 8))
+        table
+            .add_target(0, MAX_SECTORS + 1, "linear", "dmtestdummy0 0")
+            .is_err()
     );
+    // u64::MAX length (would also overflow `begin + len`).
+    assert!(
+        table
+            .add_target(0, u64::MAX, "linear", "dmtestdummy0 0")
+            .is_err()
+    );
+    // The table is unchanged by the rejected additions.
+    assert_eq!(table.nr_sectors(), 0);
+    assert!(table.targets().is_empty());
+}
+
+/// `chunk_size` must fit in a u32 (cf. Linux `stripe_ctr`'s `kstrtouint`).
+#[ktest]
+fn striped_ctr_rejects_oversize_chunk() {
+    let striped = striped_type();
+    ensure_dummy_device();
+    ensure_dummy_device1();
+
+    assert!(
+        striped
+            .ctr(
+                16,
+                &["2", "4294967296", DUMMY_DEV_NAME, "0", DUMMY_DEV_NAME1, "0"]
+            )
+            .is_err()
+    );
+}
+
+/// The linear target's area must fit within the underlying device
+/// (DummyDisk has 4096 sectors).
+#[ktest]
+fn linear_ctr_rejects_out_of_capacity() {
+    ensure_dummy_device();
+    let linear = linear_type();
+
+    // offset + len beyond the device capacity.
+    assert!(linear.ctr(4097, &[DUMMY_DEV_NAME, "0"]).is_err());
+    assert!(linear.ctr(100, &[DUMMY_DEV_NAME, "4000"]).is_err());
+    // offset + len overflowing u64.
+    assert!(
+        linear
+            .ctr(100, &[DUMMY_DEV_NAME, "18446744073709551615"])
+            .is_err()
+    );
+    // Exactly at the capacity boundary is accepted.
+    assert!(linear.ctr(96, &[DUMMY_DEV_NAME, "4000"]).is_ok());
+}
+
+/// Every stripe leg's area must fit within its underlying device
+/// (DummyDisk has 4096 sectors; width = 64 / 2 = 32).
+#[ktest]
+fn striped_ctr_rejects_out_of_capacity() {
+    let striped = striped_type();
+    ensure_dummy_device();
+    ensure_dummy_device1();
+
+    // Leg 1: 4080 + 32 = 4112 > 4096.
+    assert!(
+        striped
+            .ctr(
+                64,
+                &["2", "8", DUMMY_DEV_NAME, "0", DUMMY_DEV_NAME1, "4080"]
+            )
+            .is_err()
+    );
+    // physical_start + width overflowing u64.
+    assert!(
+        striped
+            .ctr(
+                64,
+                &[
+                    "2",
+                    "8",
+                    DUMMY_DEV_NAME,
+                    "0",
+                    DUMMY_DEV_NAME1,
+                    "18446744073709551615"
+                ]
+            )
+            .is_err()
+    );
+    // Each leg exactly at the capacity boundary is accepted.
+    assert!(
+        striped
+            .ctr(
+                64,
+                &["2", "8", DUMMY_DEV_NAME, "4064", DUMMY_DEV_NAME1, "4064"]
+            )
+            .is_ok()
+    );
+}
+
+/// suspend/resume reject invalid state transitions (cf. Linux `dm_suspend`
+/// /`dm_resume` returning `-EINVAL`).
+#[ktest]
+fn suspend_resume_state_transitions() {
+    let id = DeviceId::new(MajorId::new(253), MinorId::new(8));
+    let dm = DmDevice::create("dmtest-suspend", id);
+
+    // Resuming a device that is not suspended fails.
+    assert!(dm.resume().is_err());
+    assert!(!dm.is_suspended());
+
+    // Suspend then resume is the happy path.
+    assert!(dm.suspend().is_ok());
+    assert!(dm.is_suspended());
+    // A repeated suspend fails.
+    assert!(dm.suspend().is_err());
+    assert!(dm.resume().is_ok());
+    assert!(!dm.is_suspended());
+    // A repeated resume fails.
+    assert!(dm.resume().is_err());
+}
+
+/// Built-in target versions match the Linux baseline (linear 1.4.0,
+/// error 1.7.0).
+#[ktest]
+fn builtin_target_versions() {
+    let ver = linear_type().version();
+    assert_eq!(ver.major, 1);
+    assert_eq!(ver.minor, 4);
+    assert_eq!(ver.patch, 0);
+
+    let ver = error_type().version();
+    assert_eq!(ver.major, 1);
+    assert_eq!(ver.minor, 7);
+    assert_eq!(ver.patch, 0);
+}
+
+// ==================================================================
+// Wave-2 extension APIs (TABLE_DEPS, TABLE_CLEAR, READONLY, geometry,
+// TARGET_MSG, DEFERRED_REMOVE)
+// ==================================================================
+
+/// `DmTable::deps` aggregates the underlying device IDs of all targets
+/// and deduplicates them.
+#[ktest]
+fn table_deps_dedup_by_device_id() {
+    ensure_builtin_targets();
+    ensure_striped_target();
+    let dev0 = ensure_dummy_device();
+    let dev1 = ensure_dummy_device1();
+
+    // A linear table depends on its single underlying device.
+    let mut table = DmTable::new();
+    table.add_target(0, 64, "linear", "dmtestdummy0 0").unwrap();
+    assert_eq!(table.deps(), vec![dev0.id()]);
+
+    // A striped table with two legs plus a linear target sharing leg 0's
+    // device: the duplicate device ID appears only once.
+    let mut table = DmTable::new();
+    table
+        .add_target(0, 64, "striped", "2 8 dmtestdummy0 0 dmtestdummy1 0")
+        .unwrap();
+    table
+        .add_target(64, 64, "linear", "dmtestdummy0 100")
+        .unwrap();
+    let deps = table.deps();
+    assert_eq!(deps.len(), 2);
+    assert!(deps.contains(&dev0.id()));
+    assert!(deps.contains(&dev1.id()));
+}
+
+/// A read-only DM device refuses write bios but lets reads and flushes
+/// through (surfacing to user space as EIO instead of EROFS; see the
+/// comment in `DmDevice::enqueue`).
+#[ktest]
+fn readonly_rejects_writes_allows_read_flush() {
+    ensure_builtin_targets();
+    let md = MemDisk::new("dmtw2ro0", 20, 4096);
+
+    let mut table = DmTable::new();
+    table.add_target(0, 256, "linear", "dmtw2ro0 0").unwrap();
+    let dm = create_dm_with_table(table);
+
+    dm.set_readonly(true);
+    assert!(dm.is_readonly());
+
+    // Writes are refused at enqueue time.
+    let seg = BioSegment::alloc(1, BioDirection::ToDevice);
+    let bio = Bio::new(BioType::Write, Sid::new(0), vec![seg], None);
+    let mut batch = IoBatch::new();
+    assert_eq!(
+        bio.submit(dm.as_ref(), &mut batch),
+        Err(BioEnqueueError::Refused)
+    );
+    assert_eq!(md.enqueues(), 0);
+
+    // Reads are unaffected.
+    let (status, _) = dm_read(&dm, 0, 1);
+    assert_eq!(status, BioStatus::Complete);
+
+    // Flushes are allowed through.
+    let bio = Bio::new(BioType::Flush, Sid::new(0), vec![], None);
+    let status = bio.submit_and_wait(dm.as_ref()).unwrap();
+    assert_eq!(status, BioStatus::Complete);
+
+    // Clearing the flag re-enables writes.
+    dm.set_readonly(false);
+    assert!(!dm.is_readonly());
+    let status = dm_write(&dm, 0, 1, &vec![0x5au8; BLOCK_SIZE]);
+    assert_eq!(status, BioStatus::Complete);
+}
+
+/// `clear_inactive_table` drops the inactive table, leaves the active
+/// table untouched, and is idempotent (cf. Linux `table_clear`).
+#[ktest]
+fn clear_inactive_table_is_idempotent() {
+    ensure_builtin_targets();
+    ensure_dummy_device();
+
+    let id = DeviceId::new(MajorId::new(253), MinorId::new(21));
+    let dm = DmDevice::create("dmtest-clear", id);
+
+    let mut t1 = DmTable::new();
+    t1.add_target(0, 64, "linear", "dmtestdummy0 0").unwrap();
+    let mut t2 = DmTable::new();
+    t2.add_target(0, 64, "linear", "dmtestdummy0 64").unwrap();
+
+    dm.load_table(t1);
+    dm.swap_table(); // t1 becomes active
+    dm.load_table(t2); // t2 becomes inactive
+    let (active, inactive) = dm.get_tables();
+    assert!(active.is_some() && inactive.is_some());
+
+    dm.clear_inactive_table();
+    let (active, inactive) = dm.get_tables();
+    assert!(active.is_some());
+    assert!(inactive.is_none());
+
+    // Clearing again with no inactive table succeeds and is a no-op.
+    dm.clear_inactive_table();
+    let (active, inactive) = dm.get_tables();
+    assert!(active.is_some());
+    assert!(inactive.is_none());
+}
+
+/// The geometry string is pure storage: set/get round-trips and defaults
+/// to `None`.
+#[ktest]
+fn geometry_set_and_get() {
+    let id = DeviceId::new(MajorId::new(253), MinorId::new(22));
+    let dm = DmDevice::create("dmtest-geo", id);
+
+    assert_eq!(dm.geometry(), None);
+    dm.set_geometry(String::from("1024 16 63 none"));
+    assert_eq!(dm.geometry().as_deref(), Some("1024 16 63 none"));
+}
+
+/// `DmTable::message` locates the target by sector and forwards the
+/// message; the built-in targets do not override `message`, so the
+/// default "not supported" error is returned.
+#[ktest]
+fn message_defaults_to_unsupported() {
+    ensure_builtin_targets();
+    ensure_dummy_device();
+
+    let mut table = DmTable::new();
+    table.add_target(0, 64, "linear", "dmtestdummy0 0").unwrap();
+
+    // No target covers the sector.
+    assert!(table.message(64, &[]).is_err());
+    // The linear target uses the default implementation.
+    assert_eq!(
+        table.message(0, &["foo"]),
+        Err("target does not support messages")
+    );
+}
+
+/// The deferred-removal callback fires exactly when the open count
+/// reaches zero while deferred removal is armed, and is consumed by the
+/// firing.
+#[ktest]
+fn deferred_remove_fires_on_last_close() {
+    let id = DeviceId::new(MajorId::new(253), MinorId::new(23));
+    let dm = DmDevice::create("dmtest-defrm", id);
+
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_clone = fired.clone();
+    dm.set_on_last_close(Box::new(move || {
+        fired_clone.store(true, Ordering::SeqCst);
+    }));
+
+    // Without the deferred-remove flag, the last close does not fire.
+    dm.on_open();
+    dm.on_close();
+    assert!(!fired.load(Ordering::SeqCst));
+
+    // Armed: the callback fires only when the count reaches zero.
+    dm.mark_deferred_remove();
+    assert!(dm.is_deferred_remove());
+    dm.on_open();
+    dm.on_open();
+    dm.on_close();
+    assert!(!fired.load(Ordering::SeqCst));
+    dm.on_close();
+    assert!(fired.load(Ordering::SeqCst));
+
+    // The callback is consumed: a subsequent open/close cycle does not
+    // re-fire it.
+    dm.on_open();
+    dm.on_close();
+    assert!(fired.load(Ordering::SeqCst));
+
+    // Disarming clears the flag.
+    dm.cancel_deferred_remove();
+    assert!(!dm.is_deferred_remove());
 }

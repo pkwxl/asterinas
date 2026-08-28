@@ -16,6 +16,7 @@ use alloc::{
 use core::any::Any;
 
 use aster_block::BlockDevice;
+use device_id::DeviceId;
 
 use crate::{
     linear::resolve_device,
@@ -83,7 +84,10 @@ impl TargetType for StripedTargetType {
         }
 
         let chunk_size = parse_decimal(params[1])?;
-        if chunk_size == 0 {
+        // Cf. Linux `stripe_ctr`'s `kstrtouint` (dm-stripe.c:102-110):
+        // `chunk_size` must fit in a u32, which also guarantees that
+        // `chunk_size * stripes` in `map` cannot overflow a u64.
+        if chunk_size == 0 || chunk_size > u32::MAX as u64 {
             return Err("striped: invalid chunk_size");
         }
 
@@ -105,6 +109,12 @@ impl TargetType for StripedTargetType {
             let dev = resolve_device(params[2 + 2 * i])
                 .map_err(|_| "striped: underlying device not found")?;
             let physical_start = parse_decimal(params[2 + 2 * i + 1])?;
+            // Cf. Linux's `device_area_is_invalid` check done at table bind
+            // time: the leg's area must fit within the underlying device.
+            match physical_start.checked_add(width) {
+                Some(end) if end <= dev.metadata().nr_sectors as u64 => {}
+                _ => return Err("striped: device too small for target"),
+            }
             legs.push(StripeLeg {
                 dev,
                 physical_start,
@@ -160,6 +170,13 @@ impl TargetType for StripedTargetType {
                 s
             }
             None => String::new(),
+        }
+    }
+
+    fn deps(&self, private: &dyn Any) -> Vec<DeviceId> {
+        match private.downcast_ref::<StripedPrivate>() {
+            Some(p) => p.legs.iter().map(|leg| leg.dev.id()).collect(),
+            None => Vec::new(),
         }
     }
 }

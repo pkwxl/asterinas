@@ -9,7 +9,7 @@ use alloc::{
 };
 use core::{
     fmt::Debug,
-    sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
 };
 
 use aster_block::{
@@ -17,7 +17,7 @@ use aster_block::{
     bio::{BioEnqueueError, BioType, SubmittedBio},
 };
 use device_id::DeviceId;
-use ostd::sync::{RwLock, SpinLock, WaitQueue};
+use ostd::sync::{Mutex, RwLock, SpinLock, WaitQueue};
 
 use crate::{
     DmTable,
@@ -25,6 +25,14 @@ use crate::{
 };
 
 /// Represents a mapped device with active/inactive table slots
+///
+/// `name` is the creation-time name. Device renaming (DM_DEV_RENAME) is
+/// handled entirely by the control-plane glue's name registry: the
+/// aster-block device registry is indexed by `DeviceId` (not name), and
+/// `BlockDevice::name()` returns a borrow tied to `&self`, so the name
+/// stored here is deliberately left untouched by a rename and
+/// `BlockDevice::name()` keeps returning the creation-time name (a
+/// documented simplification).
 #[derive(Debug)]
 pub struct DmDevice {
     name: String,
@@ -34,6 +42,30 @@ pub struct DmDevice {
     suspend_flag: AtomicU32,
     deferred_queue: SpinLock<VecDeque<SubmittedBio>>,
     in_flight: Arc<InFlight>,
+    /// Read-only state (DM_READONLY_FLAG); see `set_readonly`.
+    readonly: AtomicBool,
+    /// Deferred-removal state (DM_DEFERRED_REMOVE); see
+    /// `mark_deferred_remove`.
+    deferred_remove: AtomicBool,
+    /// Geometry string stored for reporting only (DM_DEV_SET_GEOMETRY);
+    /// it has no effect on I/O, same as in Linux.
+    geometry: Mutex<Option<String>>,
+    /// Callback fired when the last open handle is closed while deferred
+    /// removal is armed; registered by the control-plane glue.
+    on_last_close: OnLastClose,
+}
+
+/// The glue-registered callback invoked when the last open handle of a
+/// device marked for deferred removal is closed.
+struct OnLastClose(Mutex<Option<Box<dyn Fn() + Send + Sync>>>);
+
+// `Box<dyn Fn>` is not `Debug`, so provide a manual implementation.
+impl Debug for OnLastClose {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OnLastClose")
+            .field("is_set", &self.0.lock().is_some())
+            .finish()
+    }
 }
 
 /// Tracks the bios that the device has accepted but that have not been
@@ -84,6 +116,10 @@ impl DmDevice {
             suspend_flag: AtomicU32::new(0),
             deferred_queue: SpinLock::new(VecDeque::new()),
             in_flight: Arc::new(InFlight::new()),
+            readonly: AtomicBool::new(false),
+            deferred_remove: AtomicBool::new(false),
+            geometry: Mutex::new(None),
+            on_last_close: OnLastClose(Mutex::new(None)),
         };
         Arc::new(device)
     }
@@ -115,6 +151,64 @@ impl DmDevice {
         }
     }
 
+    /// Clear the inactive table slot (DM_TABLE_CLEAR).
+    ///
+    /// Idempotent, like Linux's `table_clear`: clearing a device with no
+    /// inactive table succeeds. The active table is never touched.
+    pub fn clear_inactive_table(&self) {
+        let mut tables = self.tables.write();
+        tables.1 = None;
+    }
+
+    /// Set or clear the read-only flag of the device
+    /// (DM_READONLY_FLAG).
+    pub fn set_readonly(&self, ro: bool) {
+        self.readonly.store(ro, Ordering::SeqCst);
+    }
+
+    /// Check whether the device is read-only.
+    pub fn is_readonly(&self) -> bool {
+        self.readonly.load(Ordering::SeqCst)
+    }
+
+    /// Store the geometry string of the device (DM_DEV_SET_GEOMETRY).
+    ///
+    /// Pure storage with no effect on I/O, same as in Linux.
+    pub fn set_geometry(&self, geo: String) {
+        *self.geometry.lock() = Some(geo);
+    }
+
+    /// Return the geometry string previously stored by `set_geometry`,
+    /// or `None` if none was set.
+    pub fn geometry(&self) -> Option<String> {
+        self.geometry.lock().clone()
+    }
+
+    /// Arm deferred removal (DM_DEFERRED_REMOVE): when the last open
+    /// handle closes, the callback registered via `set_on_last_close`
+    /// fires.
+    pub fn mark_deferred_remove(&self) {
+        self.deferred_remove.store(true, Ordering::SeqCst);
+    }
+
+    /// Check whether deferred removal is armed.
+    pub fn is_deferred_remove(&self) -> bool {
+        self.deferred_remove.load(Ordering::SeqCst)
+    }
+
+    /// Disarm deferred removal (e.g. when the device is opened again
+    /// before the last close, cf. Linux clearing DMF_DEFERRED_REMOVE).
+    pub fn cancel_deferred_remove(&self) {
+        self.deferred_remove.store(false, Ordering::SeqCst);
+    }
+
+    /// Register the callback fired when the last open handle closes while
+    /// deferred removal is armed. Replaces any previously registered
+    /// callback. The callback fires at most once (it is consumed).
+    pub fn set_on_last_close(&self, cb: Box<dyn Fn() + Send + Sync>) {
+        *self.on_last_close.0.lock() = Some(cb);
+    }
+
     /// Remove the device (requires open_count == 0, simplified: just drop)
     pub fn remove(&self) {
         let mut tables = self.tables.write();
@@ -133,10 +227,15 @@ impl DmDevice {
         (tables.0.clone(), tables.1.clone())
     }
 
-    /// Suspend the device: block new I/O and wait for in-flight to complete
-    pub fn suspend(&self) {
+    /// Suspend the device: block new I/O and wait for in-flight to complete.
+    ///
+    /// Fails if the device is already suspended (cf. Linux `dm_suspend`,
+    /// which returns `-EINVAL` for a repeated suspend).
+    pub fn suspend(&self) -> Result<(), &'static str> {
         // Set the suspend flag first; new bios are deferred from now on.
-        self.suspend_flag.store(1, Ordering::SeqCst);
+        self.suspend_flag
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "device already suspended")?;
         // Wait until all bios accepted before the flag was set complete.
         //
         // The `inc` (SeqCst) in `enqueue` happens before its suspended
@@ -145,12 +244,18 @@ impl DmDevice {
         self.in_flight
             .drained
             .wait_until(|| (self.in_flight.count.load(Ordering::SeqCst) == 0).then_some(()));
+        Ok(())
     }
 
-    /// Resume the device: unblock and replay deferred queue
-    pub fn resume(&self) {
+    /// Resume the device: unblock and replay deferred queue.
+    ///
+    /// Fails if the device is not suspended (cf. Linux `dm_resume`, which
+    /// returns `-EINVAL` when resuming a live device).
+    pub fn resume(&self) -> Result<(), &'static str> {
         // Clear suspend flag
-        self.suspend_flag.store(0, Ordering::SeqCst);
+        self.suspend_flag
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "device not suspended")?;
 
         // Pop the deferred bios into a local backlog first, then replay them
         // without holding the queue lock. Replaying under the lock would
@@ -168,6 +273,7 @@ impl DmDevice {
             // queue.
             let _ = self.enqueue(bio);
         }
+        Ok(())
     }
 
     /// Check if device is suspended
@@ -229,6 +335,15 @@ impl BlockDevice for DmDevice {
         // that a concurrent `suspend` either counts this bio or has its
         // flag observed by the check below.
         self.in_flight.inc();
+        // Read-only enforcement. The block layer has no read-only concept
+        // and `BioEnqueueError` has no EROFS channel, so writes on a
+        // read-only DM device are refused here and surface to user space
+        // as EIO instead of Linux's EROFS (a known divergence). Flushes
+        // are allowed through.
+        if bio.type_() == BioType::Write && self.is_readonly() {
+            self.in_flight.dec();
+            return Err(BioEnqueueError::Refused);
+        }
         if self.is_suspended() {
             // Defer the *whole* bio before any splitting; it will be
             // re-split against the new table when replayed on resume.
@@ -293,6 +408,17 @@ impl BlockDevice for DmDevice {
     }
 
     fn on_close(&self) {
-        self.open_count.fetch_sub(1, Ordering::SeqCst);
+        let remaining = self.open_count.fetch_sub(1, Ordering::SeqCst) - 1;
+        // Deferred removal: when the last open handle closes, fire the
+        // glue-registered callback. Take the callback out of the mutex
+        // first and invoke it after releasing the lock, so that the
+        // callback (which may call back into this device, e.g. to remove
+        // it) cannot deadlock.
+        if remaining == 0 && self.is_deferred_remove() {
+            let cb = self.on_last_close.0.lock().take();
+            if let Some(cb) = cb {
+                cb();
+            }
+        }
     }
 }

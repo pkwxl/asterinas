@@ -8,10 +8,8 @@ edition.workspace = true
 [dependencies]
 aster-block.workspace = true
 device-id.workspace = true
-hashbrown.workspace = true
 io-util.workspace = true
 ostd.workspace = true
-spin.workspace = true
 
 [dev-dependencies]
 ostd-test.workspace = true
