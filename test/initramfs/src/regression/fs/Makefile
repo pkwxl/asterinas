@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 
 SUBDIRS := \
+	erofs \
 	ext2 \
 	fdatasync \
 	getcwd \
