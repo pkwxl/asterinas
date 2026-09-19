@@ -140,8 +140,8 @@ static inline int ero_fs_registered(void)
 	if (fd < 0)
 		return 0;
 	while (total < (ssize_t)sizeof(buf) - 1) {
-		ssize_t n = read(fd, buf + total,
-				 sizeof(buf) - 1 - (size_t)total);
+		ssize_t n =
+			read(fd, buf + total, sizeof(buf) - 1 - (size_t)total);
 
 		if (n <= 0)
 			break;
