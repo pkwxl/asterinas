@@ -72,7 +72,7 @@ impl FsType for ErofsType {
         // The tree is built once and cached in the `Once` static, so
         // repeated calls return the same node (the `FsType::sysnode`
         // contract). The registry attaches it under `/sys/fs`.
-        Some(EROFS_SYSNODE_ROOT.get_or_init(build_sysnode).clone())
+        Some(EROFS_SYSNODE_ROOT.call_once(build_sysnode).clone())
     }
 }
 
