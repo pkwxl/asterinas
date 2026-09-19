@@ -123,6 +123,20 @@
 #define FIBMAP _IO(0x00, 1)
 #endif
 
+/*
+ * AUTO-DECISION: the FIEMAP ioctl number is defined locally as
+ * _IOWR('f', 11, struct fiemap) -- its exact value in linux/fs.h --
+ * under the canonical name FS_IOC_FIEMAP. linux/fiemap.h only exports
+ * struct fiemap + the FIEMAP_* flags (no ioctl macro at all), and the
+ * macro's only header home, linux/fs.h, is off-limits per the FIBMAP
+ * decision above (MS_* redefinition noise x -Werror). Guarded #ifndef
+ * so a future header chain that does provide it stays conflict-free.
+ * (Test-writing choice; no expected value moves.)
+ */
+#ifndef FS_IOC_FIEMAP
+#define FS_IOC_FIEMAP _IOWR('f', 11, struct fiemap)
+#endif
+
 #define EROFS_REG_DIR EROFS_INIT_MNT "/regular"
 #define EROFS_SELF_REG EROFS_SELF_MNT "/regular"
 
@@ -510,7 +524,7 @@ FN_TEST(data_path_fiemap_fibmap_enotty)
 		fm.fm_start = 0;
 		fm.fm_length = FIEMAP_MAX_OFFSET;
 		fm.fm_extent_count = 1;
-		TEST_ERRNO(ioctl(fd, FIEMAP_IOCTL, &fm), ENOTTY);
+		TEST_ERRNO(ioctl(fd, FS_IOC_FIEMAP, &fm), ENOTTY);
 		TEST_ERRNO(ioctl(fd, FIBMAP, &lba), ENOTTY);
 		TEST_SUCC(close(fd));
 	}
@@ -521,7 +535,7 @@ FN_TEST(data_path_fiemap_fibmap_enotty)
 		fm.fm_start = 0;
 		fm.fm_length = FIEMAP_MAX_OFFSET;
 		fm.fm_extent_count = 1;
-		TEST_ERRNO(ioctl(dfd, FIEMAP_IOCTL, &fm), ENOTTY);
+		TEST_ERRNO(ioctl(dfd, FS_IOC_FIEMAP, &fm), ENOTTY);
 		TEST_SUCC(close(dfd));
 	}
 }
