@@ -113,6 +113,19 @@
  */
 #define XV_KERNEL_PTR ((const void *)(uintptr_t)0xfffffffffffff000ULL)
 
+/*
+ * AUTO-DECISION: unmapped low value pointer for the W-X05 sample-15
+ * residue, laundered through a volatile object. GCC folds the plain
+ * uintptr_t cast back to the literal address and, with setxattr's
+ * access(read_only, 3, 4) attribute, -Wstringop-overread rejects any
+ * compiler-known constant low address as a read source (the F39
+ * XV_KERNEL_PTR spelling above stays clean only because its size is
+ * 0, i.e. no read at all). The volatile load hands the analyzer an
+ * opaque pointer while keeping the address (0x10 is never mapped) and
+ * the asserted observable identical.
+ */
+static const void *volatile xv_bad_ptr = (const void *)(uintptr_t)0x10;
+
 /* Long-name material (S01 sec. 3.4): "user." + 'n' * 200 = 205 chars. */
 #define XV_LONGNAME_TOTAL 205
 
@@ -277,8 +290,8 @@ static int xv_has_name(const char *buf, size_t len, const char *name)
  * pinning order would freeze an on-disk layout detail the baseline
  * never promises.
  */
-static int xv_check_list(const char *path, const char *const *names,
-			 int nnames, int total)
+static int xv_check_list(const char *path, const char *const *names, int nnames,
+			 int total)
 {
 	char list[512];
 	ssize_t n;
@@ -322,9 +335,8 @@ static int xv_set_errno(void)
 {
 	const char val[] = "v";
 
-	return setxattr(xv_path, xv_name, val, sizeof(val) - 1, 0) < 0 ?
-		       errno :
-		       0;
+	return setxattr(xv_path, xv_name, val, sizeof(val) - 1, 0) < 0 ? errno :
+									 0;
 }
 
 /* errno of removexattr (0 on success). */
@@ -374,8 +386,8 @@ FN_TEST(xattr_get_host_value_matrix)
 	TEST_RES(xv_matches_ch(buf, 4, 'N'), _ret == 0);
 
 	/* Absent name on a host with entries: ENODATA. */
-	TEST_ERRNO(getxattr(XV_MNT "/xattr_user_short.bin", "user.missing",
-			    buf, sizeof(buf)),
+	TEST_ERRNO(getxattr(XV_MNT "/xattr_user_short.bin", "user.missing", buf,
+			    sizeof(buf)),
 		   ENODATA);
 
 	/* Host-level zero-entry control (xattr_none.bin gets nothing). */
@@ -480,8 +492,7 @@ FN_TEST(xattr_visibility_priv_drop_matrix)
 	 * cell is shadowed on aster by the parse-first order -- Linux
 	 * answers EACCES here, aster answers the parse EOPNOTSUPP. */
 	xv_name = "lustre.x";
-	TEST_RES(ero_run_as_uid(XV_NOBODY, xv_get_errno),
-		 _ret == EOPNOTSUPP);
+	TEST_RES(ero_run_as_uid(XV_NOBODY, xv_get_errno), _ret == EOPNOTSUPP);
 
 	/* X15 exemption: security. skips the read gate -> plain ENODATA. */
 	xv_name = "security.foo";
@@ -508,8 +519,8 @@ FN_TEST(xattr_visibility_priv_drop_matrix)
 
 	/* W-X08 sample 2 (登记差异): unknown prefix + missing path ->
 	 * Linux ENOENT, aster EOPNOTSUPP (parse first; root form). */
-	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/no_such_entry", "lustre.x",
-			    NULL, 0),
+	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/no_such_entry", "lustre.x", NULL,
+			    0),
 		   EOPNOTSUPP);
 
 	/* List has no permission gate (negative contrast): the 0600 host
@@ -555,16 +566,16 @@ FN_TEST(xattr_list_visibility_root)
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
 
-	TEST_RES(xv_check_list(XV_MNT "/xattr_user_short.bin", user_v_names,
-			       1, 7),
+	TEST_RES(xv_check_list(XV_MNT "/xattr_user_short.bin", user_v_names, 1,
+			       7),
 		 _ret == 0);
 	TEST_RES(xv_check_list(XV_MNT "/xattr_multi.bin", multi_names, 3, 21),
 		 _ret == 0);
 	TEST_RES(xv_check_list(XV_MNT "/xattr_trusted.bin", trusted_names, 1,
 			       10),
 		 _ret == 0);
-	TEST_RES(xv_check_list(XV_MNT "/xattr_security.bin", security_names,
-			       1, 11),
+	TEST_RES(xv_check_list(XV_MNT "/xattr_security.bin", security_names, 1,
+			       11),
 		 _ret == 0);
 	TEST_RES(xv_check_list(XV_MNT "/xattr_shared_1.bin", shared_names, 2,
 			       25),
@@ -575,11 +586,9 @@ FN_TEST(xattr_list_visibility_root)
 	TEST_RES(xv_check_list(XV_MNT "/xattr_shared_3.bin", shared_names, 2,
 			       25),
 		 _ret == 0);
-	TEST_RES(xv_check_list(XV_MNT "/prefix_lpx_1.bin", prefix_names, 2,
-			       51),
+	TEST_RES(xv_check_list(XV_MNT "/prefix_lpx_1.bin", prefix_names, 2, 51),
 		 _ret == 0);
-	TEST_RES(xv_check_list(XV_MNT "/prefix_lpx_2.bin", prefix_names, 2,
-			       51),
+	TEST_RES(xv_check_list(XV_MNT "/prefix_lpx_2.bin", prefix_names, 2, 51),
 		 _ret == 0);
 
 	/* The 200-char name is listed in full (X27 family: plain long
@@ -613,8 +622,7 @@ FN_TEST(xattr_list_visibility_root)
 	 * empty. The acl VALUE faces are acl.c's; this is the list-side
 	 * cell only.
 	 */
-	TEST_RES(xv_check_list(XV_MNT "/acl_file.bin", NULL, 0, 0),
-		 _ret == 0);
+	TEST_RES(xv_check_list(XV_MNT "/acl_file.bin", NULL, 0, 0), _ret == 0);
 	TEST_RES(xv_check_list(XV_MNT "/acl_dir", NULL, 0, 0), _ret == 0);
 }
 END_TEST()
@@ -638,6 +646,13 @@ FN_TEST(xattr_write_erofs_and_order)
 	const char *host = XV_MNT "/xattr_user_short.bin";
 	const char *missing = EROFS_INIT_MNT "/no_such_entry";
 	const char val[] = "v";
+	/* E2BIG staging: the syscall size gate (> XATTR_SIZE_MAX 65536)
+	 * fires before any copy, but the region handed over is made
+	 * genuinely readable at the full size so -Wstringop-overread (it
+	 * reads sizes, not intent) sees an in-bounds source. 70000 is the
+	 * registered oversize value; sizeof() locks buffer and syscall
+	 * size together by construction. */
+	static char big[70000];
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
 
@@ -646,10 +661,8 @@ FN_TEST(xattr_write_erofs_and_order)
 	TEST_ERRNO(setxattr(host, "user.", val, 1, 0), EROFS);
 	TEST_ERRNO(setxattr(host, "trusted.new", val, 1, 0), EROFS);
 	TEST_ERRNO(setxattr(host, "security.new", val, 1, 0), EROFS);
-	TEST_ERRNO(setxattr(host, "system.posix_acl_access", val, 1, 0),
-		   EROFS);
-	TEST_ERRNO(setxattr(host, "user.new", val, 1, XV_XATTR_CREATE),
-		   EROFS);
+	TEST_ERRNO(setxattr(host, "system.posix_acl_access", val, 1, 0), EROFS);
+	TEST_ERRNO(setxattr(host, "user.new", val, 1, XV_XATTR_CREATE), EROFS);
 	TEST_ERRNO(removexattr(host, "user.v"), EROFS);
 	TEST_ERRNO(removexattr(host, "trusted.t"), EROFS);
 
@@ -664,14 +677,12 @@ FN_TEST(xattr_write_erofs_and_order)
 	/* F21 negatives: each syscall-layer gate fires before EROFS. */
 	TEST_ERRNO(setxattr(missing, "user.x", val, 1, 5), EINVAL);
 	TEST_ERRNO(setxattr(missing, "", val, 1, 0), ERANGE);
-	TEST_ERRNO(setxattr(missing, "user.x", val, 70000, 0), E2BIG);
+	TEST_ERRNO(setxattr(missing, "user.x", big, sizeof(big), 0), E2BIG);
 
 	/* 登记差异(W-X05 sample 15): unmapped value pointer + missing
 	 * path -> Linux EFAULT (value copy first), aster ENOENT (the
 	 * lazy reader is only consulted after lookup). */
-	TEST_ERRNO(setxattr(missing, "user.x",
-			    (const void *)(uintptr_t)0x10, 16, 0),
-		   ENOENT);
+	TEST_ERRNO(setxattr(missing, "user.x", xv_bad_ptr, 16, 0), ENOENT);
 
 	/* 登记差异(W-X05 F39 corner): kernel-range value pointer with
 	 * size=0 -> aster EFAULT (the reader faults at construction);
@@ -758,8 +769,7 @@ FN_TEST(xattr_nouser_xattr_gate)
 	TEST_RES(xv_matches_ch(buf, 16, 'S'), _ret == 0);
 
 	/* X4: user names are skipped from the list (not an error). */
-	TEST_RES(listxattr(XV_SELF "/xattr_user_short.bin", list,
-			   sizeof(list)),
+	TEST_RES(listxattr(XV_SELF "/xattr_user_short.bin", list, sizeof(list)),
 		 _ret == 0);
 	TEST_RES(listxattr(XV_SELF "/xattr_trusted.bin", list, sizeof(list)),
 		 _ret == 10);
@@ -790,13 +800,12 @@ FN_TEST(xattr_shared_all_fidelity)
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_XSHARED);
 	ero_ensure_self_mnt();
 
-	TEST_SUCC(mount(EROFS_DEV_XSHARED, EROFS_SELF_MNT, "erofs", 0,
-			NULL));
+	TEST_SUCC(mount(EROFS_DEV_XSHARED, EROFS_SELF_MNT, "erofs", 0, NULL));
 
 	TEST_RES(xv_check_all_entries(XV_SELF), _ret == 0);
 
-	TEST_RES(xv_check_list(XV_SELF "/xattr_user_short.bin", user_v_names,
-			       1, 7),
+	TEST_RES(xv_check_list(XV_SELF "/xattr_user_short.bin", user_v_names, 1,
+			       7),
 		 _ret == 0);
 	TEST_RES(xv_check_list(XV_SELF "/xattr_multi.bin", multi_names, 3, 21),
 		 _ret == 0);
@@ -847,8 +856,7 @@ FN_TEST(xattr_zero_xattr_negative)
 			    sizeof(buf)),
 		   ENODATA);
 
-	TEST_RES(listxattr(XV_SELF "/xattr_user_short.bin", list,
-			   sizeof(list)),
+	TEST_RES(listxattr(XV_SELF "/xattr_user_short.bin", list, sizeof(list)),
 		 _ret == 0);
 	TEST_RES(listxattr(XV_SELF "/xattr_multi.bin", list, sizeof(list)),
 		 _ret == 0);
@@ -913,8 +921,8 @@ FN_TEST(xattr_prefix_get_list_fidelity)
 	TEST_RES(getxattr(XV_SELF "/xattr_user_short.bin", "user.v", buf,
 			  sizeof(buf)),
 		 _ret == 1);
-	TEST_RES(xv_check_list(XV_SELF "/xattr_user_short.bin", user_v_names,
-			       1, 7),
+	TEST_RES(xv_check_list(XV_SELF "/xattr_user_short.bin", user_v_names, 1,
+			       7),
 		 _ret == 0);
 
 	/* Absent tail of the registered prefix family -> ENODATA (the

@@ -291,8 +291,8 @@ FN_TEST(data_path_flat_size_gradient)
 
 	/* EOF crossing: exactly the 1-byte tail of flat_4097b comes back. */
 	{
-		int fd = TEST_SUCC(open(EROFS_REG_DIR "/flat_4097b.bin",
-					O_RDONLY));
+		int fd = TEST_SUCC(
+			open(EROFS_REG_DIR "/flat_4097b.bin", O_RDONLY));
 
 		if (fd >= 0) {
 			TEST_RES(pread(fd, buf, EROFS_IMG_BS,
@@ -402,11 +402,11 @@ FN_TEST(data_path_tail_zerofill_mmap)
 			continue;
 		}
 		for (k = 0; k < EROFS_IMG_BS; k++) {
-			char want = k < rows[i].data_len ?
-					    (char)ero_content_byte(
-						    (size_t)rows[i].page_off +
-						    k) :
-					    0;
+			char want =
+				k < rows[i].data_len ?
+					(char)ero_content_byte(
+						(size_t)rows[i].page_off + k) :
+					0;
 
 			if (p[k] != want)
 				bad++;
@@ -431,8 +431,7 @@ FN_TEST(data_path_splice_pipe)
 	int fd;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
-	fd = TEST_SUCC(open(EROFS_REG_DIR "/flat_16k_plus_100b.bin",
-			    O_RDONLY));
+	fd = TEST_SUCC(open(EROFS_REG_DIR "/flat_16k_plus_100b.bin", O_RDONLY));
 	if (fd < 0)
 		return;
 	TEST_SUCC(pipe(pfd));
@@ -454,8 +453,7 @@ FN_TEST(data_path_splice_pipe)
 			 _ret == 0);
 	}
 	/* The explicit offset advanced across both splices. */
-	TEST_RES((unsigned long long)off,
-		 _ret == EROFS_IMG_BS + 1024);
+	TEST_RES((unsigned long long)off, _ret == EROFS_IMG_BS + 1024);
 
 	TEST_SUCC(close(pfd[0]));
 	TEST_SUCC(close(pfd[1]));
@@ -552,14 +550,12 @@ FN_TEST(data_path_chunk4b_crossblk_content)
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CHUNK4B);
 	ero_ensure_self_mnt();
 
-	TEST_SUCC(mount(EROFS_DEV_CHUNK4B, EROFS_SELF_MNT, "erofs", 0,
-			NULL));
-	TEST_RES(ero_check_content_path(
-			 EROFS_SELF_REG "/flat_16k_plus_100b.bin",
-			 EROFS_SIZE_16K_PLUS_100),
+	TEST_SUCC(mount(EROFS_DEV_CHUNK4B, EROFS_SELF_MNT, "erofs", 0, NULL));
+	TEST_RES(ero_check_content_path(EROFS_SELF_REG
+					"/flat_16k_plus_100b.bin",
+					EROFS_SIZE_16K_PLUS_100),
 		 _ret == 0);
-	TEST_RES(ero_check_content_path(EROFS_SELF_REG "/flat_4096b.bin",
-					4096),
+	TEST_RES(ero_check_content_path(EROFS_SELF_REG "/flat_4096b.bin", 4096),
 		 _ret == 0);
 	TEST_RES(ero_check_content_path(EROFS_SELF_REG "/file_1b.bin", 1),
 		 _ret == 0);
@@ -584,18 +580,15 @@ FN_TEST(data_path_concat_shift_content)
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CONCAT);
 	ero_ensure_self_mnt();
 
-	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0,
-			NULL));
-	TEST_RES(ero_check_content_path(
-			 EROFS_SELF_REG "/flat_16k_plus_100b.bin",
-			 EROFS_SIZE_16K_PLUS_100),
+	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0, NULL));
+	TEST_RES(ero_check_content_path(EROFS_SELF_REG
+					"/flat_16k_plus_100b.bin",
+					EROFS_SIZE_16K_PLUS_100),
 		 _ret == 0);
-	TEST_RES(ero_check_content_path(EROFS_SELF_REG "/flat_4096b.bin",
-					4096),
+	TEST_RES(ero_check_content_path(EROFS_SELF_REG "/flat_4096b.bin", 4096),
 		 _ret == 0);
 
-	fd = TEST_SUCC(open(EROFS_SELF_REG "/content_anchor.txt",
-			    O_RDONLY));
+	fd = TEST_SUCC(open(EROFS_SELF_REG "/content_anchor.txt", O_RDONLY));
 	if (fd >= 0) {
 		TEST_SUCC(fstat(fd, &st));
 		TEST_RES((unsigned long long)st.st_size,
@@ -631,10 +624,8 @@ FN_TEST(data_path_concat_sparse_hole_form_face)
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CONCAT);
 	ero_ensure_self_mnt();
 
-	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0,
-			NULL));
-	fd = TEST_SUCC(open(EROFS_SELF_REG "/sparse_hole.bin",
-			    O_RDONLY));
+	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0, NULL));
+	fd = TEST_SUCC(open(EROFS_SELF_REG "/sparse_hole.bin", O_RDONLY));
 	if (fd >= 0) {
 		TEST_SUCC(fstat(fd, &st));
 		TEST_RES((unsigned long long)st.st_size,
@@ -670,10 +661,8 @@ FN_TEST(data_path_main_only_data_eio)
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_FLATDEV);
 	ero_ensure_self_mnt();
 
-	TEST_SUCC(mount(EROFS_DEV_FLATDEV, EROFS_SELF_MNT, "erofs", 0,
-			NULL));
-	fd = TEST_SUCC(open(EROFS_SELF_REG "/flat_4096b.bin",
-			    O_RDONLY));
+	TEST_SUCC(mount(EROFS_DEV_FLATDEV, EROFS_SELF_MNT, "erofs", 0, NULL));
+	fd = TEST_SUCC(open(EROFS_SELF_REG "/flat_4096b.bin", O_RDONLY));
 	if (fd >= 0) {
 		/* Metadata resolves from the main device. */
 		TEST_SUCC(fstat(fd, &st));

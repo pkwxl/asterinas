@@ -222,8 +222,7 @@ FN_TEST(acl_absence_faces)
 	EROFS_SKIP_IF_NO_INIT_MNT();
 
 	TEST_ERRNO(getxattr(AC_DIR, AC_ACCESS, buf, sizeof(buf)), ENODATA);
-	TEST_ERRNO(getxattr(AC_FILE, AC_DEFAULT, buf, sizeof(buf)),
-		   ENODATA);
+	TEST_ERRNO(getxattr(AC_FILE, AC_DEFAULT, buf, sizeof(buf)), ENODATA);
 	TEST_ERRNO(getxattr(AC_MNT "/xattr_none.bin", AC_ACCESS, buf,
 			    sizeof(buf)),
 		   ENODATA);
@@ -273,11 +272,11 @@ FN_TEST(acl_symlink_own_gate)
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
 
-	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/symlink/to_file_short",
-			    AC_ACCESS, buf, sizeof(buf)),
+	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/symlink/to_file_short", AC_ACCESS,
+			    buf, sizeof(buf)),
 		   EOPNOTSUPP);
-	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/symlink/to_file_short",
-			    AC_DEFAULT, buf, sizeof(buf)),
+	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/symlink/to_file_short", AC_DEFAULT,
+			    buf, sizeof(buf)),
 		   EOPNOTSUPP);
 }
 END_TEST()
@@ -330,14 +329,12 @@ FN_TEST(acl_noacl_variant_gate)
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
 	ero_ensure_self_mnt();
 
-	TEST_SUCC(mount(EROFS_DEV_BASE, EROFS_SELF_MNT, "erofs", 0,
-			"noacl"));
+	TEST_SUCC(mount(EROFS_DEV_BASE, EROFS_SELF_MNT, "erofs", 0, "noacl"));
 
 	TEST_ERRNO(getxattr(AC_SELF "/acl_file.bin", AC_ACCESS, buf,
 			    sizeof(buf)),
 		   EOPNOTSUPP);
-	TEST_ERRNO(getxattr(AC_SELF "/acl_dir", AC_DEFAULT, buf,
-			    sizeof(buf)),
+	TEST_ERRNO(getxattr(AC_SELF "/acl_dir", AC_DEFAULT, buf, sizeof(buf)),
 		   EOPNOTSUPP);
 
 	TEST_RES(getxattr(AC_SELF "/xattr_user_short.bin", "user.v", buf,
