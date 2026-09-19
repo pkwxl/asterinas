@@ -111,6 +111,7 @@ echo "Start erofs fs test......"
 ./erofs/super_block
 ./erofs/statfs_remount
 ./erofs/umount_show
+./erofs/sysfs
 echo "All erofs fs test passed."
 
 echo "Start fdatasync test......"
