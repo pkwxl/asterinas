@@ -115,6 +115,7 @@ echo "Start erofs fs test......"
 ./erofs/inode_stat
 ./erofs/namei
 ./erofs/symlink
+./erofs/readdir
 echo "All erofs fs test passed."
 
 echo "Start fdatasync test......"
