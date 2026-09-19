@@ -661,7 +661,13 @@ pub(super) enum FileKind {
     /// carries it; the variant itself is the guard-carrying face and
     /// keeps every kind match default-free (T-001 §9.7.4). The
     /// payload is the nibble value, kept for diagnostics.
-    Other(#[expect(dead_code)] u8),
+    // AUTO-DECISION: no dead-code suppression on the payload — the
+    // in-crate clippy -Dwarnings run (T-022 S06 test round) proved
+    // the field-never-read finding does not fire at this position
+    // (the standalone-probe prediction diverged: the sole
+    // construction site lives inside the not-yet-called
+    // `from_raw_i_mode`), so an expect here stays unfulfilled.
+    Other(u8),
 }
 
 impl FileKind {
