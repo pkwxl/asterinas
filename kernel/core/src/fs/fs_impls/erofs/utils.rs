@@ -35,13 +35,16 @@
 #![cfg_attr(not(ktest), expect(dead_code))]
 // Dead-code ledger (why the `expect` above stays fulfilled): in regular
 // builds the two hash primitives have no caller until the superblock
-// checksum verification lands (`super_block.rs`, T-023), and
-// `duration_from_parts` is called only from the `build_time` and `time`
-// mirror decodes (T-022 S03/S07), which are themselves dormant until
-// T-023/T-024 — so until then every item below is referenced only by
-// the ktest suite, which is compiled out of regular builds. The `expect`
-// becomes unfulfilled — and the compiler will ask for its removal —
-// only once no dead item remains under this module.
+// checksum verification lands (`super_block.rs`, T-023) — until then
+// they are referenced only by the ktest suite, which is compiled out
+// of regular builds. `duration_from_parts` is called only from the
+// `build_time` and `time` mirror decodes (T-022 S03/S07), which are
+// themselves dormant until T-023/T-024, and the ktest suite keeps it
+// uncovered by design (no new ktest cases for a pure transcription) —
+// it is dead in *both* cfgs and therefore carries its own item-level
+// `expect(dead_code)` below. The module-level `expect` becomes
+// unfulfilled — and the compiler will ask for its removal — only once
+// no dead item remains under this module.
 
 use core::time::Duration;
 
@@ -190,6 +193,13 @@ pub(super) fn xxh32(data: &[u8], seed: u32) -> u32 {
 /// malformed images; normal images keep nsec < 1e9), so saturation
 /// merely turns the panic into a known-diff value: no new guard, no
 /// error, no clamping (F6n, `docs/T-011/S01/index.md` §4.2).
+// Dead in both cfgs until S03/S07: regular builds have no caller yet,
+// and the ktest suite keeps this helper uncovered by design, so the
+// module-level `cfg_attr(not(ktest), ...)` above cannot cover the
+// ktest cfg — the function carries its own expect. The first reachable
+// caller lands with the mirror decodes; the `expect` fires
+// `unfulfilled` the moment one does, which is the prompt to remove it.
+#[expect(dead_code)]
 pub(super) fn duration_from_parts(secs: u64, nsecs: u32) -> Duration {
     Duration::new(
         secs.saturating_add((nsecs / 1_000_000_000) as u64),
