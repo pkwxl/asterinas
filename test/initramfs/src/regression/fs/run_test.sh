@@ -119,6 +119,7 @@ echo "Start erofs fs test......"
 ./erofs/data_path
 ./erofs/xattr
 ./erofs/acl
+./erofs/write_ero_fs
 echo "All erofs fs test passed."
 
 echo "Start fdatasync test......"
