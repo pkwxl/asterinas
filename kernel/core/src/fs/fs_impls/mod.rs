@@ -7,6 +7,7 @@
 pub mod cgroupfs;
 pub mod configfs;
 pub mod devpts;
+pub mod erofs;
 pub mod exfat;
 pub mod ext2;
 pub mod overlayfs;
