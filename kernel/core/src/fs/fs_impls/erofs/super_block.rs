@@ -10,15 +10,17 @@
 //! on-disk constants (`SUPER_OFFSET`, `SUPER_MAGIC_V1`, `NAME_LEN`,
 //! and the compat/incompat bitflag sets).
 //!
-//! Bring-up state: the disk side has landed — `RawSuperBlock`,
-//! `RawDeviceSlot`, the compression config record headers (archive-A
-//! registration), the feature bitflag sets, the cross-file constants,
-//! and the 26 + 6 layout assertions. The mirror side — the decoded
+//! Bring-up state: both halves have landed — the disk side
+//! (`RawSuperBlock`, `RawDeviceSlot`, the compression config record
+//! headers, the feature bitflag sets, the cross-file constants, the
+//! 26 + 6 layout assertions) and the mirror side (the decoded
 //! `SuperBlock`, the pure `From<RawSuperBlock>` conversion, the
-//! checksum verification, and the predicate/accessor surface — lands
-//! with the same task; the mount-time validation sequence with T-023.
-//! Until then the `SuperBlock` at the bottom remains the minimal type
-//! shell required by the `Erofs` handle.
+//! checksum verification, and the predicate/accessor surface). The
+//! mount-time validation sequence — which door runs first and what
+//! each failure reports — lands with T-023; until a caller wires the
+//! mirror into `Erofs::open`, every dormant surface below carries
+//! its own `#[expect(dead_code)]` removal prompt with its first
+//! consumer annotated.
 //!
 //! Boundary: field-level decoding and predicates only — the assembly
 //! and validation *order* decisions belong solely to
@@ -26,6 +28,7 @@
 
 use core::mem::offset_of;
 
+use aster_util::fixed_str::FixedCStr;
 use ostd::const_assert;
 
 use super::prelude::*;
@@ -38,11 +41,11 @@ use super::prelude::*;
 /// The erofs superblock is located at byte 1024 from the beginning of
 /// the device (`EROFS_SUPER_OFFSET`, erofs_fs.h:12; consumed at
 /// super.c:290,323).
-// First consumers: the mount-time superblock read (`fs.rs`, T-023) and
-// the mirror-side `sb_size()` upper-bound door. Until then there is no
-// live caller — the `expect` below fires the moment one lands, which
-// is the prompt to remove it.
-#[expect(dead_code)]
+// Live since T-022 S03: the mirror-side `checksummed_len()` consumes
+// it — an `#[expect(dead_code)]` method is a dead-code-analysis root,
+// and its references count. The mount-time superblock read (`fs.rs`,
+// T-023) joins later; the bridging `expect` was removed when the
+// first consumer landed.
 pub(super) const SUPER_OFFSET: usize = 1024;
 
 /// The erofs V1 magic number
@@ -63,9 +66,10 @@ pub(super) const NAME_LEN: usize = 255;
 
 /// The size of one superblock extension slot in bytes
 /// (`EROFS_SB_EXTSLOT_SIZE`, erofs_fs.h:44).
-// Consumed by the mirror-side `sb_size()` (= 128 + extslots × 16),
-// which lands with the SuperBlock mirror later in this task.
-#[expect(dead_code)]
+// Live since T-022 S03: consumed by the mirror-side `sb_size()` — an
+// `#[expect(dead_code)]` method is a dead-code-analysis root, and its
+// references count. The bridging `expect` was removed when that
+// consumer landed.
 const SB_EXTSLOT_SIZE: usize = 16;
 
 // ---------------------------------------------------------------------------
@@ -383,10 +387,326 @@ struct RawZstdCfgs {
     reserved: [u8; 4], // @2 u8[4]
 }
 
-/// Validated in-memory mirror of the on-disk superblock.
+// ---------------------------------------------------------------------------
+// In-memory mirror: SuperBlock, the pure decode, and the predicate
+// surface (SB3/SB4/SB5, `docs/T-011/S02/index.md` §5; conversion table
+// §5.2, predicate surface §5.5, from_le ledger §5.6).
+// ---------------------------------------------------------------------------
+
+/// Validated in-memory mirror of the on-disk superblock (SB4/SB5).
 ///
-/// Placeholder form: the real decoded geometry (block size, root nid,
-/// feature sets, uuid, volume name) lands with the mirror side later
-/// in this task, replacing this shell wholesale.
-#[derive(Debug)]
-pub(super) struct SuperBlock;
+/// The conversion point is the pure `From<RawSuperBlock>` below: no
+/// validation, no error arm, no ordering — every mount-time gate
+/// (magic, blkszbits bounds, dirblkbits, checksum trigger and value,
+/// unknown incompat bits, sb_size bound, volume-name NIL, the
+/// V-series doors) is *supplied* here as a predicate or accessor and
+/// *sequenced* solely by `fs.rs::Erofs::open` (T-023). Fields are
+/// `pub(super)` for direct family reads; derived values and
+/// judgements are methods.
+///
+/// Carries all 22 semantic fields of the 24 on-disk fields —
+/// `checksum` lives only at the byte layer, inside the checksum
+/// verification helper, and `reserved2` is read-but-not-checked
+/// (G5) — with the two build timestamp fields collapsed into the
+/// single `build_time: Duration`: 21 fields in total.
+///
+/// # Field liveness (dead-code ledger)
+///
+/// The `From` conversion *writes* every field but reads none, and the
+/// derived `Clone`/`Copy`/`Debug` impls are intentionally ignored by
+/// dead-code analysis, so a mirror field is only live once live code
+/// reads it. Fields consumed through accessors (`blkszbits`,
+/// `sb_extslots`, `feature_compat`, `feature_incompat`,
+/// `volume_name`) are read by the `#[expect(dead_code)]` accessor
+/// roots below — an item carrying an `expect` is a dead-code-analysis
+/// root, so its reads count. Every other field carries its own
+/// `#[expect(dead_code)]` with its first consumer annotated: the
+/// `expect` fires `unfulfilled` the moment that consumer lands, which
+/// is the removal prompt (the cut-domain pair additionally carries
+/// its SB5 revival note). The design sketch marked only the
+/// cut-domain pair with a deadness attribute; the landed form
+/// generalizes it to every not-yet-read field, for the same reason
+/// S01 replaced `#[allow]` with `#[expect]` — the workspace bans
+/// allow attributes, and the `expect` doubles as the revival alarm.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SuperBlock {
+    /// The file system magic number (host order; the `From` body is
+    /// its single `from_le`).
+    // First consumer: the mount-time magic door (`fs.rs`, T-023,
+    // EINVAL on mismatch).
+    #[expect(dead_code)]
+    pub(super) magic: u32,
+    /// Compatible feature bits, host order; decoded by the
+    /// `feature_compat()` accessor. Unknown compat bits are silently
+    /// accepted (G4) — no unknown-compat door exists anywhere.
+    pub(super) feature_compat: u32,
+    /// The filesystem block size as a bit shift (`1 << blkszbits`);
+    /// read directly (u8, no endianness). The bounds door (G-M08:
+    /// outside 9..=PAGE_SHIFT → EINVAL) is mount-time (T-023).
+    pub(super) blkszbits: u8,
+    /// The number of 16-byte superblock extension slots; consumed by
+    /// `sb_size()`. The V7 upper-bound door is mount-time (T-023).
+    pub(super) sb_extslots: u8,
+    /// The nid of the root directory inode (host order).
+    // First consumer: the root-inode read of the mount-time assembly
+    // (`fs.rs`, T-023).
+    #[expect(dead_code)]
+    pub(super) root_nid: u16,
+    /// The total number of valid inodes (host order).
+    // First consumer: statfs `f_files` (T-023).
+    #[expect(dead_code)]
+    pub(super) inos: u64,
+    /// The compact-inode time derivation source, as a single
+    /// `Duration` decoded through `utils::duration_from_parts` (ID1):
+    /// the seconds field carries the full le64 domain unchanged (F6;
+    /// the `as i64` truncation happens at the statx exit), and a
+    /// malformed nsec >= 1e9 normalizes through the carrier — the
+    /// F6n known-diff, reached only from malformed images.
+    // First consumer: compact-inode ctime derivation (T-024; D10
+    // three-times-one-field).
+    #[expect(dead_code)]
+    pub(super) build_time: Duration,
+    /// The total number of blocks (host order), the statfs basis.
+    // First consumer: statfs/total_blocks geometry (T-023).
+    #[expect(dead_code)]
+    pub(super) blocks: u32,
+    /// The start block address of the metadata area (host order).
+    // First consumer: the inode metadata space location (T-023/T-024;
+    // the iloc formula consumes the mirror field).
+    #[expect(dead_code)]
+    pub(super) meta_blkaddr: u32,
+    /// The start block address of the shared xattr area (host order).
+    // First consumer: the shared-xattr walk (`xattr.rs`, T-026).
+    #[expect(dead_code)]
+    pub(super) xattr_blkaddr: u32,
+    /// The 128-bit volume UUID (byte array, read as-is).
+    // First consumer: the mount-time geometry consumption (T-023).
+    #[expect(dead_code)]
+    pub(super) uuid: [u8; 16],
+    /// The volume name, as read off disk (byte array; not yet
+    /// NUL-checked). The NIL door and the decoded view are the two
+    /// accessors below — the door must run first (T-023).
+    pub(super) volume_name: [u8; 16],
+    /// Incompatible feature bits, host order; decoded by the
+    /// `feature_incompat()` accessor, gated by
+    /// `has_unknown_incompat()`.
+    pub(super) feature_incompat: u32,
+    /// The C union `u1` (erofs_fs.h:73-78), carried as the minimal
+    /// common width integer (U1) with its two readings discriminated
+    /// by the consumer: `available_compr_algs` (the algorithm bitmap,
+    /// LZ4=0/LZMA=1/DEFLATE=2/ZSTD=3) when `COMPR_CFGS` is set,
+    /// otherwise `lz4_max_distance` (the legacy LZ4 sliding window).
+    /// The mirror stores the host-order bits only; reading
+    /// discrimination is mount-time and compression-domain business.
+    // First consumer: the mount-time V9 door (u1 != 0 → EOPNOTSUPP,
+    // T-023) and the COMPR_CFGS algorithm-config records (G-Z01
+    // revival).
+    #[expect(dead_code)]
+    pub(super) u1: u16,
+    /// The number of devices besides the primary device (host order).
+    // First consumer: the DEVICE_TABLE face of the mount-time
+    // sequence (T-023; the multi-device scan itself stays pruned,
+    // G-M14).
+    #[expect(dead_code)]
+    pub(super) extra_devices: u16,
+    /// The device table start offset, in `DEVT_SLOT_SIZE` units (host
+    /// order). Cut-domain field (SB5): the multi-device scan stays
+    /// pruned under archive A (G-M14), so nothing reads this offset
+    /// until that domain revives and takes over the device-table
+    /// locating formula and the empty-tag door.
+    #[expect(dead_code)]
+    pub(super) devt_slotoff: u16,
+    /// The directory block size in bit shift; non-zero is a
+    /// mount-time error (T-023).
+    // First consumer: the mount-time dirblkbits door (T-023).
+    #[expect(dead_code)]
+    pub(super) dirblkbits: u8,
+    /// The number of long xattr name prefixes; read directly (u8).
+    // First consumer: the long-prefix domain (`xattr.rs`, T-026).
+    #[expect(dead_code)]
+    pub(super) xattr_prefix_count: u8,
+    /// The start of the long xattr name prefix area (host order).
+    // First consumer: the long-prefix domain (`xattr.rs`, T-026;
+    // located at `xattr_prefix_start × 4`).
+    #[expect(dead_code)]
+    pub(super) xattr_prefix_start: u32,
+    /// The nid of the special packed inode (fragments; host order).
+    /// Cut-domain field (SB5): the fragments assembly face stays
+    /// pruned under archive A, so nothing reads this nid until that
+    /// domain revives (FRAGMENTS, G-Z01 archive C).
+    #[expect(dead_code)]
+    pub(super) packed_nid: u64,
+    /// The xattr name filter reservation byte; the bloom filter is
+    /// effective only when this is zero (read directly, u8).
+    // First consumer: the bloom effectiveness gate (`xattr.rs`,
+    // T-026).
+    #[expect(dead_code)]
+    pub(super) xattr_filter_reserved: u8,
+}
+
+/// Pure field decode: no validation, no error arm, no ordering (SB3).
+///
+/// The single E1 conversion point for the 15 little-endian superblock
+/// fields (each `from_le` exactly once, S02 §5.6); `u8` fields and
+/// byte arrays are read directly; `checksum` is deliberately not
+/// converted here — its single `from_le` lives in
+/// `verify_superblock_checksum`, the other conversion point. The two
+/// build
+/// timestamp fields collapse through `utils::duration_from_parts`,
+/// the ID1 single source shared with the inode `time` decode.
+impl From<RawSuperBlock> for SuperBlock {
+    fn from(raw: RawSuperBlock) -> Self {
+        Self {
+            magic: u32::from_le(raw.magic),
+            feature_compat: u32::from_le(raw.feature_compat),
+            blkszbits: raw.blkszbits,
+            sb_extslots: raw.sb_extslots,
+            root_nid: u16::from_le(raw.root_nid),
+            inos: u64::from_le(raw.inos),
+            build_time: super::utils::duration_from_parts(
+                u64::from_le(raw.build_time),
+                u32::from_le(raw.build_time_nsec),
+            ),
+            blocks: u32::from_le(raw.blocks),
+            meta_blkaddr: u32::from_le(raw.meta_blkaddr),
+            xattr_blkaddr: u32::from_le(raw.xattr_blkaddr),
+            uuid: raw.uuid,
+            volume_name: raw.volume_name,
+            feature_incompat: u32::from_le(raw.feature_incompat),
+            u1: u16::from_le(raw.u1),
+            extra_devices: u16::from_le(raw.extra_devices),
+            devt_slotoff: u16::from_le(raw.devt_slotoff),
+            dirblkbits: raw.dirblkbits,
+            xattr_prefix_count: raw.xattr_prefix_count,
+            xattr_prefix_start: u32::from_le(raw.xattr_prefix_start),
+            packed_nid: u64::from_le(raw.packed_nid),
+            xattr_filter_reserved: raw.xattr_filter_reserved,
+        }
+    }
+}
+
+impl SuperBlock {
+    /// Returns the file system block size, in the general form
+    /// `1 << blkszbits` (never a 4096 literal). The blkszbits bounds
+    /// door (G-M08) is mount-time (T-023) and is not re-checked here:
+    /// the decode layer supplies the formula, the mount layer
+    /// guarantees the domain it is evaluated over.
+    // First consumer: the mount-time geometry and every read site
+    // below the handle (T-023+); all read positions are
+    // mirror-driven per RD3.
+    #[expect(dead_code)]
+    pub(super) fn block_size(&self) -> usize {
+        1 << self.blkszbits
+    }
+
+    /// Returns the on-disk superblock size: the fixed 128-byte record
+    /// plus `sb_extslots` 16-byte extension slots. The base is
+    /// `size_of::<RawSuperBlock>()`, same-sourced with the layout
+    /// assertions (C5); the slot unit is `SB_EXTSLOT_SIZE`. The V7
+    /// upper-bound door (sb_size > PAGE_SIZE − SUPER_OFFSET → EINVAL)
+    /// is mount-time (T-023).
+    // First consumer: the mount-time V7 door and the volume-level
+    // metadata record area start (T-023).
+    #[expect(dead_code)]
+    pub(super) fn sb_size(&self) -> usize {
+        size_of::<RawSuperBlock>() + SB_EXTSLOT_SIZE * self.sb_extslots as usize
+    }
+
+    /// Returns the compatible feature set, decoded with
+    /// `from_bits_truncate`: linux has no unknown-compat-bit check
+    /// (super.c:307), so unknown bits are silently accepted —
+    /// dropped by the truncation without any rejection (G4).
+    // First consumers: the SB_CHKSUM verification trigger and the
+    // XATTR_FILTER bloom gate (T-023/T-026).
+    #[expect(dead_code)]
+    pub(super) fn feature_compat(&self) -> FeatureCompatSet {
+        FeatureCompatSet::from_bits_truncate(self.feature_compat)
+    }
+
+    /// Returns the incompatible feature set, decoded with
+    /// `from_bits_truncate` — meaningful only behind the unknown-bit
+    /// door, which the mount-time sequence must run first (T-023):
+    /// after that door, truncation loses nothing.
+    // First consumers: the DEVICE_TABLE/COMPR_CFGS/ZTAILPACKING bit
+    // judgements of the mount-time sequence (T-023).
+    #[expect(dead_code)]
+    pub(super) fn feature_incompat(&self) -> FeatureIncompatSet {
+        FeatureIncompatSet::from_bits_truncate(self.feature_incompat)
+    }
+
+    /// Returns whether any unknown incompatible feature bit is set.
+    /// The mask is the union of the known bits and cannot shrink
+    /// (G3); `ext2/super_block.rs:245-248` is the structural
+    /// precedent. The EINVAL door itself is mount-time (T-023,
+    /// super.c:315-320).
+    // First consumer: the mount-time unknown-incompat door (T-023).
+    #[expect(dead_code)]
+    pub(super) fn has_unknown_incompat(&self) -> bool {
+        self.feature_incompat & !FeatureIncompatSet::all().bits() != 0
+    }
+
+    /// Returns whether `volume_name` contains a NUL byte within its
+    /// 16 bytes. The NIL door (no NUL → EUCLEAN, the mapping of the
+    /// linux EFSCORRUPTED, super.c:346-352) is mount-time (T-023).
+    // First consumer: the mount-time volume-name door (T-023).
+    #[expect(dead_code)]
+    pub(super) fn volume_name_is_nul_terminated(&self) -> bool {
+        self.volume_name.contains(&0)
+    }
+
+    /// Returns the volume name as a NUL-terminated fixed string.
+    ///
+    /// Silently truncates when no NUL is present
+    /// (`FixedCStr::from_bytes_until_nul` clamps at the first NUL or
+    /// the end of the 16 bytes), so the NIL door must run *before*
+    /// this accessor is consulted — an ordering constraint owned by
+    /// the mount-time sequence (T-023).
+    // First consumer: the mount-time geometry consumption (T-023).
+    #[expect(dead_code)]
+    pub(super) fn volume_name(&self) -> FixedCStr<16> {
+        FixedCStr::from_bytes_until_nul(&self.volume_name)
+    }
+
+    /// Returns the length of the checksummed superblock region, in
+    /// the general blkszbits form of super.c:57-62: `len = 1 <<
+    /// blkszbits`, then `len -= 1024` only when the block size
+    /// exceeds `SUPER_OFFSET` (T-001 §3.5). The covered device
+    /// interval is `[SUPER_OFFSET, SUPER_OFFSET + len)`; for
+    /// blkszbits < 10 the region deliberately extends past the end of
+    /// block 0 — a parity fact of the conditional, not a defect.
+    // First consumer: the mount-time SB_CHKSUM door (T-023), which
+    // reads exactly this many bytes at SUPER_OFFSET before handing
+    // them to `verify_superblock_checksum`.
+    #[expect(dead_code)]
+    pub(super) fn checksummed_len(&self) -> usize {
+        let block_size = 1 << self.blkszbits;
+        if block_size > SUPER_OFFSET {
+            block_size - SUPER_OFFSET
+        } else {
+            block_size
+        }
+    }
+}
+
+/// Verifies the superblock checksum over `region` — the bytes the
+/// caller read over `[SUPER_OFFSET, SUPER_OFFSET +
+/// SuperBlock::checksummed_len())`; the helper CRCs over exactly
+/// what it is given, so the region length is a caller contract
+/// pinned by `checksummed_len`'s documentation — against
+/// `raw_checksum`, the raw on-disk `checksum` field value.
+///
+/// Zeroes the checksum field within the caller's buffer copy (the
+/// offsets are the same-sourced layout anchors, C5 — the zeroing
+/// touches only the in-memory copy, never the device; this is the
+/// kmemdup-and-clear of super.c:64-71 without a heap allocation),
+/// then compares `crc32c(!0, region)` with the disk value. The
+/// single E1 conversion of `checksum` happens here. The trigger bit
+/// (`FeatureCompatSet::SB_CHKSUM`), the failure errno (EBADMSG,
+/// "invalid checksum"), and the call position in the door sequence
+/// belong to the mount-time sequence (T-023).
+// First consumer: the mount-time SB_CHKSUM door (T-023).
+#[expect(dead_code)]
+pub(super) fn verify_superblock_checksum(region: &mut [u8], raw_checksum: u32) -> bool {
+    region[offset_of!(RawSuperBlock, checksum)..offset_of!(RawSuperBlock, feature_compat)].fill(0);
+    super::utils::crc32c(!0, region) == u32::from_le(raw_checksum)
+}

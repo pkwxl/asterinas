@@ -33,18 +33,18 @@
 //! fixed head bytes).
 
 #![cfg_attr(not(ktest), expect(dead_code))]
-// Dead-code ledger (why the `expect` above stays fulfilled): in regular
-// builds the two hash primitives have no caller until the superblock
-// checksum verification lands (`super_block.rs`, T-023) — until then
-// they are referenced only by the ktest suite, which is compiled out
-// of regular builds. `duration_from_parts` is called only from the
-// `build_time` and `time` mirror decodes (T-022 S03/S07), which are
-// themselves dormant until T-023/T-024, and the ktest suite keeps it
-// uncovered by design (no new ktest cases for a pure transcription) —
-// it is dead in *both* cfgs and therefore carries its own item-level
-// `expect(dead_code)` below. The module-level `expect` becomes
-// unfulfilled — and the compiler will ask for its removal — only once
-// no dead item remains under this module.
+// Dead-code ledger (why the `expect` above stays fulfilled): in
+// regular builds `xxh32` has no caller until the xattr name-filter
+// bloom domain lands (`xattr.rs`, T-026) — until then it is
+// referenced only by the ktest suite, which is compiled out of
+// regular builds, so its dead-code lint fires under the module-level
+// `expect`. `crc32c` is live in both cfgs since T-022 S03 (the
+// `#[expect(dead_code)]` checksum verification in `super_block.rs`
+// is a dead-code-analysis root, and its call counts as a live use),
+// as is `duration_from_parts` (called by the live
+// `From<RawSuperBlock>` mirror decode). The module-level `expect`
+// becomes unfulfilled — and the compiler will ask for its removal —
+// only once `xxh32` gains a regular-build caller too.
 
 use core::time::Duration;
 
@@ -193,13 +193,13 @@ pub(super) fn xxh32(data: &[u8], seed: u32) -> u32 {
 /// malformed images; normal images keep nsec < 1e9), so saturation
 /// merely turns the panic into a known-diff value: no new guard, no
 /// error, no clamping (F6n, `docs/T-011/S01/index.md` §4.2).
-// Dead in both cfgs until S03/S07: regular builds have no caller yet,
-// and the ktest suite keeps this helper uncovered by design, so the
-// module-level `cfg_attr(not(ktest), ...)` above cannot cover the
-// ktest cfg — the function carries its own expect. The first reachable
-// caller lands with the mirror decodes; the `expect` fires
-// `unfulfilled` the moment one does, which is the prompt to remove it.
-#[expect(dead_code)]
+// Live since T-022 S03: the `SuperBlock` mirror decode
+// (`super_block.rs`, `From<RawSuperBlock>`) is the first reachable
+// caller, and the inode `time` decode (T-022 S07) joins it later. No
+// deadness attribute belongs here — the bridging item-level
+// `expect(dead_code)` was removed the moment this first caller
+// landed (its firing `unfulfilled` was the pre-annotated removal
+// prompt).
 pub(super) fn duration_from_parts(secs: u64, nsecs: u32) -> Duration {
     Duration::new(
         secs.saturating_add((nsecs / 1_000_000_000) as u64),
