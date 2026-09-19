@@ -105,6 +105,10 @@ test_ext2 "/ext2" "test_file.txt"
 ./ext2/xattr
 echo "All ext2 fs test passed."
 
+echo "Start erofs fs test......"
+./erofs/mount_options
+echo "All erofs fs test passed."
+
 echo "Start fdatasync test......"
 test_fdatasync
 echo "All fdatasync test passed."
