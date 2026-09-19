@@ -79,10 +79,14 @@ fi
 if [ "$1" = "riscv" ]; then
     # NOTE: The initramfs assumes that ext2.img, exfat.img, and ltp_dev.img appear as
     # `/dev/vda`, `/dev/vdb`, and `/dev/vdc`, respectively. RISC-V virtio-mmio
-    # block devices are discovered in reverse command-line order, so list them
-    # in the reverse of the desired device-node order.
-    # Conditionally-attached erofs images (x5..x19) appear as /dev/vdf..vdt
-    # and are likewise listed in reverse device order below.
+    # block devices are discovered in reverse command-line order, so list them in
+    # the reverse of the desired device-node order.
+    # Conditionally-attached erofs images (x5..x19) are likewise listed in
+    # reverse device order below. Guest vd letters are assigned sequentially
+    # by device registration order (starting from /dev/vda), NOT by qemu drive
+    # id: with the 18 virtio disks of an erofs-only riscv boot they land on
+    # /dev/vdd../dev/vdr; /dev/vdf../dev/vdt only materializes when two more
+    # virtio disks (e.g. the x86 xfstests pair x3/x4) precede them.
     # TODO: Once UUID-based mounting is implemented, this strict ordering will no longer be required.
     EROFS_RISCV_EXTRA=""
     if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
