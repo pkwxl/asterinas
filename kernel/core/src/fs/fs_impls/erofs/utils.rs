@@ -8,7 +8,7 @@
 //! e.g. the superblock checksum *interval* formula belongs to the consumer
 //! side (`super_block.rs`), not to these primitives.
 //!
-//! Two primitives are provided:
+//! Two hash primitives and one timestamp helper are provided:
 //!
 //! - `crc32c`: table-driven CRC32C (Castagnoli polynomial, reflected form)
 //!   in pure update form — no final XOR; the seed is the running register.
@@ -16,11 +16,15 @@
 //!   (little-endian 4-byte lanes, wrapping arithmetic throughout, no
 //!   streaming interface — the erofs input domain is short suffixes plus
 //!   a `u32` seed).
+//! - `duration_from_parts`: decode-direction `(secs, nsecs) -> Duration`
+//!   conversion with a saturating carry — pure integer arithmetic with
+//!   no on-disk knowledge, the single source (ID1) for every erofs
+//!   timestamp decode.
 //!
 //! Upgrade path (S04 D1, `docs/T-010/analysis.md` §4.1): the moment a
-//! second consumer outside `fs_impls/erofs` appears, promote these
-//! primitives into a dedicated `kernel/libs/` crate following the jhash
-//! precedent — a pure move with zero behavior drift.
+//! second consumer outside `fs_impls/erofs` appears, promote the two
+//! hash primitives into a dedicated `kernel/libs/` crate following the
+//! jhash precedent — a pure move with zero behavior drift.
 //!
 //! The `#[cfg(ktest)]` suite at the tail of this file locks both
 //! primitives against the reference vector tables of
@@ -29,11 +33,17 @@
 //! fixed head bytes).
 
 #![cfg_attr(not(ktest), expect(dead_code))]
-// The first non-ktest consumer is the superblock checksum verification
-// (T-023, `super_block.rs`); until then these primitives are referenced
-// only by the ktest suite below, which is compiled out of regular builds.
-// Once a real consumer lands, the `expect` above becomes unfulfilled and
-// the compiler will ask for its removal — remove this attribute then.
+// Dead-code ledger (why the `expect` above stays fulfilled): in regular
+// builds the two hash primitives have no caller until the superblock
+// checksum verification lands (`super_block.rs`, T-023), and
+// `duration_from_parts` is called only from the `build_time` and `time`
+// mirror decodes (T-022 S03/S07), which are themselves dormant until
+// T-023/T-024 — so until then every item below is referenced only by
+// the ktest suite, which is compiled out of regular builds. The `expect`
+// becomes unfulfilled — and the compiler will ask for its removal —
+// only once no dead item remains under this module.
+
+use core::time::Duration;
 
 /// Reflected CRC32C (Castagnoli) polynomial: 0x1EDC6F41 normal form,
 /// 0x82F63B78 reflected form.
@@ -159,6 +169,32 @@ pub(super) fn xxh32(data: &[u8], seed: u32) -> u32 {
     }
 
     xxh32_avalanche(h32)
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp conversion (ID1, `docs/T-011/analysis.md` §5.3).
+// ---------------------------------------------------------------------------
+
+/// Decode-direction `(secs, nsecs) -> Duration` conversion — the single
+/// source for every erofs timestamp decode. Hosted in `utils.rs` and
+/// `pub(super)` because both consumers live in sibling files: the
+/// `build_time` mirror field (`super_block.rs`, T-022 S03) and the inode
+/// `time` field (`inode/mod.rs`, T-022 S07).
+///
+/// Normalizes exactly like `Duration::new` (an `nsecs` of 1e9 or more
+/// carries into `secs`); the only difference is the carry being a
+/// `saturating_add`: in the malformed corner where `secs` lies within
+/// `[u64::MAX - 3, u64::MAX]` and `nsecs >= 1e9`, std must panic while
+/// this function saturates to a value of the same family — that corner
+/// already sits in the F6n known-diff domain (reachable only from
+/// malformed images; normal images keep nsec < 1e9), so saturation
+/// merely turns the panic into a known-diff value: no new guard, no
+/// error, no clamping (F6n, `docs/T-011/S01/index.md` §4.2).
+pub(super) fn duration_from_parts(secs: u64, nsecs: u32) -> Duration {
+    Duration::new(
+        secs.saturating_add((nsecs / 1_000_000_000) as u64),
+        nsecs % 1_000_000_000,
+    )
 }
 
 #[cfg(ktest)]

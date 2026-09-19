@@ -201,9 +201,9 @@ pub(super) struct RawSuperBlock {
     /// are a mount-time error.
     pub feature_incompat: u32, // @80 __le32
     /// The C union `u1` (erofs_fs.h:73-78), carried as the minimal
-    /// common width integer (U1: no Rust unions under
-    /// `#![deny(unsafe_code)]`). Two readings, discriminated by the
-    /// consumer:
+    /// common width integer (U1: Rust unions are structurally excluded
+    /// in the safe-Rust kernel tree). Two readings, discriminated by
+    /// the consumer:
     ///
     /// - `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` set:
     ///   `available_compr_algs`, the algorithm bitmap (LZ4=0, LZMA=1,
