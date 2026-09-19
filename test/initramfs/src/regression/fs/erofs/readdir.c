@@ -108,6 +108,14 @@ struct linux_dirent64 {
  * AUTO-DECISION: widen the glibc-pass name column 48 -> 256 instead of
  * suppressing -Wformat-truncation (<stdio.h> copies of unknown-length
  * names must never be provably truncatable; no expected value moves).
+ *
+ * S18 late compile fix (same philosophy, raw-getdents half): the two
+ * copies of a raw getdents64 d_name -- a flexible array riding the
+ * 4096 B syscall buffer, provably up to 4076 B under the optimizing
+ * official build -- are precision-bounded to their destination
+ * ("%.*s"), which -Wformat-truncation proves non-truncatable. Output
+ * is byte-identical for every legal <= 255 B name; no expected value
+ * moves.
  */
 #define EROFS_NAME_COL 256
 
@@ -159,7 +167,8 @@ static int ero_read_dir_fd(int fd, struct ero_rec *recs, int max)
 				return -1;
 			}
 			snprintf(recs[count].name, sizeof(recs[count].name),
-				 "%s", d->d_name);
+				 "%.*s", (int)sizeof(recs[count].name) - 1,
+				 d->d_name);
 			recs[count].type = d->d_type;
 			recs[count].off = d->d_off;
 			recs[count].reclen = d->d_reclen;
@@ -225,7 +234,7 @@ static int ero_first_name(int fd, char *out, size_t outsz,
 	if (n <= 0)
 		return -1;
 	d = (struct linux_dirent64 *)buf;
-	snprintf(out, outsz, "%s", d->d_name);
+	snprintf(out, outsz, "%.*s", (int)outsz - 1, d->d_name);
 	if (reclen != NULL)
 		*reclen = d->d_reclen;
 	return 0;
