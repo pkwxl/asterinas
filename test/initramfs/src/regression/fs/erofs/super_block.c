@@ -106,8 +106,7 @@ FN_TEST(super_block_device_count_mismatch)
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BLOB);
 	ero_ensure_self_mnt();
 
-	TEST_ERRNO(mount_dev(EROFS_DEV_BASE, "device=" EROFS_DEV_BLOB),
-		   EINVAL);
+	TEST_ERRNO(mount_dev(EROFS_DEV_BASE, "device=" EROFS_DEV_BLOB), EINVAL);
 }
 END_TEST()
 
@@ -129,8 +128,7 @@ FN_TEST(super_block_multidev_transition_einval)
 	 * BASE(extra=0)因计数不匹配拒(对等),FLATDEV(extra=1)
 	 * 计数匹配但过渡拒(本行)。
 	 */
-	TEST_ERRNO(mount_dev(EROFS_DEV_FLATDEV,
-			 "device=" EROFS_DEV_BLOB),
+	TEST_ERRNO(mount_dev(EROFS_DEV_FLATDEV, "device=" EROFS_DEV_BLOB),
 		   EINVAL);
 }
 END_TEST()
