@@ -466,9 +466,9 @@ pub(super) const INODE_DATALAYOUT_MAX: u8 = 5;
 /// (`EROFS_CHUNK_FORMAT_BLKBITS_MASK`, erofs_fs.h:124): chunksize =
 /// blocksize << chunk-blkbits. The 5-bit domain is carried in full,
 /// with no upper-bound check (T-001 §6.6).
-// First consumer: the chunkbits formula of the D9 decode —
-// `blkszbits + (format & CHUNK_FORMAT_BLKBITS_MASK)` (T-022 S07).
-#[expect(dead_code)]
+// Live since T-022 S07: consumed by the chunkbits formula of the D9
+// decode — `blkszbits + (format & CHUNK_FORMAT_BLKBITS_MASK)`. The
+// bridging `expect` was removed when the first consumer landed.
 pub(super) const CHUNK_FORMAT_BLKBITS_MASK: u16 = 0x001F;
 
 /// The chunk-index flag (`EROFS_CHUNK_FORMAT_INDEXES`,
@@ -485,8 +485,9 @@ pub(super) const CHUNK_FORMAT_INDEXES: u16 = 0x0020;
 /// (`EROFS_CHUNK_FORMAT_ALL`, erofs_fs.h:128-129) — the I10 guard
 /// mask: any bit outside it is "unsupported chunk format"
 /// (EOPNOTSUPP, inode.c:170-175).
-// First consumer: the I10 guard of the TryFrom decode (T-022 S07).
-#[expect(dead_code)]
+// Live since T-022 S07: consumed by the I10 guard of the TryFrom
+// decode. The bridging `expect` was removed when the first consumer
+// landed.
 pub(super) const CHUNK_FORMAT_ALL: u16 = 0x003F;
 
 /// `EROFS_NULL_ADDR = -1` (erofs_fs.h:263): the chunk-index/block-map
@@ -613,9 +614,9 @@ impl DataLayout {
     /// layer-3 rejection site `inode/data.rs::map_blocks`
     /// (datalayout ≠ flat → EOPNOTSUPP, T-025) forwards through it,
     /// never rewrites it.
-    // First consumer: the D9/D12 segments of the TryFrom bodies
-    // (T-022 S07).
-    #[expect(dead_code)]
+    // Live since T-022 S07: consumed by the D9/D12 segments of the
+    // TryFrom bodies. The bridging `expect` was removed when the
+    // first consumer landed.
     pub(super) fn is_compressed(&self) -> bool {
         matches!(self, Self::CompressedFull | Self::CompressedCompact)
     }
@@ -681,9 +682,9 @@ impl FileKind {
     /// the other nine land in `Other` (the low 12 permission bits
     /// are irrelevant here — they are carried losslessly by the
     /// `mode` field, X3).
-    // First consumer: the kind decode and the I8 guard of the
-    // TryFrom bodies (T-022 S07).
-    #[expect(dead_code)]
+    // Live since T-022 S07: consumed by the kind decode and the I8
+    // guard of the TryFrom bodies. The bridging `expect` was removed
+    // when the first consumer landed.
     fn from_raw_i_mode(i_mode: u16) -> Self {
         match i_mode & S_IFMT {
             S_IFIFO => Self::Fifo,
@@ -709,14 +710,13 @@ impl FileKind {
 /// structurally never placed inside a kind branch (the pathological
 /// kind x datalayout combinations are accepted parity behavior,
 /// T-003 §1.4).
-// The variants are constructed only by the TryFrom D9 segments below.
-// Those conversion bodies are invisible to the dead-code analysis
-// until a live caller reaches them (the S08 entry read is an
-// expect-root whose call makes the conversions reachable), so this
-// expectation stays fulfilled through S07 and fires — as the
-// pre-annotated removal prompt — when S08 lands (the `bits` payload
-// is likewise first read by the T-025 map path).
-#[expect(dead_code)]
+// The variants are constructed by the TryFrom D9 segments below. The
+// enum-level bridging `expect` was removed in the T-022 S07 test
+// round: trait impls are live roots of the in-crate dead-code
+// analysis, so the conversions' constructions are already visible
+// and the expectation came out unfulfilled (the standalone probe had
+// predicted the bodies stay invisible — it diverged). The `bits`
+// payload is first read by the T-025 map path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AddrState {
     /// FLAT_PLAIN / FLAT_INLINE: the data start is the `raw_blkaddr`
@@ -778,13 +778,14 @@ impl AddrState {
 ///
 /// # Field liveness (dead-code ledger)
 ///
-/// The same discipline as the `SuperBlock` mirror: the conversion
-/// (S07) writes every field, but the two conversion bodies stay
-/// invisible to the dead-code analysis until a live caller reaches
-/// them (the S08 entry read is an expect-root whose call makes the
-/// conversions reachable), so a field is only live once live code
-/// reads it. `version` is read by `inode_isize()` below and `kind`
-/// and `i_u` by the ID4 accessors below — an `#[expect(dead_code)]`
+/// The same discipline as the `SuperBlock` mirror. Trait impls are
+/// live roots of the in-crate dead-code analysis, so the two
+/// conversion bodies (S07) are already visible — every helper they
+/// reference stays live through them (the S07 test round removed the
+/// eight first-consumer expects that came out unfulfilled). Writes
+/// are not reads, though: a field is only live once live code reads
+/// it. `version` is read by `inode_isize()` below and `kind` and
+/// `i_u` by the ID4 accessors below — an `#[expect(dead_code)]`
 /// method is a dead-code-analysis root, and its reads count — while
 /// the other ten fields carry their own `#[expect(dead_code)]` with
 /// the first consumer annotated, firing `unfulfilled` as the removal
@@ -957,9 +958,9 @@ impl InodeDesc {
 /// two branches are exhaustive over the le16 domain, so the
 /// (icount == 0, result == 12) corner is structurally unreachable
 /// and no third arm exists (G7).
-// First consumer: the `xattr_isize` field decode of the TryFrom
-// bodies (T-022 S07).
-#[expect(dead_code)]
+// Live since T-022 S07: consumed by the `xattr_isize` field decode
+// of the TryFrom bodies. The bridging `expect` was removed when the
+// first consumer landed.
 fn xattr_ibody_size(icount: u16) -> usize {
     if icount == 0 {
         0

@@ -462,9 +462,11 @@ pub(super) struct SuperBlock {
     /// the `as i64` truncation happens at the statx exit), and a
     /// malformed nsec >= 1e9 normalizes through the carrier — the
     /// F6n known-diff, reached only from malformed images.
-    // First consumer: compact-inode ctime derivation (T-024; D10
-    // three-times-one-field).
-    #[expect(dead_code)]
+    // Live since T-022 S07: read by the compact-inode D10 decode of
+    // the inode TryFrom (`time: sb.build_time`; the T-024 handle
+    // ctime derives through the same mirror field — D10
+    // three-times-one-field). The bridging `expect` was removed when
+    // the first consumer landed.
     pub(super) build_time: Duration,
     /// The total number of blocks (host order), the statfs basis.
     // First consumer: statfs/total_blocks geometry (T-023).
@@ -591,10 +593,12 @@ impl SuperBlock {
     /// door (G-M08) is mount-time (T-023) and is not re-checked here:
     /// the decode layer supplies the formula, the mount layer
     /// guarantees the domain it is evaluated over.
-    // First consumer: the mount-time geometry and every read site
-    // below the handle (T-023+); all read positions are
-    // mirror-driven per RD3.
-    #[expect(dead_code)]
+    // Live since T-022 S07: consumed by the D12 nr_sectors decode of
+    // the inode TryFrom (`align_up(sb.block_size())`); the
+    // mount-time geometry and every later read site below the handle
+    // (T-023+) join through the same accessor — all read positions
+    // are mirror-driven per RD3. The bridging `expect` was removed
+    // when the first consumer landed.
     pub(super) fn block_size(&self) -> usize {
         1 << self.blkszbits
     }
