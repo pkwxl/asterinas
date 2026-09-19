@@ -20,7 +20,9 @@
 #  - MEM: amount of memory, e.g. "8G";
 #  - VNC_PORT: VNC port, default is "42";
 #  - ATTACH_XFSTESTS_IMAGES: "true" or "false", whether to attach xfstests images (xfstests_test.img and xfstests_scratch.img) to the VM. Defaults to auto-detection from ENABLE_CONFORMANCE_TEST + CONFORMANCE_TEST_SUITE.
-#  - ATTACH_EROFS_IMAGES: "true" or "false", reserved for attaching the erofs test images to the VM. Defaults to auto-detection from ENABLE_EROFS_TEST. Drive attach logic is not implemented yet: setting it has no effect for now.
+#  - ATTACH_EROFS_IMAGES: "true" or "false", whether to attach the erofs test
+#    images (EROFS_ALL_IMAGES under test/initramfs/build/) to the VM. Defaults
+#    to auto-detection from ENABLE_EROFS_TEST.
 
 OVMF=${OVMF:-"on"}
 VHOST=${VHOST:-"off"}
@@ -34,7 +36,6 @@ if [ "${ENABLE_CONFORMANCE_TEST:-"false"}" = "true" ] && \
    [ "${CONFORMANCE_TEST_SUITE:-"ltp"}" = "xfstests" ]; then
     ATTACH_XFSTESTS_IMAGES="true"
 fi
-# Reserved for T-019: no drive/device attach logic consumes this yet.
 ATTACH_EROFS_IMAGES=${ATTACH_EROFS_IMAGES:-false}
 if [ "${ENABLE_EROFS_TEST:-"false"}" = "true" ]; then
     ATTACH_EROFS_IMAGES="true"
@@ -80,8 +81,46 @@ if [ "$1" = "riscv" ]; then
     # `/dev/vda`, `/dev/vdb`, and `/dev/vdc`, respectively. RISC-V virtio-mmio
     # block devices are discovered in reverse command-line order, so list them
     # in the reverse of the desired device-node order.
+    # Conditionally-attached erofs images (x5..x19) appear as /dev/vdf..vdt
+    # and are likewise listed in reverse device order below.
     # TODO: Once UUID-based mounting is implemented, this strict ordering will no longer be required.
+    EROFS_RISCV_EXTRA=""
+    if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
+        EROFS_RISCV_EXTRA="\
+            -drive if=none,format=raw,id=x5,file=./test/initramfs/build/erofs_base.img \
+            -drive if=none,format=raw,id=x6,file=./test/initramfs/build/erofs_blob.img \
+            -drive if=none,format=raw,id=x7,file=./test/initramfs/build/erofs_base_cpt.img \
+            -drive if=none,format=raw,id=x8,file=./test/initramfs/build/erofs_uuid0.img \
+            -drive if=none,format=raw,id=x9,file=./test/initramfs/build/erofs_bs_512.img \
+            -drive if=none,format=raw,id=x10,file=./test/initramfs/build/erofs_bs_1024.img \
+            -drive if=none,format=raw,id=x11,file=./test/initramfs/build/erofs_bs_2048.img \
+            -drive if=none,format=raw,id=x12,file=./test/initramfs/build/erofs_comp_lz4.img \
+            -drive if=none,format=raw,id=x13,file=./test/initramfs/build/erofs_xattr_shared_all.img \
+            -drive if=none,format=raw,id=x14,file=./test/initramfs/build/erofs_xattr_none.img \
+            -drive if=none,format=raw,id=x15,file=./test/initramfs/build/erofs_prefix.img \
+            -drive if=none,format=raw,id=x16,file=./test/initramfs/build/erofs_flatdev.img \
+            -drive if=none,format=raw,id=x17,file=./test/initramfs/build/erofs_chunk4b.img \
+            -drive if=none,format=raw,id=x18,file=./test/initramfs/build/erofs_flatdev_concat.img \
+            -drive if=none,format=raw,id=x19,file=./test/initramfs/build/erofs_flatdev_badtag.img \
+            -device virtio-blk-device,drive=x19 \
+            -device virtio-blk-device,drive=x18 \
+            -device virtio-blk-device,drive=x17 \
+            -device virtio-blk-device,drive=x16 \
+            -device virtio-blk-device,drive=x15 \
+            -device virtio-blk-device,drive=x14 \
+            -device virtio-blk-device,drive=x13 \
+            -device virtio-blk-device,drive=x12 \
+            -device virtio-blk-device,drive=x11 \
+            -device virtio-blk-device,drive=x10 \
+            -device virtio-blk-device,drive=x9 \
+            -device virtio-blk-device,drive=x8 \
+            -device virtio-blk-device,drive=x7 \
+            -device virtio-blk-device,drive=x6 \
+            -device virtio-blk-device,drive=x5 \
+        "
+    fi
     QEMU_ARGS="\
+        $EROFS_RISCV_EXTRA \
         -cpu rv64,svpbmt=true,zkr=true \
         -machine virt \
         -m ${MEM:-8G} \
@@ -136,6 +175,42 @@ if [ "$1" = "tdx" ]; then
         -monitor chardev:mux \
         -d guest_errors \
     "
+
+    # Add erofs drives and devices when erofs tests are enabled.
+    if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
+        QEMU_ARGS="$QEMU_ARGS \
+        -drive if=none,format=raw,id=x5,file=./test/initramfs/build/erofs_base.img \
+        -drive if=none,format=raw,id=x6,file=./test/initramfs/build/erofs_blob.img \
+        -drive if=none,format=raw,id=x7,file=./test/initramfs/build/erofs_base_cpt.img \
+        -drive if=none,format=raw,id=x8,file=./test/initramfs/build/erofs_uuid0.img \
+        -drive if=none,format=raw,id=x9,file=./test/initramfs/build/erofs_bs_512.img \
+        -drive if=none,format=raw,id=x10,file=./test/initramfs/build/erofs_bs_1024.img \
+        -drive if=none,format=raw,id=x11,file=./test/initramfs/build/erofs_bs_2048.img \
+        -drive if=none,format=raw,id=x12,file=./test/initramfs/build/erofs_comp_lz4.img \
+        -drive if=none,format=raw,id=x13,file=./test/initramfs/build/erofs_xattr_shared_all.img \
+        -drive if=none,format=raw,id=x14,file=./test/initramfs/build/erofs_xattr_none.img \
+        -drive if=none,format=raw,id=x15,file=./test/initramfs/build/erofs_prefix.img \
+        -drive if=none,format=raw,id=x16,file=./test/initramfs/build/erofs_flatdev.img \
+        -drive if=none,format=raw,id=x17,file=./test/initramfs/build/erofs_chunk4b.img \
+        -drive if=none,format=raw,id=x18,file=./test/initramfs/build/erofs_flatdev_concat.img \
+        -drive if=none,format=raw,id=x19,file=./test/initramfs/build/erofs_flatdev_badtag.img \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=x5,serial=verofsbase,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xd,drive=x6,serial=verofsblob,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xe,drive=x7,serial=verofscpt,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xf,drive=x8,serial=verofsuuid0,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x10,drive=x9,serial=verofsbs512,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x11,drive=x10,serial=verofsbs1k,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x12,drive=x11,serial=verofsbs2k,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x13,drive=x12,serial=verofscomp,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x14,drive=x13,serial=verofsxshare,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x15,drive=x14,serial=verofsxnone,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x16,drive=x15,serial=verofspfx,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x17,drive=x16,serial=verofsflatdev,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x18,drive=x17,serial=verofschunk4b,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x19,drive=x18,serial=verofsconcat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x1a,drive=x19,serial=verofsbadtag,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+    "
+    fi
     echo $QEMU_ARGS
     exit 0
 fi
@@ -162,6 +237,27 @@ if [ "$ATTACH_XFSTESTS_IMAGES" = "true" ]; then
     COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
     -drive if=none,format=raw,id=x3,file=./test/initramfs/build/xfstests_test.img \
     -drive if=none,format=raw,id=x4,file=./test/initramfs/build/xfstests_scratch.img \
+"
+fi
+
+# Add erofs drives when erofs tests are enabled.
+if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
+    COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
+    -drive if=none,format=raw,id=x5,file=./test/initramfs/build/erofs_base.img \
+    -drive if=none,format=raw,id=x6,file=./test/initramfs/build/erofs_blob.img \
+    -drive if=none,format=raw,id=x7,file=./test/initramfs/build/erofs_base_cpt.img \
+    -drive if=none,format=raw,id=x8,file=./test/initramfs/build/erofs_uuid0.img \
+    -drive if=none,format=raw,id=x9,file=./test/initramfs/build/erofs_bs_512.img \
+    -drive if=none,format=raw,id=x10,file=./test/initramfs/build/erofs_bs_1024.img \
+    -drive if=none,format=raw,id=x11,file=./test/initramfs/build/erofs_bs_2048.img \
+    -drive if=none,format=raw,id=x12,file=./test/initramfs/build/erofs_comp_lz4.img \
+    -drive if=none,format=raw,id=x13,file=./test/initramfs/build/erofs_xattr_shared_all.img \
+    -drive if=none,format=raw,id=x14,file=./test/initramfs/build/erofs_xattr_none.img \
+    -drive if=none,format=raw,id=x15,file=./test/initramfs/build/erofs_prefix.img \
+    -drive if=none,format=raw,id=x16,file=./test/initramfs/build/erofs_flatdev.img \
+    -drive if=none,format=raw,id=x17,file=./test/initramfs/build/erofs_chunk4b.img \
+    -drive if=none,format=raw,id=x18,file=./test/initramfs/build/erofs_flatdev_concat.img \
+    -drive if=none,format=raw,id=x19,file=./test/initramfs/build/erofs_flatdev_badtag.img \
 "
 fi
 
@@ -221,6 +317,47 @@ if [ "$ATTACH_XFSTESTS_IMAGES" = "true" ]; then
         QEMU_ARGS="$QEMU_ARGS \
         -device virtio-blk-pci,bus=pcie.0,addr=0xa,drive=x3,serial=vxfstest,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
         -device virtio-blk-pci,bus=pcie.0,addr=0xb,drive=x4,serial=vxfsscratch,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+    "
+    fi
+fi
+
+# Add erofs devices when erofs tests are enabled.
+if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
+    if [ "$1" = "microvm" ]; then
+        QEMU_ARGS="$QEMU_ARGS \
+        -device virtio-blk-device,drive=x5,serial=verofsbase \
+        -device virtio-blk-device,drive=x6,serial=verofsblob \
+        -device virtio-blk-device,drive=x7,serial=verofscpt \
+        -device virtio-blk-device,drive=x8,serial=verofsuuid0 \
+        -device virtio-blk-device,drive=x9,serial=verofsbs512 \
+        -device virtio-blk-device,drive=x10,serial=verofsbs1k \
+        -device virtio-blk-device,drive=x11,serial=verofsbs2k \
+        -device virtio-blk-device,drive=x12,serial=verofscomp \
+        -device virtio-blk-device,drive=x13,serial=verofsxshare \
+        -device virtio-blk-device,drive=x14,serial=verofsxnone \
+        -device virtio-blk-device,drive=x15,serial=verofspfx \
+        -device virtio-blk-device,drive=x16,serial=verofsflatdev \
+        -device virtio-blk-device,drive=x17,serial=verofschunk4b \
+        -device virtio-blk-device,drive=x18,serial=verofsconcat \
+        -device virtio-blk-device,drive=x19,serial=verofsbadtag \
+    "
+    else
+        QEMU_ARGS="$QEMU_ARGS \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=x5,serial=verofsbase,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xd,drive=x6,serial=verofsblob,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xe,drive=x7,serial=verofscpt,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0xf,drive=x8,serial=verofsuuid0,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x10,drive=x9,serial=verofsbs512,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x11,drive=x10,serial=verofsbs1k,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x12,drive=x11,serial=verofsbs2k,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x13,drive=x12,serial=verofscomp,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x14,drive=x13,serial=verofsxshare,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x15,drive=x14,serial=verofsxnone,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x16,drive=x15,serial=verofspfx,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x17,drive=x16,serial=verofsflatdev,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x18,drive=x17,serial=verofschunk4b,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x19,drive=x18,serial=verofsconcat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x1a,drive=x19,serial=verofsbadtag,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
     "
     fi
 fi
