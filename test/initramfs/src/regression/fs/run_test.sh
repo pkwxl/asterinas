@@ -107,6 +107,7 @@ echo "All ext2 fs test passed."
 
 echo "Start erofs fs test......"
 ./erofs/mount_options
+./erofs/mount_path
 echo "All erofs fs test passed."
 
 echo "Start fdatasync test......"
