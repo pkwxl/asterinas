@@ -32,6 +32,7 @@ pub(super) fn init() {
     exfat::init();
     overlayfs::init();
     virtiofs::init();
+    erofs::init();
 }
 
 pub(super) fn init_on_each_cpu() {

@@ -3,24 +3,91 @@
 //! EROFS: the Enhanced Read-Optimized File System, a read-only Linux
 //! filesystem designed for read-heavy workloads on fixed media.
 //!
-//! This module is currently being brought up (task T-021). The present,
-//! interim state contains only the L0 utility layer; the ten-file layout
-//! of `docs/T-010/analysis.md` §1 — `fs.rs`, `fs_type.rs`,
-//! `super_block.rs`, `inode/{mod,data,file,dir,symlink}.rs`, `xattr.rs`,
-//! `prelude.rs`, `impl_for_vfs/{mod,fs,inode}.rs`, `test_utils.rs` —
-//! together with the `__log_prefix!` binding and the `init()` VFS
-//! registration entry is filled in by the subsequent T-021 subtasks.
-//! Until then the module is compiled but inert: nothing registers it,
-//! and no erofs code runs on any boot path.
+//! This module is the entry point for erofs support in Asterinas. A caller
+//! registers the `Erofs` filesystem type via `init`, after which the VFS
+//! can recognize `"erofs"` as a filesystem type and attempt to mount erofs
+//! volumes through the standard filesystem trait interfaces.
 //!
-//! # Current module structure
+//! The Enhanced Read-Optimized File System (erofs) is a Linux read-only
+//! filesystem targeting memory efficiency and compact on-disk layouts:
+//! fixed-size inodes with a 32-byte compact form, inline data and
+//! symlinks, cluster-aligned data placement, and optional compression.
+//! This implementation is read-only by construction: there is no write
+//! path, no dirty tracking, and no allocator anywhere in the family;
+//! every mutating VFS entry point is explicitly rejected with `EROFS`.
 //!
-//! | File    | Layer | Responsibility |
-//! |---------|-------|----------------|
-//! | `utils` | L0 | Checksum/hash primitives (`crc32c`, `xxh32`) with the embedded ktest vector suite; zero family dependencies |
+//! # On-disk layout
+//!
+//! An erofs volume starts with a 1024-byte reserved region followed by
+//! the superblock; inode numbers (`nid`s) index inodes linearly, and
+//! file data is placed in units of the block size chosen at mkfs time.
+//! There are no block groups, bitmaps, or group descriptor tables.
+//! The `super_block` module owns the on-disk superblock decoding and
+//! validation (the checksum interval formula lives there, not in
+//! `utils`), while `fs` owns the mount-time assembly sequence.
+//!
+//! # Module structure
+//!
+//! | Module         | Responsibility                                        |
+//! |----------------|-------------------------------------------------------|
+//! | `fs`           | Filesystem handle: mount state, inode cache           |
+//! | `inode`        | Inode family: decoding, data, files, dirs, symlinks   |
+//! | `xattr`        | Extended attribute iteration and reads                |
+//! | `super_block`  | On-disk superblock decoding and validation            |
+//! | `impl_for_vfs` | Wires erofs types into the VFS trait interfaces       |
+//! | `fs_type`      | `FsType` registration glue and sysnode                 |
+//! | `utils`        | Checksum/hash primitives (`crc32c`, `xxh32`)          |
+//! | `prelude`      | Common imports shared across submodules               |
+//!
+//! The inode family splits into `mod`, `data`, `file`, `dir`, and
+//! `symlink` submodules; the ktest-only fixtures live in `test_utils`
+//! (compiled under `#[cfg(ktest)]`, never referenced by production
+//! files).
+//!
+//! # Bring-up state
+//!
+//! Task T-021 delivers the compilable skeleton: the ten-file layout,
+//! the VFS registration glue, and the utility layer with its embedded
+//! vector tests. The superblock/inode decoding lands with T-022, the
+//! mount assembly with T-023, and the downstream domains (namei, data
+//! path, xattr, ktest fixtures) with T-024..T-027. Until then
+//! `Erofs::open` rejects every mount with a clear error instead of
+//! panicking or swallowing it.
 //!
 //! # References
 //!
 //! - `linux/fs/erofs/` (Linux v6.12.103, the behavioral parity baseline)
 
+// Set this module's log prefix for `ostd::log`.
+macro_rules! __log_prefix {
+    () => {
+        "erofs: "
+    };
+}
+
+pub use fs::Erofs;
+pub use inode::Inode;
+
+use self::fs_type::EROFS_TYPE;
+use crate::fs::vfs::registry;
+
+mod fs;
+mod fs_type;
+mod impl_for_vfs;
+mod inode;
+mod prelude;
+mod super_block;
 mod utils;
+mod xattr;
+
+#[cfg(ktest)]
+mod test_utils;
+
+/// Registers the erofs filesystem type with the VFS registry.
+///
+/// Registration can only fail on a duplicate filesystem-type name or a
+/// sysnode collision, both of which would be programming bugs (`"erofs"`
+/// is unique in the whole tree), hence the `unwrap`.
+pub(super) fn init() {
+    registry::register(&EROFS_TYPE).unwrap();
+}
