@@ -46,7 +46,7 @@
  * evidence, S05 sec. 6 extension 2); the four self-mount tests use
  * EROFS_SKIP_IF_NO_DEV() (device present AND erofs registered,
  * extension 1) and mount/umount the single self-mount point serially
- * inside the FN_TEST. The init mount point is never umounted or
+ * inside the FN_TEST. The init mount point is never unmounted or
  * remounted.
  *
  * Expected values are frozen from the baseline BEFORE the erofs

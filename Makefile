@@ -371,6 +371,15 @@ test:
 
 .PHONY: ktest
 ktest: CONSOLE = ttyS0
+# The production early-cmdline parser (aster-cmdline's
+# `#[ostd::early_cmdline_parser]`, kernel/core/comps/cmdline/src/early.rs)
+# keeps the early UART console disabled unless the exact token `earlycon`
+# appears before `--`. Kernels linking that component (asterinas,
+# aster-core) would otherwise drop ALL ktest harness output silently
+# while still exiting with the isa-debug-exit status, making failures
+# undiagnosable. The token is inert for kernels that use OSTD's weak
+# default parser (it ignores the cmdline entirely).
+ktest: CARGO_OSDK_TEST_ARGS += --kcmd-args=earlycon
 ktest: initramfs $(CARGO_OSDK)
 	@# cargo-osdk tests default workspace members.
 	@# `linux-bzimage-setup` is left out of `default-members`

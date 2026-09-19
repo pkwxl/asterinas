@@ -42,7 +42,7 @@
  *
  * Guard: EROFS_SKIP_IF_NO_INIT_MNT() (mount-success evidence,
  * S05 sec. 6 extension 2) on every FN_TEST; the init mount point
- * is never umounted or remounted, and this file does no
+ * is never unmounted or remounted, and this file does no
  * mount(2)/umount2 of its own (carriers beyond MNT belong to the
  * sibling files).
  *

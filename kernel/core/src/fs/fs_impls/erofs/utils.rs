@@ -124,8 +124,9 @@ pub(super) fn xxh32(data: &[u8], seed: u32) -> u32 {
         let mut v4 = seed.wrapping_sub(PRIME32_1);
 
         // The C `do { ... } while (p <= limit)` over 16-byte stripes is
-        // exactly `chunks_exact(16)`; the leftover is the tail below.
-        for stripe in data.chunks_exact(16) {
+        // exactly the `as_chunks::<16>()` ladder; the leftover is the
+        // tail below. (`&[u8; 16]` coerces to the `&[u8]` lane reader.)
+        for stripe in data.as_chunks::<16>().0 {
             v1 = xxh32_round(v1, read_le32(stripe, 0));
             v2 = xxh32_round(v2, read_le32(stripe, 4));
             v3 = xxh32_round(v3, read_le32(stripe, 8));

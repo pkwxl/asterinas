@@ -1,4 +1,9 @@
-{ lib, stdenvNoCC, pkgs, conformanceSrc }:
+{
+  lib,
+  stdenvNoCC,
+  pkgs,
+  conformanceSrc,
+}:
 
 let
   standaloneCoreutils = pkgs.coreutils.override { singleBinary = false; };
@@ -20,13 +25,21 @@ let
     e2fsprogs
   ];
 
-  sbinDeps = with pkgs; [ util-linux kmod xfsprogs e2fsprogs ];
+  sbinDeps = with pkgs; [
+    util-linux
+    kmod
+    xfsprogs
+    e2fsprogs
+  ];
 
-  runtimePath = lib.makeBinPath runtimeDeps + ":"
+  runtimePath =
+    lib.makeBinPath runtimeDeps
+    + ":"
     + lib.concatMapStringsSep ":" (package: "${package}/sbin") sbinDeps
     + ":/bin:/usr/bin:/sbin:/usr/sbin";
 
-in stdenvNoCC.mkDerivation {
+in
+stdenvNoCC.mkDerivation {
   name = "xfstests";
 
   buildCommand = ''

@@ -1,19 +1,27 @@
-{ target ? "x86_64", enableBenchmarkTest ? false, enableConformanceTest ? false
-, enableRegressionTest ? false, conformanceTestSuite ? "ltp"
-, conformanceTestWorkDir ? "/tmp", regressionTestPlatform ? "asterinas"
-, dnsServer ? "none", smp ? 1, initramfsCompressed ? true, }:
+{
+  target ? "x86_64",
+  enableBenchmarkTest ? false,
+  enableConformanceTest ? false,
+  enableRegressionTest ? false,
+  conformanceTestSuite ? "ltp",
+  conformanceTestWorkDir ? "/tmp",
+  regressionTestPlatform ? "asterinas",
+  dnsServer ? "none",
+  smp ? 1,
+  initramfsCompressed ? true,
+}:
 let
-  crossSystem.config = if target == "x86_64" then
-    "x86_64-unknown-linux-gnu"
-  else if target == "riscv64" then
-    "riscv64-unknown-linux-gnu"
-  else
-    throw "Target arch ${target} not yet supported.";
+  crossSystem.config =
+    if target == "x86_64" then
+      "x86_64-unknown-linux-gnu"
+    else if target == "riscv64" then
+      "riscv64-unknown-linux-gnu"
+    else
+      throw "Target arch ${target} not yet supported.";
 
   # Pinned nixpkgs (nix version: 2.29.1, channel: nixos-25.05, release date: 2025-07-01)
   nixpkgs = fetchTarball {
-    url =
-      "https://github.com/NixOS/nixpkgs/archive/c0bebd16e69e631ac6e52d6eb439daba28ac50cd.tar.gz";
+    url = "https://github.com/NixOS/nixpkgs/archive/c0bebd16e69e631ac6e52d6eb439daba28ac50cd.tar.gz";
     sha256 = "1fbhkqm8cnsxszw4d4g0402vwsi75yazxkpfx3rdvln4n6s68saf";
   };
   pkgs = import nixpkgs {
@@ -21,7 +29,8 @@ let
     overlays = [ ];
     inherit crossSystem;
   };
-in rec {
+in
+rec {
   # Packages needed by initramfs
   busybox = pkgs.busybox;
   benchmark = pkgs.callPackage ./benchmark { };
@@ -30,8 +39,7 @@ in rec {
     testSuite = conformanceTestSuite;
     workDir = conformanceTestWorkDir;
   };
-  regression =
-    pkgs.callPackage ./regression { testPlatform = regressionTestPlatform; };
+  regression = pkgs.callPackage ./regression { testPlatform = regressionTestPlatform; };
 
   initramfs = pkgs.callPackage ./initramfs.nix {
     inherit busybox;
@@ -54,7 +62,11 @@ in rec {
     CPPFLAGS = "-fcommon -fpermissive";
   });
   lmbench = pkgs.callPackage ./benchmark/lmbench.nix { };
-  redis = (pkgs.redis.overrideAttrs (_: { doCheck = false; })).override {
-    withSystemd = false;
-  };
+  redis =
+    (pkgs.redis.overrideAttrs (_: {
+      doCheck = false;
+    })).override
+      {
+        withSystemd = false;
+      };
 }

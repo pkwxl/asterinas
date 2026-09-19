@@ -38,7 +38,7 @@
  * evidence, S05 sec. 6 extension 2); the noacl test uses
  * EROFS_SKIP_IF_NO_DEV() (device present AND erofs registered,
  * extension 1) and mounts/umounts the single self-mount point inside
- * the FN_TEST. The init mount point is never umounted or remounted.
+ * the FN_TEST. The init mount point is never unmounted or remounted.
  *
  * Expected values are frozen from the baseline BEFORE the erofs
  * implementation exists; every assertion here is parity (the one

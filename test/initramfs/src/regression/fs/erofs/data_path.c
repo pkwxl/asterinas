@@ -35,7 +35,7 @@
  * evidence, S05 sec. 6 extension 2); C12/D1/C11 tests use the self-mount
  * class guard EROFS_SKIP_IF_NO_DEV() (device present AND erofs
  * registered, extension 1) and mount/umount the single self-mount point
- * serially inside the FN_TEST. The init mount point is never umounted
+ * serially inside the FN_TEST. The init mount point is never unmounted
  * or remounted.
  *
  * Expected values are frozen from the baseline BEFORE the erofs
