@@ -6,9 +6,9 @@
 # ----------------------------------------------------------------------------
 # 职责: 把静态源树 erofs_tree/ 全量复制到 build/erofs_tree_stage/ 副本,在
 # 副本上补全 git 不可承载 / 机械批量的形态(两空目录、many_entries、
-# special 七型、sparse、symlink 边界、xattr/acl、stat 多样性)。此后一切
-# mkfs.erofs 调用一律以 stage 目录为 srcdir(S01 §6),永不直接消费
-# erofs_tree/。
+# special 七型、sparse、symlink 边界、xattr/acl、stat 多样性),末步全量
+# mtime 锚定(S09 可复现门,见步骤 8/9)。此后一切 mkfs.erofs 调用一律以
+# stage 目录为 srcdir(S01 §6),永不直接消费 erofs_tree/。
 #
 # 接口(S01 §4.0): erofs_stage.sh [src] [dst]
 #   缺省 src = <本脚本所在目录>/erofs_tree
@@ -128,7 +128,7 @@ command -v python3 >/dev/null 2>&1 || die "自检#5: python3 ABSENT — socket �
 note "PASS: python3 PRESENT ($(python3 --version 2>&1))"
 
 # ================= §4.2 补全步骤(自检全过后顺序执行) =================
-section "§4.2 步骤 1/8: 全量重建副本 + 两空目录补建"
+section "§4.2 步骤 1/9: 全量重建副本 + 两空目录补建"
 rm -rf "$DST"
 mkdir -p "$DST"
 cp -a "$SRC"/. "$DST"/
@@ -142,7 +142,7 @@ note "n255_*(名长恰 255)自 stage 摘除: mkfs.erofs 1.7.1 拒收(源路径�
 mkdir -p "$DST/dirs/empty_dir" "$DST/xattr_host/acl_dir"
 note "cp -a 完成(保 symlink 与静态 mode);dirs/empty_dir、xattr_host/acl_dir 显式 mkdir -p(git 不追踪空目录,全新 clone 下为常态路径 — S08 修订①)"
 
-section "§4.2 步骤 2/8: many_entries(${MANY_COUNT} × ${MANY_NAMELEN}B 名,机械批量)"
+section "§4.2 步骤 2/9: many_entries(${MANY_COUNT} × ${MANY_NAMELEN}B 名,机械批量)"
 mkdir -p "$DST/dirs/many_entries"
 PAD="$(repeat a 31)"
 i=0
@@ -161,7 +161,7 @@ MANY_N="$(find "$DST/dirs/many_entries" -mindepth 1 | wc -l)"
 [ "$MANY_N" -eq "$MANY_COUNT" ] || die "步骤2: many_entries 条目数 $MANY_N != $MANY_COUNT"
 note "$MANY_COUNT 条 × 名长 ${MANY_NAMELEN}B 逐条自检通过(目录预期跨 3 块以上,dirent ≈ 200×54B)"
 
-section "§4.2 步骤 3/8: special/(chr/blk/fifo/sock,git 不可承载)"
+section "§4.2 步骤 3/9: special/(chr/blk/fifo/sock,git 不可承载)"
 mkdir "$DST/special"
 mknod "$DST/special/chr_dev" c 1 3   || die "步骤3: mknod chr_dev c 1 3 失败"
 mknod "$DST/special/blk_dev" b 7 200 || die "步骤3: mknod blk_dev b 7 200 失败"
@@ -176,7 +176,7 @@ python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])'
 [ -S "$DST/special/sock_entry" ] || die "步骤3: sock_entry 非 socket"
 note "special 四条落位并复核: chr(1,3) blk(7,200) fifo sock"
 
-section "§4.2 步骤 4/8: sparse_hole.bin(392KiB = 首 4K 公式 + 洞 384KiB + 尾 4K 公式)"
+section "§4.2 步骤 4/9: sparse_hole.bin(392KiB = 首 4K 公式 + 洞 384KiB + 尾 4K 公式)"
 SP="$DST/regular/sparse_hole.bin"
 F4K="$(repeat "$FORMULA" 158)"; F4K="${F4K:0:4096}"          # 26×158=4108 → 截 4096: content[0..4095]
 PHASE=$(( (SPARSE_SIZE - 4096) % 26 ))
@@ -192,7 +192,7 @@ SP_LIM=$(( SPARSE_SIZE / 512 ))                              # 784
 [ "$SP_BLK" -lt "$SP_LIM" ] || die "步骤4: 物理 sparse 不成立(blocks=$SP_BLK >= $SP_LIM)"
 note "size=$SPARSE_SIZE blocks(512B)=$SP_BLK < $SP_LIM — 中段 $((SPARSE_SIZE - 8192))B(384KiB)为洞"
 
-section "§4.2 步骤 5/8: symlink 边界(4090B 近 PATH_MAX 目标;slink_empty 按 §8.4 兜底移除)"
+section "§4.2 步骤 5/9: symlink 边界(4090B 近 PATH_MAX 目标;slink_empty 按 §8.4 兜底移除)"
 # slink_empty(空目标 symlink)Linux 不可造: symlink(2) 对空 oldname 在
 # VFS getname 层即回 ENOENT(ln 与 python3 os.symlink 双路径实测同败,
 # 与文件系统无关)— 按 S01 §8.4 兜底自 stage 清单移除并记录
@@ -209,7 +209,7 @@ if [ -e "$DST/symlink/slink_empty" ] || [ -L "$DST/symlink/slink_empty" ]; then
 fi
 note "slink_near_max(${NEAR_MAX_LEN}B)落位并回读复核;slink_empty 移除(Linux symlink(2) 拒空目标 ENOENT;FX-INODE 承载)"
 
-section "§4.2 步骤 6/8: xattr/acl(S01 §3.4 表逐条;setfattr + setfacl,getfattr 复核)"
+section "§4.2 步骤 6/9: xattr/acl(S01 §3.4 表逐条;setfattr + setfacl,getfattr 复核)"
 X="$DST/xattr_host"
 MID_HEX="$(printf '%02x' {0..63})"                                  # 0x00..0x3F 递增 64B
 LONG_HEX="$(printf '%02x' {0..255} {0..255} {0..255} {0..255})"     # (i mod 256) 递增 1024B
@@ -281,7 +281,7 @@ vr "$X/xattr_security.bin"   security.s   "$(repeat S 16)"
 vr "$X/prefix_lpx_1.bin"     user.erofs_test.lpx.alpha "$(repeat P 8)"
 note "14 宿主 / 21 条目复核通过(xattr_none 零条目对照);acl 两精确名 + 代表值逐字节回读一致"
 
-section "§4.2 步骤 7/8: stat 多样性(S01 §3.6 表逐条 chmod/chown)"
+section "§4.2 步骤 7/9: stat 多样性(S01 §3.6 表逐条 chmod/chown)"
 chmod 0600 "$DST/regular/inline_64b.bin"       || die "步骤7: chmod 0600 inline_64b 失败"
 chmod 0444 "$DST/regular/flat_4096b.bin"       || die "步骤7: chmod 0444 flat_4096b 失败"
 chmod 0711 "$DST/dirs/small"                   || die "步骤7: chmod 0711 dirs/small 失败"
@@ -294,7 +294,24 @@ chown 65534:65534 "$DST/xattr_host/xattr_multi.bin" || die "步骤7: chown 65534
 [ "$(stat -c '%u %g' "$DST/xattr_host/xattr_multi.bin")" = '65534 65534' ] || die "步骤7复核: xattr_multi owner != 65534:65534"
 note "mode 600/444/711 + owner 1000:1000、65534:65534 落位并复核"
 
-section "§4.2 步骤 8/8: 尾检摘要与对账(计数硬停,防静默缩面)"
+section "§4.2 步骤 8/9: mtime 全量锚定 @0(S09 可复现门)"
+# T-018/S09 首跑实证(docs/T-018/S09/index.md §5–§6): mkfs.erofs 1.7.1 把
+# 源 stat 的 mtime/mtime_nsec 逐字节写入 extended inode(微树两跑探针定论,
+# 并非全局 build_time 回声)。本脚本步骤 1–7 造出的 ~210 条目(200 bulk、
+# special 四型、sparse、slink_near_max、empty_dir/acl_dir/many_entries/
+# special 目录)mtime = 造场时刻,逐 build 漂移 → 15 产物 digest 不稳
+# (首跑 RECON 13/15 other=1196..1200)。锚定后重造仅 SB build_time/nsec/
+# uuid/checksum 白名单面漂移(探针实测 non-wl diff = 0)。
+# - touch -h: symlink 不解引用(4090B 目标不存在,不带 -h 会 ENOENT 硬败);
+# - fifo/socket 走 utimensat 路径语义(无 open() 阻塞面),实测可锚定;
+# - 静态半边(cp -a 保 checkout 时刻)一并锚定: git 不承载 mtime,重 clone
+#   的 checkout 时刻任意,一并锚定使产线对 re-checkout 亦稳定。
+find "$DST" -exec touch -h -d '@0' -- {} + || die "步骤8: mtime 锚定失败(find/touch 非零)"
+PIN_N="$(find "$DST" -newermt '@1' -printf x | wc -c)"
+[ "$PIN_N" -eq 0 ] || die "步骤8复核: $PIN_N 条目 mtime 新于 @1(锚定未全覆盖)"
+note "全量锚定完成: 全部条目 mtime = @0(1970-01-01T00:00:00Z 常量;nsec = 0)"
+
+section "§4.2 步骤 9/9: 尾检摘要与对账(计数硬停,防静默缩面)"
 REG_N="$(find "$DST" -type f | wc -l)"
 LNK_N="$(find "$DST" -type l | wc -l)"
 DIR_N="$(find "$DST" -mindepth 1 -type d | wc -l)"
