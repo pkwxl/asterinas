@@ -42,8 +42,26 @@
 #include <sys/sysmacros.h>
 #include <sys/xattr.h>
 
+/*
+ * ST_* f_flags bit numbers. This glibc's <sys/statfs.h> ships only
+ * struct statfs (no ST_* numbers at all) and <linux/statfs.h> is
+ * absent, so define the three consumed bits from the pinned Linux
+ * 6.12 baseline tree's include/linux/statfs.h: ST_RDONLY 0x0001,
+ * ST_NOATIME 0x0400, ST_VALID 0x0020. ST_VALID is kernel-internal
+ * (its value equals MS_REMOUNT, which is why it is never exported to
+ * the UAPI); Linux sets it unconditionally in calculate_f_flags
+ * ("ST_VALID | flags_by_mnt | flags_by_sb", fs/statfs.c). Bit-number
+ * reconciliation against the doc chain is registered in
+ * docs/T-020/S06/index.md sec. 5-7.
+ */
+#ifndef ST_RDONLY
+#define ST_RDONLY 0x0001
+#endif
+#ifndef ST_NOATIME
+#define ST_NOATIME 0x0400
+#endif
 #ifndef ST_VALID
-#define ST_VALID 0x80000000
+#define ST_VALID 0x0020
 #endif
 
 /*
@@ -194,8 +212,8 @@ FN_TEST(statfs_remount_f_flags_forms)
 	TEST_SUCC(statfs(EROFS_SELF_MNT, &st));
 	TEST_RES(st.f_flags & ST_RDONLY, _ret != 0);
 	TEST_RES(st.f_flags & ST_NOATIME, _ret == 0);
-	/* 登记差异(W-M03): Linux 基线 f_flags 恒置 ST_VALID(bit31);
-	 * aster 恒 0。 */
+	/* 登记差异(W-M03): Linux 基线 f_flags 恒置 ST_VALID(bit5,
+	 * 0x20,与 MS_REMOUNT 同值故不导出 UAPI);aster 恒 0。 */
 	TEST_RES(st.f_flags & ST_VALID, _ret == 0);
 	TEST_SUCC(umount(EROFS_SELF_MNT));
 
