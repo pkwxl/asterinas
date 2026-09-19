@@ -82,7 +82,12 @@ bitflags! {
     // First consumers: the mirror-side accessors and the SB_CHKSUM
     // verification door (this task's mirror side; mount-time
     // consumption in T-023).
-    #[expect(dead_code)]
+    //
+    // No deadness attribute on the set: the bitflags 1.3 expansion
+    // writes hand-rolled fmt/bitops trait impls for the type, which
+    // the dead-code analysis counts as uses — the set is live by
+    // construction in every cfg, so an `expect(dead_code)` here is
+    // reported unfulfilled (`unfulfilled_lint_expectations`).
     pub(super) struct FeatureCompatSet: u32 {
         /// The superblock checksum is present and verified at mount
         /// (super.c:308 triggers the crc32c verification).
@@ -106,7 +111,9 @@ bitflags! {
     /// excludes the "independent bits" misuse by construction.
     // First consumers: the mirror-side accessors and the unknown-bit
     // door (this task's mirror side; mount-time consumption in T-023).
-    #[expect(dead_code)]
+    //
+    // No deadness attribute on the set — same liveness-by-construction
+    // rationale as on `FeatureCompatSet` above.
     pub(super) struct FeatureIncompatSet: u32 {
         /// Zero padding (compression domain, decompressor.c:217).
         const ZERO_PADDING = 1 << 0;
@@ -150,11 +157,11 @@ bitflags! {
 /// once via `uN::from_le` at the mirror-side `From` conversion, except
 /// `checksum`, whose single conversion lives in the checksum
 /// verification helper; `u8` fields and byte arrays are read directly.
-// Interim dead code: the first consumer chain is the mirror-side
-// `From<RawSuperBlock>` (later in this task) and, behind it, the
-// mount-time `read_val` site (T-023). The `expect` below fires once
-// that chain goes live, prompting the attribute's removal.
-#[expect(dead_code)]
+// No deadness attribute: the permanent `const_assert!` layout
+// anchors below reference the type — underscore-named const items
+// are dead-code-exempt themselves yet still count as uses of the
+// referenced types — so the type is live in every cfg and an
+// `expect(dead_code)` would only be reported unfulfilled.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawSuperBlock {
@@ -269,12 +276,11 @@ const_assert!(offset_of!(RawSuperBlock, reserved2) == 105); // erofs_fs.h:86
 /// per-device block accounting, and the `mapped_blkaddr` consumption
 /// (T-025 data path); deriving `Pod` and wiring `read_val` happen then.
 /// No mirror structure is built now — nothing consumes one.
-// `#[expect(dead_code)]` (rather than the `#[allow(dead_code)]` of the
-// design sketch): the workspace bans `allow` attributes
-// (clippy::allow_attributes, T-010 §3.3), and `expect` additionally
-// fires when the multi-device revival makes this live — a built-in
-// reminder to drop the attribute then.
-#[expect(dead_code)]
+// No deadness attribute (and never an `#[allow]`: the workspace bans
+// allow attributes, clippy::allow_attributes, T-010 §3.3): like
+// `RawSuperBlock` above, the type is kept live in every cfg by the
+// permanent `const_assert!` anchors below, so an `expect(dead_code)`
+// would only be reported unfulfilled.
 #[repr(C)]
 pub(super) struct RawDeviceSlot {
     /// The device tag (sha256 digest / backend id / doubling as a
@@ -324,8 +330,11 @@ const_assert!(offset_of!(RawDeviceSlot, reserved) == 72); // erofs_fs.h:50
 // §7.8 and belong to the revival task. Revival lands with the G-Z01
 // archive-C compression domain, together with its error paths;
 // relocating these structures then is the revival task's call.
-// (`#[expect(dead_code)]` rather than the sketch's `#[allow]` — same
-// adaptation as noted on `RawDeviceSlot` above.)
+// (`#[expect(dead_code)]` rather than the sketch's `#[allow]` — the
+// workspace bans allow attributes, clippy::allow_attributes,
+// T-010 §3.3; unlike the structures above, these headers are
+// referenced by no `const_assert!`, so the expectation stays
+// fulfilled until the revival.)
 // ---------------------------------------------------------------------------
 
 /// The LZ4 config record payload (`z_erofs_lz4_cfgs`,
