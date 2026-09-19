@@ -26,6 +26,16 @@ mount -t configfs none /sys/kernel/config
 mount -t ext2 /dev/vda /ext2
 mount -t exfat /dev/vdb /exfat
 
+# The erofs image is conditionally attached (tools/qemu_args.sh:
+# ATTACH_EROFS_IMAGES, auto-detected from ENABLE_EROFS_TEST). Guard the
+# mount on device-node existence so that runs without erofs images are
+# unaffected. The mountpoint is created here, not in the initramfs image,
+# to keep the default guest filesystem tree unchanged.
+if [ -b /dev/vdf ]; then
+    mkdir -p /erofs
+    mount -t erofs /dev/vdf /erofs
+fi
+
 # When the init process starts,
 # it does not have a process group, session, or controlling terminal.
 # The `script` tool is a standard Linux utility
