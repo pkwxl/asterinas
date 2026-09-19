@@ -7,21 +7,24 @@
 //! identified by nid — erofs has no block groups, so inode numbers are
 //! linear and the FS-level cache in `fs.rs` is keyed by nid directly.
 //!
-//! Bring-up state (T-022 S05 + S06): the on-disk half and the typed
-//! vocabulary of the dual-format decoding are in place — the two raw
-//! inode records (`RawInodeCompact` 32B / `RawInodeExtended` 64B,
-//! sharing the discriminating prefix at offsets 0/2/4/16), the
-//! chunk-domain records (`RawInodeChunkInfo`, a registration-only
-//! host for its layout assertions, and `RawInodeChunkIndex` for
-//! element-wise reads), the `i_format` bit family with the two
-//! extraction helpers and the entry's `parse_i_format` validation,
-//! the inode-domain constants — 13 + 15 + 4 + 5 layout assertions in
-//! total — plus the four vocabulary enums (`InodeVersion`,
-//! `DataLayout`, `FileKind`, `AddrState`), the decoded `InodeDesc`
-//! mirror with its 13-field set, and the `xattr_ibody_size` helper.
-//! The dual `TryFrom` decode with the I7/I8/I10 guards and the entry
-//! read land with the remaining T-022 subtasks (S07-S08). The `Inode`
-//! handle shell below
+//! Bring-up state (T-022 S05 + S06 + S07): the on-disk half, the
+//! typed vocabulary, and the dual-format conversion are in place —
+//! the two raw inode records (`RawInodeCompact` 32B /
+//! `RawInodeExtended` 64B, sharing the discriminating prefix at
+//! offsets 0/2/4/16), the chunk-domain records (`RawInodeChunkInfo`,
+//! a registration-only host for its layout assertions, and
+//! `RawInodeChunkIndex` for element-wise reads), the `i_format` bit
+//! family with the two extraction helpers and the entry's
+//! `parse_i_format` validation, the inode-domain constants — 13 + 15
+//! + 4 + 5 layout assertions in total — plus the four vocabulary
+//! enums (`InodeVersion`, `DataLayout`, `FileKind`, `AddrState`),
+//! the decoded `InodeDesc` mirror with its 13-field set, the
+//! `xattr_ibody_size` helper, the dual `TryFrom` decode with the
+//! I7/I8/I10 guards and the G-Z02 dual-caliber `nr_sectors`
+//! accounting, and the two ID4 `i_u` accessors. The decode entry
+//! (`read_inode_desc`, the five-step sequence minus the iloc
+//! location) lands with the remaining T-022 subtask (S08). The
+//! `Inode` handle shell below
 //! — still the minimal shell required by the `FileSystem` trait
 //! surface — stays interim until T-024 (the nid, descriptor, and
 //! payload fields land then; payload shapes remain deliberately not
@@ -57,9 +60,11 @@ mod symlink;
 
 use core::mem::offset_of;
 
+use align_ext::AlignExt;
+use device_id::{DeviceId, MajorId, MinorId};
 use ostd::const_assert;
 
-use super::{fs::Erofs, prelude::*};
+use super::{fs::Erofs, prelude::*, super_block::SuperBlock};
 use crate::fs::vfs::inode::Extension;
 
 /// An erofs inode number (`nid`): the linear on-disk inode identifier.
@@ -704,10 +709,13 @@ impl FileKind {
 /// structurally never placed inside a kind branch (the pathological
 /// kind x datalayout combinations are accepted parity behavior,
 /// T-003 §1.4).
-// The variants are constructed only by the TryFrom D9 segments
-// (T-022 S07); until then this expectation stays fulfilled on the
-// variant-level dead-code findings (the `bits` payload is likewise
-// first read by the T-025 map path).
+// The variants are constructed only by the TryFrom D9 segments below.
+// Those conversion bodies are invisible to the dead-code analysis
+// until a live caller reaches them (the S08 entry read is an
+// expect-root whose call makes the conversions reachable), so this
+// expectation stays fulfilled through S07 and fires — as the
+// pre-annotated removal prompt — when S08 lands (the `bits` payload
+// is likewise first read by the T-025 map path).
 #[expect(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AddrState {
@@ -771,13 +779,16 @@ impl AddrState {
 /// # Field liveness (dead-code ledger)
 ///
 /// The same discipline as the `SuperBlock` mirror: the conversion
-/// (S07) writes every field but reads none, so a field is only live
-/// once live code reads it. `version` is read by `inode_isize()`
-/// below — an `#[expect(dead_code)]` method is a dead-code-analysis
-/// root, and its reads count — while every other field carries its
-/// own `#[expect(dead_code)]` with the first consumer annotated,
-/// firing `unfulfilled` as the removal prompt when that consumer
-/// lands.
+/// (S07) writes every field, but the two conversion bodies stay
+/// invisible to the dead-code analysis until a live caller reaches
+/// them (the S08 entry read is an expect-root whose call makes the
+/// conversions reachable), so a field is only live once live code
+/// reads it. `version` is read by `inode_isize()` below and `kind`
+/// and `i_u` by the ID4 accessors below — an `#[expect(dead_code)]`
+/// method is a dead-code-analysis root, and its reads count — while
+/// the other ten fields carry their own `#[expect(dead_code)]` with
+/// the first consumer annotated, firing `unfulfilled` as the removal
+/// prompt when that consumer lands.
 ///
 /// # Not-mirrored ledger (explicit, `docs/T-011/analysis.md` §3.2)
 ///
@@ -805,9 +816,8 @@ pub(super) struct InodeDesc {
     /// Runtime invariant: never `Other` — the I8 guard rejects at
     /// construction, so `Other` exists only on the guard-carrying
     /// face.
-    // First readers: the accessor premises (T-022 S07) and the
-    // InodeType mapping (T-024).
-    #[expect(dead_code)]
+    // Live since T-022 S07: read by the accessor premises below (the
+    // InodeType mapping joins in T-024).
     pub(super) kind: FileKind,
     /// The 12 permission bits, carried losslessly (X3: no permission
     /// canonicalization at the decode).
@@ -858,9 +868,7 @@ pub(super) struct InodeDesc {
     /// first-pass kind views and the second-pass datalayout views —
     /// is a view of this one value, never a re-interpretation in
     /// place (the two-independent-passes fidelity, T-003 §1.3).
-    // First readers: the ID4 accessors `raw_blkaddr`/`rdev`
-    // (T-022 S07).
-    #[expect(dead_code)]
+    // Live since T-022 S07: read by the ID4 accessors below.
     pub(super) i_u: u32,
     /// The D9 discrimination product (see `AddrState`).
     // First readers: the chunk-unit/bits consumption (T-024/T-025).
@@ -889,6 +897,50 @@ impl InodeDesc {
             InodeVersion::Compact => size_of::<RawInodeCompact>(),
             InodeVersion::Extended => size_of::<RawInodeExtended>(),
         }
+    }
+
+    /// The first-pass `i_u` reading for REG/DIR/LNK: the data start
+    /// block (D8, inode.c:142). No range check — out-of-volume and
+    /// zero values are carried as-is; the rejection belongs to the
+    /// data-path consumer (`inode/data.rs`, T-025).
+    ///
+    /// The `debug_assert` below pins the discrimination premise, not
+    /// a disk value: its target is API misuse (a review-surface
+    /// programming error), which is not an error path and never a
+    /// parity surface (the DBG_BUGON discipline, G6, bans the
+    /// opposite promotion of debug asserts into runtime checks).
+    // First consumer: the flat direct mapping of the map path
+    // (`inode/data.rs::map_blocks`, T-025).
+    #[expect(dead_code)]
+    pub(super) fn raw_blkaddr(&self) -> u32 {
+        debug_assert!(matches!(
+            self.kind,
+            FileKind::Reg | FileKind::Dir | FileKind::Lnk
+        ));
+        self.i_u
+    }
+
+    /// The first-pass `i_u` reading for CHR/BLK: the device number
+    /// (D8, inode.c:151), through the `new_decode_dev` bit pattern
+    /// (kdev_t.h:46-51): major = (v & 0xfff00) >> 8 (12 bits) and
+    /// minor = (v & 0xff) | ((v >> 12) & 0xfff00) (20 bits) — exactly
+    /// the full domains of `MajorId`/`MinorId`, so the ranged
+    /// constructors have no reachable failure (linux decodes any
+    /// le32 into a defined device number). The ext2 extended-branch
+    /// precedent (`block_ptr_tree.rs:898-906`) is taken here without
+    /// the encode/decode round trip, which is the identity on these
+    /// widths. FIFO/SOCK have no reading path at all — the assembly
+    /// fills `self_dev_id = None` for them (T-003 X6, T-024). Same
+    /// premise-assert discipline as `raw_blkaddr` above.
+    // First consumer: the special-file assembly (`self_dev_id`,
+    // T-024).
+    #[expect(dead_code)]
+    pub(super) fn rdev(&self) -> DeviceId {
+        debug_assert!(matches!(self.kind, FileKind::Chr | FileKind::Blk));
+        let v = self.i_u;
+        let major = (v & 0xfff00) >> 8;
+        let minor = (v & 0xff) | ((v >> 12) & 0xfff00);
+        DeviceId::new(MajorId::new(major as u16), MinorId::new(minor))
     }
 }
 
@@ -961,4 +1013,235 @@ fn parse_i_format(ifmt: u16) -> Result<(InodeVersion, DataLayout)> {
         _ => DataLayout::ChunkBased,        // == 4 (erofs_fs.h:103); 5..=7 rejected at I4
     };
     Ok((version, datalayout))
+}
+
+// ---------------------------------------------------------------------------
+// The dual TryFrom decode (T-022 S07; signatures `docs/T-011/S05/
+// index.md` §1.2, field table §3.1, accessor shrink §5; guard and
+// order spec `docs/T-011/S06/index.md` §1.1/§2.1; G-Z02 note
+// `docs/T-011/analysis.md` §4.5). The compressed-blocks and chunk
+// readings of `i_u` stay inline in these bodies (ID4: no
+// consumer-less functions) — `nblks` is exhausted by the D12
+// accounting below, the chunk metadata by the `AddrState::Chunked`
+// materialization.
+// ---------------------------------------------------------------------------
+
+/// The compact-form decode: the D5 field accounting plus the I8/I10
+/// guards.
+///
+/// The parameter-form triple (ID0): the version is carried statically
+/// by the input type, `datalayout` is the entry's one-shot
+/// discrimination product flowing in as a parameter (I3/I4 are never
+/// re-judged here), and the superblock enters as one whole reference
+/// — the three exogenous consumption points are the compact time
+/// derivation, the chunkbits shift, and the D12 dual-caliber
+/// accounting. The error face is {I8, I10}: the negative-size guard
+/// I7 is structurally unreachable on this form — the le32 domain
+/// caps `i_size` at 4GiB - 1 — and no fake guard is fabricated (G7;
+/// the ext2 precedent `ext2/inode/mod.rs:316-318` is the
+/// extended-form counterpart only, and the ext2 ESTALE and
+/// symlink-size doors are deliberately not transcribed).
+///
+/// No I/O arm (the input is already an in-memory image; read errors
+/// belong to the entry read, S08), no ENOMEM arm (all-Copy fields,
+/// zero allocation, F4/G-M21), and no assembly-face guard (I12 and
+/// the blkszbits door belong to the data path and the mount
+/// sequence). Half-state invisibility (C1): every guard returns
+/// before the `Ok` literal is assembled, so no partially-built
+/// descriptor can escape the conversion.
+impl TryFrom<(&RawInodeCompact, DataLayout, &SuperBlock)> for InodeDesc {
+    type Error = Error;
+
+    fn try_from(
+        (raw, datalayout, sb): (&RawInodeCompact, DataLayout, &SuperBlock),
+    ) -> Result<Self> {
+        // D5 field decode: pure memory, no error exit — the source
+        // copies the fields (inode.c:97-124) ahead of every content
+        // guard. E1: every little-endian field converts exactly once,
+        // here (the 7-field ledger, S05 §6; the `mode` local serves
+        // both the kind discrimination and the permission bits).
+        let mode = u16::from_le(raw.i_mode);
+        let kind = FileKind::from_raw_i_mode(mode);
+        let size = u32::from_le(raw.i_size) as u64;
+        let xattr_isize = xattr_ibody_size(u16::from_le(raw.i_xattr_icount));
+        let iu = u32::from_le(raw.i_u);
+
+        // D8 (I8): the bogus-i_mode guard, strictly before the D9
+        // cross-cut (inode.c:157-161 ahead of :164-178).
+        if matches!(kind, FileKind::Other(_)) {
+            return_errno_with_message!(Errno::EUCLEAN, "bogus i_mode");
+        }
+
+        // D9: the second, datalayout-driven reading of `iu` — never
+        // inside a kind branch (the pathological kind x datalayout
+        // combinations are accepted parity behavior, T-003 §1.4).
+        let addr_state = match datalayout {
+            DataLayout::FlatPlain | DataLayout::FlatInline => AddrState::Flat,
+            DataLayout::CompressedFull | DataLayout::CompressedCompact => AddrState::Compressed,
+            DataLayout::ChunkBased => {
+                // The chunk-info decomposition (S03 §5): `iu as u16`,
+                // mechanically proven by the `RawInodeChunkInfo`
+                // layout assertions; the reserved half is never read
+                // (G5).
+                let chunkformat = iu as u16;
+                // I10: unknown chunk-format bits, rejected before the
+                // `Chunked` materialization (inode.c:170-175).
+                if chunkformat & !CHUNK_FORMAT_ALL != 0 {
+                    return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported chunk format");
+                }
+                // inode.c:176-177: the 5-bit chunk-blkbits domain is
+                // carried in full, with no upper-bound check.
+                let bits = sb.blkszbits as u32 + (chunkformat & CHUNK_FORMAT_BLKBITS_MASK) as u32;
+                AddrState::Chunked {
+                    format: chunkformat,
+                    bits,
+                }
+            }
+        };
+
+        // AUTO-TODO(G-Z02): The compressed data path is deferred as a whole
+        // under archive A, yet this parsing remains a parity bookkeeping
+        // duty — a compressed inode reports st_blocks from the on-disk
+        // compressed_blocks count (the round_up(i_size) fallback covers
+        // every non-compressed layout). Merge it back into the data path
+        // when the G-Z01 deferral note is lifted.
+        let nblks: u32 = if datalayout.is_compressed() { iu } else { 0 };
+        let nr_sectors: usize = if nblks != 0 {
+            // The compressed-block count in 512-byte sectors (4k
+            // example: << 3). The blkszbits - 9 underflow is
+            // structurally prevented by the mount-time door (G-M08),
+            // not re-checked here.
+            (nblks as usize) << (sb.blkszbits as usize - 9)
+        } else {
+            // The generic caliber: round_up(size, block_size) >> 9
+            // (4k example: round_up(size, 4096) >> 9); size = 0
+            // yields 0. usize carries it without overflow (the
+            // extreme i64::MAX size lands at ~2^54 sectors).
+            (size as usize).align_up(sb.block_size()) >> 9
+        };
+
+        Ok(Self {
+            version: InodeVersion::Compact,
+            datalayout,
+            kind,
+            mode: InodeMode::from_bits_truncate(mode & 0o7777),
+            uid: u16::from_le(raw.i_uid) as u32,
+            gid: u16::from_le(raw.i_gid) as u32,
+            nlink: u16::from_le(raw.i_nlink) as u32,
+            size,
+            xattr_isize,
+            // D10: the compact form carries no own timestamp; the
+            // three Metadata times derive from the superblock build
+            // time (the same-source derivation, S02 §5.3).
+            time: sb.build_time,
+            i_u: iu,
+            addr_state,
+            nr_sectors,
+        })
+    }
+}
+
+/// The extended-form decode: the full I7 → I8 → I10 guard chain over
+/// the D6 field accounting.
+///
+/// Same parameter-form triple and same boundaries as the compact
+/// decode above; the form-specific difference is the error face
+/// {I7, I8, I10}: the le64 `i_size` domain makes the negative-size
+/// guard reachable here only (inode.c:133-137; the ext2 structural
+/// precedent is `ext2/inode/mod.rs:316-318`). The guard order is the
+/// source execution order (T-001 §9.2): I7 strictly before I8 and
+/// the D9 cross-cut — with I7 and I10 both tripping, the first error
+/// is I7's, and swapping that order would drift the errno from
+/// EUCLEAN to EOPNOTSUPP (the errno-level ordering pin, S06 §2.2).
+impl TryFrom<(&RawInodeExtended, DataLayout, &SuperBlock)> for InodeDesc {
+    type Error = Error;
+
+    fn try_from(
+        (raw, datalayout, sb): (&RawInodeExtended, DataLayout, &SuperBlock),
+    ) -> Result<Self> {
+        // D6 field decode: pure memory, no error exit; the 9-field
+        // E1 ledger (S05 §6) converts each little-endian field
+        // exactly once, here.
+        let size = u64::from_le(raw.i_size);
+        let mode = u16::from_le(raw.i_mode);
+        let kind = FileKind::from_raw_i_mode(mode);
+        let xattr_isize = xattr_ibody_size(u16::from_le(raw.i_xattr_icount));
+        let iu = u32::from_le(raw.i_u);
+        let time = super::utils::duration_from_parts(
+            u64::from_le(raw.i_mtime),
+            u32::from_le(raw.i_mtime_nsec),
+        );
+
+        // D7 (I7): negative i_size, extended-only (inode.c:133-137).
+        if size > i64::MAX as u64 {
+            return_errno_with_message!(Errno::EUCLEAN, "negative i_size");
+        }
+
+        // D8 (I8): the bogus-i_mode guard, strictly before the D9
+        // cross-cut (inode.c:157-161 ahead of :164-178).
+        if matches!(kind, FileKind::Other(_)) {
+            return_errno_with_message!(Errno::EUCLEAN, "bogus i_mode");
+        }
+
+        // D9: the second, datalayout-driven reading of `iu` — never
+        // inside a kind branch (the pathological kind x datalayout
+        // combinations are accepted parity behavior, T-003 §1.4).
+        let addr_state = match datalayout {
+            DataLayout::FlatPlain | DataLayout::FlatInline => AddrState::Flat,
+            DataLayout::CompressedFull | DataLayout::CompressedCompact => AddrState::Compressed,
+            DataLayout::ChunkBased => {
+                // The chunk-info decomposition (S03 §5): `iu as u16`,
+                // mechanically proven by the `RawInodeChunkInfo`
+                // layout assertions; the reserved half is never read
+                // (G5).
+                let chunkformat = iu as u16;
+                // I10: unknown chunk-format bits, rejected before the
+                // `Chunked` materialization (inode.c:170-175).
+                if chunkformat & !CHUNK_FORMAT_ALL != 0 {
+                    return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported chunk format");
+                }
+                // inode.c:176-177: the 5-bit chunk-blkbits domain is
+                // carried in full, with no upper-bound check.
+                let bits = sb.blkszbits as u32 + (chunkformat & CHUNK_FORMAT_BLKBITS_MASK) as u32;
+                AddrState::Chunked {
+                    format: chunkformat,
+                    bits,
+                }
+            }
+        };
+
+        // The G-Z02 deferral note quoted verbatim in the compact body
+        // above covers this caliber as well — one marker per tree, the
+        // formula itself is per-form.
+        let nblks: u32 = if datalayout.is_compressed() { iu } else { 0 };
+        let nr_sectors: usize = if nblks != 0 {
+            // The compressed-block count in 512-byte sectors (4k
+            // example: << 3). The blkszbits - 9 underflow is
+            // structurally prevented by the mount-time door (G-M08),
+            // not re-checked here.
+            (nblks as usize) << (sb.blkszbits as usize - 9)
+        } else {
+            // The generic caliber: round_up(size, block_size) >> 9
+            // (4k example: round_up(size, 4096) >> 9); size = 0
+            // yields 0. usize carries it without overflow (the
+            // extreme i64::MAX size lands at ~2^54 sectors).
+            (size as usize).align_up(sb.block_size()) >> 9
+        };
+
+        Ok(Self {
+            version: InodeVersion::Extended,
+            datalayout,
+            kind,
+            mode: InodeMode::from_bits_truncate(mode & 0o7777),
+            uid: u32::from_le(raw.i_uid),
+            gid: u32::from_le(raw.i_gid),
+            nlink: u32::from_le(raw.i_nlink),
+            size,
+            xattr_isize,
+            time,
+            i_u: iu,
+            addr_state,
+            nr_sectors,
+        })
+    }
 }
