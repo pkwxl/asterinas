@@ -381,8 +381,10 @@ FN_TEST(statfs_remount_rw_request_stays_ro)
 	TEST_SUCC(mount_dev(EROFS_DEV_BASE, 0, NULL));
 	/* remount,rw = MS_REMOUNT without MS_RDONLY. */
 	TEST_SUCC(remount_base(0, NULL));
-	/* Write-family EROFS negative control on the preset entry. */
-	TEST_ERRNO(open(EROFS_SELF_MNT "/regular/empty_file", O_WRONLY), EROFS);
+	/* Write-family EROFS negative control on the preset entry (name
+	 * fixed to the S01 sec. 3.1 verbatim form by T-020/S07). */
+	TEST_ERRNO(open(EROFS_SELF_MNT "/regular/empty_file.bin", O_WRONLY),
+		   EROFS);
 	/* O1 witness: f_flags still carries ST_RDONLY. */
 	TEST_SUCC(statfs(EROFS_SELF_MNT, &st));
 	TEST_RES(st.f_flags & ST_RDONLY, _ret != 0);

@@ -110,6 +110,7 @@ echo "Start erofs fs test......"
 ./erofs/mount_path
 ./erofs/super_block
 ./erofs/statfs_remount
+./erofs/umount_show
 echo "All erofs fs test passed."
 
 echo "Start fdatasync test......"
