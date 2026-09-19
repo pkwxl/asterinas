@@ -20,6 +20,7 @@
 #  - MEM: amount of memory, e.g. "8G";
 #  - VNC_PORT: VNC port, default is "42";
 #  - ATTACH_XFSTESTS_IMAGES: "true" or "false", whether to attach xfstests images (xfstests_test.img and xfstests_scratch.img) to the VM. Defaults to auto-detection from ENABLE_CONFORMANCE_TEST + CONFORMANCE_TEST_SUITE.
+#  - ATTACH_EROFS_IMAGES: "true" or "false", reserved for attaching the erofs test images to the VM. Defaults to auto-detection from ENABLE_EROFS_TEST. Drive attach logic is not implemented yet: setting it has no effect for now.
 
 OVMF=${OVMF:-"on"}
 VHOST=${VHOST:-"off"}
@@ -32,6 +33,11 @@ ATTACH_XFSTESTS_IMAGES=${ATTACH_XFSTESTS_IMAGES:-false}
 if [ "${ENABLE_CONFORMANCE_TEST:-"false"}" = "true" ] && \
    [ "${CONFORMANCE_TEST_SUITE:-"ltp"}" = "xfstests" ]; then
     ATTACH_XFSTESTS_IMAGES="true"
+fi
+# Reserved for T-019: no drive/device attach logic consumes this yet.
+ATTACH_EROFS_IMAGES=${ATTACH_EROFS_IMAGES:-false}
+if [ "${ENABLE_EROFS_TEST:-"false"}" = "true" ]; then
+    ATTACH_EROFS_IMAGES="true"
 fi
 VIRTIOFS_TAG=${VIRTIOFS_TAG:-"aster-virtiofs"}
 VIRTIOFS_SOCKET=${VIRTIOFS_SOCKET:-"/tmp/vhostqemu/vfs.sock"}

@@ -59,6 +59,9 @@ XFSTESTS_TEST_DEV ?= /dev/vdd
 XFSTESTS_SCRATCH_DEV ?= /dev/vde
 # Specify whether to build regression tests under `test/initramfs/src/regression`.
 ENABLE_REGRESSION_TEST ?= false
+# Specify whether to build erofs test images and attach them to the VM
+# (requires the erofs regression tests under src/regression/fs/erofs/).
+ENABLE_EROFS_TEST ?= false
 # End of auto test features.
 
 # Network settings
