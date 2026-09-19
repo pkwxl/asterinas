@@ -28,7 +28,7 @@ use crate::{
             file_system::FileSystem,
             inode::{
                 Extension, FallocMode, FileOps, HardLinkability, Inode, Metadata, MknodType,
-                RenameMode, SymbolicLink,
+                RenameMode,
             },
             xattr::{XattrName, XattrSetFlags},
         },

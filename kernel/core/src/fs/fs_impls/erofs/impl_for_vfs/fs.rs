@@ -8,8 +8,6 @@
 //! reconfiguration keeps the framework default until the remount
 //! semantics land with T-023.
 
-use core::sync::atomic::Ordering;
-
 use aster_block::BLOCK_SIZE;
 
 use super::super::Erofs;

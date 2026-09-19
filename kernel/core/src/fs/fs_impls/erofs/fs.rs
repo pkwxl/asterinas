@@ -70,7 +70,6 @@ pub struct Erofs {
 /// unknown-option rejection (`EINVAL`, unlike the silently-ignoring
 /// ext2 default) land with the T-023 assembly sequence.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[expect(dead_code)]
 pub(super) struct ErofsMountOptions;
 
 impl Erofs {

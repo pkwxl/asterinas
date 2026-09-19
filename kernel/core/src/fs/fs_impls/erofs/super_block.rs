@@ -24,5 +24,4 @@
 /// Placeholder form: the real decoded geometry (block size, root nid,
 /// feature sets, uuid, volume name) lands with T-022.
 #[derive(Debug)]
-#[expect(dead_code)]
 pub(super) struct SuperBlock;
