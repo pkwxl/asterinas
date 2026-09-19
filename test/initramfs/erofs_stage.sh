@@ -21,6 +21,12 @@
 #   - §4.1 五项前置自检任一失败硬停,不软降级(断言面不随环境缩水);
 #   - 任一补全命令失败立即退出非零,无吞错。
 #
+# S01 §8.4 兜底移除(实测事实,详见 docs/T-018/S03 §3): slink_empty
+# (空目标 symlink)Linux 不可造 — symlink(2) 对空 oldname 在 VFS
+# getname 层即回 ENOENT(ln 与 python3 os.symlink 双路径实测同败,
+# 与文件系统无关);该形态自 stage 清单移除并记录,改由 FX-INODE
+# crafted builder 承载(S06 口径),不虚构替代条目。LNK 尾检 = 4。
+#
 # 版本门(T-016/S03 §6.1): 自检 #1 绑定 erofs-utils 1.7.1(mkfs 拼写逐字
 # 绑定该版本);异版硬停,须按 T-009 探针方法重核参数面后再放行,
 # 不得「先放行后补核」。
@@ -171,17 +177,22 @@ SP_LIM=$(( SPARSE_SIZE / 512 ))                              # 784
 [ "$SP_BLK" -lt "$SP_LIM" ] || die "步骤4: 物理 sparse 不成立(blocks=$SP_BLK >= $SP_LIM)"
 note "size=$SPARSE_SIZE blocks(512B)=$SP_BLK < $SP_LIM — 中段 $((SPARSE_SIZE - 8192))B(384KiB)为洞"
 
-section "§4.2 步骤 5/8: symlink 边界(空目标 + 4090B 近 PATH_MAX 目标)"
-ln -s '' "$DST/symlink/slink_empty" || die "步骤5: ln -s ''(空目标)失败"
+section "§4.2 步骤 5/8: symlink 边界(4090B 近 PATH_MAX 目标;slink_empty 按 §8.4 兜底移除)"
+# slink_empty(空目标 symlink)Linux 不可造: symlink(2) 对空 oldname 在
+# VFS getname 层即回 ENOENT(ln 与 python3 os.symlink 双路径实测同败,
+# 与文件系统无关)— 按 S01 §8.4 兜底自 stage 清单移除并记录
+# (docs/T-018/S03 §3),形态改由 FX-INODE crafted builder 承载
+# (S06 口径),不虚构替代条目。
 PATTERN='0123456789abcdef'
 BIG="$(repeat "$PATTERN" 256)"                               # 16×256 = 4096B
 NEAR="${BIG:0:$NEAR_MAX_LEN}"                                # 同 pattern 截 4090
 ln -s "$NEAR" "$DST/symlink/slink_near_max" || die "步骤5: ln -s ${NEAR_MAX_LEN}B 目标失败"
-T="$(readlink "$DST/symlink/slink_empty")"
-[ "${#T}" -eq 0 ] || die "步骤5: slink_empty 目标非空(长 ${#T})"
 T="$(readlink "$DST/symlink/slink_near_max")"
 [ "$T" = "$NEAR" ] || die "步骤5: slink_near_max 目标回读不符(长 ${#T} != $NEAR_MAX_LEN)"
-note "slink_empty(0B)/slink_near_max(${NEAR_MAX_LEN}B)落位并回读复核"
+if [ -e "$DST/symlink/slink_empty" ] || [ -L "$DST/symlink/slink_empty" ]; then
+  die "步骤5: slink_empty 不应存在(已按 S01 §8.4 兜底移除,防静默回归)"
+fi
+note "slink_near_max(${NEAR_MAX_LEN}B)落位并回读复核;slink_empty 移除(Linux symlink(2) 拒空目标 ENOENT;FX-INODE 承载)"
 
 section "§4.2 步骤 6/8: xattr/acl(S01 §3.4 表逐条;setfattr + setfacl,getfattr 复核)"
 X="$DST/xattr_host"
@@ -210,8 +221,11 @@ setfacl -m 'u::rw-,g::r--,o::r--,m::rw-,u:1000:r--' "$X/acl_file.bin" \
   || die "步骤6: setfacl(access)失败 → system.posix_acl_access 未生成"
 setfacl -d -m 'u::rwx,g::rx,o::r--,m::rwx' "$X/acl_dir" \
   || die "步骤6: setfacl -d(default)失败 → system.posix_acl_default 未生成"
-# 复核: 逐宿主条目计数(getfattr -m- 全命名空间)
-xc() { getfattr --absolute-names -d -m- "$1" 2>/dev/null | grep -c '="' || true; }
+# 复核: 逐宿主条目计数(getfattr -m- 全命名空间)。文本编码对不可打印
+# 值自动切 base64 形态(`name=0s…`,无 `="` 引号 — 64B/1024B 公式值与
+# acl blob 即此形态,tmp/test.11.out 实测),故按「非 # 注释、非空行的
+# name= 行」计数,编码无关。
+xc() { getfattr --absolute-names -d -m- "$1" 2>/dev/null | grep -c -E '^[^#[:space:]][^=]*=' || true; }
 xv() { # <path> <期望条目数>
   local c; c="$(xc "$1")"
   [ "$c" -eq "$2" ] || die "步骤6复核: ${1#$DST/} xattr 条目数 $c != $2"
@@ -275,7 +289,7 @@ FIFO_N="$(find "$DST" -type p | wc -l)"
 SOCK_N="$(find "$DST" -type s | wc -l)"
 [ "$REG_N"  -eq 235 ] || die "尾检: REG $REG_N != 235(34 静态 + 200 bulk + 1 sparse)"
 [ "$DIR_N"  -eq 19  ] || die "尾检: DIR $DIR_N != 19(15 静态 + empty_dir/many_entries/acl_dir/special)"
-[ "$LNK_N"  -eq 5   ] || die "尾检: LNK $LNK_N != 5(3 静态 + slink_empty/slink_near_max)"
+[ "$LNK_N"  -eq 4   ] || die "尾检: LNK $LNK_N != 4(3 静态 + slink_near_max;slink_empty 按 S01 §8.4 移除,见文件头注)"
 [ "$CHR_N"  -eq 1   ] || die "尾检: CHR $CHR_N != 1"
 [ "$BLK_N"  -eq 1   ] || die "尾检: BLK $BLK_N != 1"
 [ "$FIFO_N" -eq 1   ] || die "尾检: FIFO $FIFO_N != 1"
