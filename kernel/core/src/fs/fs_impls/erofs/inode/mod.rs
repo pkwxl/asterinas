@@ -7,17 +7,21 @@
 //! identified by nid — erofs has no block groups, so inode numbers are
 //! linear and the FS-level cache in `fs.rs` is keyed by nid directly.
 //!
-//! Bring-up state (T-022 S05): the on-disk half of the dual-format
-//! decoding is in place — the two raw inode records (`RawInodeCompact`
-//! 32B / `RawInodeExtended` 64B, sharing the discriminating prefix at
-//! offsets 0/2/4/16), the chunk-domain records (`RawInodeChunkInfo`, a
-//! registration-only host for its layout assertions, and
-//! `RawInodeChunkIndex` for element-wise reads), the `i_format` bit
-//! family with the two extraction helpers, and the inode-domain
-//! constants — 13 + 15 + 4 + 5 layout assertions in total. The typed
-//! vocabulary (four enums and `InodeDesc`), the dual `TryFrom` decode
-//! with the I7/I8/I10 guards, and the entry read land with the
-//! remaining T-022 subtasks (S06-S08). The `Inode` handle shell below
+//! Bring-up state (T-022 S05 + S06): the on-disk half and the typed
+//! vocabulary of the dual-format decoding are in place — the two raw
+//! inode records (`RawInodeCompact` 32B / `RawInodeExtended` 64B,
+//! sharing the discriminating prefix at offsets 0/2/4/16), the
+//! chunk-domain records (`RawInodeChunkInfo`, a registration-only
+//! host for its layout assertions, and `RawInodeChunkIndex` for
+//! element-wise reads), the `i_format` bit family with the two
+//! extraction helpers and the entry's `parse_i_format` validation,
+//! the inode-domain constants — 13 + 15 + 4 + 5 layout assertions in
+//! total — plus the four vocabulary enums (`InodeVersion`,
+//! `DataLayout`, `FileKind`, `AddrState`), the decoded `InodeDesc`
+//! mirror with its 13-field set, and the `xattr_ibody_size` helper.
+//! The dual `TryFrom` decode with the I7/I8/I10 guards and the entry
+//! read land with the remaining T-022 subtasks (S07-S08). The `Inode`
+//! handle shell below
 //! — still the minimal shell required by the `FileSystem` trait
 //! surface — stays interim until T-024 (the nid, descriptor, and
 //! payload fields land then; payload shapes remain deliberately not
@@ -420,33 +424,37 @@ pub(super) const I_DATALAYOUT_MASK: u16 = 0x07;
 /// datalayout, bits 0-3. The I3 guard mask — any bit above it (the
 /// 0xFFF0 remainder of the le16 domain) is "unsupported i_format"
 /// (EOPNOTSUPP, inode.c:53-59).
-// First consumer: the I3 guard of `parse_i_format` (T-022 S06).
-#[expect(dead_code)]
+// Live since T-022 S06: consumed by the I3 guard of `parse_i_format`
+// below — an `#[expect(dead_code)]` function is a dead-code-analysis
+// root, and its references count. The bridging `expect` was removed
+// when that consumer landed.
 pub(super) const I_ALL: u16 = 0x0F;
 
 /// The compact-layout discriminant (`EROFS_INODE_LAYOUT_COMPACT`,
 /// erofs_fs.h:132): the version-bit value selecting the 32-byte
 /// on-disk form.
-// First consumer: the `InodeVersion` construction from the extracted
-// version bit (`parse_i_format`, T-022 S06).
-#[expect(dead_code)]
+// Live since T-022 S06: referenced by the compile-time discriminant
+// lock beside `InodeVersion` (and spelled on the else arm of the
+// version construction in `parse_i_format` — the 1-bit extraction
+// domain makes that arm exactly this value).
 pub(super) const INODE_LAYOUT_COMPACT: u8 = 0;
 
 /// The extended-layout discriminant (`EROFS_INODE_LAYOUT_EXTENDED`,
 /// erofs_fs.h:134): the version-bit value selecting the 64-byte
 /// on-disk form.
-// First consumer: same as `INODE_LAYOUT_COMPACT` (T-022 S06).
-#[expect(dead_code)]
+// Live since T-022 S06: referenced by the compile-time discriminant
+// lock beside `InodeVersion` and compared directly by the version
+// construction in `parse_i_format`.
 pub(super) const INODE_LAYOUT_EXTENDED: u8 = 1;
 
 /// The datalayout sentinel (`EROFS_INODE_DATALAYOUT_MAX`,
 /// erofs_fs.h:104) — the I4 criterion: an extracted datalayout >= 5
 /// (the reserved values 5-7) is "unsupported datalayout" (EOPNOTSUPP,
 /// inode.c:61-67). The five legitimate discriminants 0-4 land as the
-/// `DataLayout` enum variants (T-022 S06), not as constants here —
+/// `DataLayout` enum variants below, not as constants here —
 /// the enum carries the disk values itself.
-// First consumer: the I4 guard of `parse_i_format` (T-022 S06).
-#[expect(dead_code)]
+// Live since T-022 S06: consumed by the I4 guard of `parse_i_format`
+// below — same root-reference rationale as `I_ALL`.
 pub(super) const INODE_DATALAYOUT_MAX: u8 = 5;
 
 /// The chunk-blkbits field mask within the chunk-info format
@@ -461,9 +469,11 @@ pub(super) const CHUNK_FORMAT_BLKBITS_MASK: u16 = 0x001F;
 /// The chunk-index flag (`EROFS_CHUNK_FORMAT_INDEXES`,
 /// erofs_fs.h:126): extent area made of 8-byte chunk indexes versus a
 /// bare 4-byte blkaddr array.
-// First consumers: `AddrState::chunk_unit()` (T-022 S06) and the
-// extent-unit selection of the chunked map path (T-025).
-#[expect(dead_code)]
+// Live since T-022 S06: consumed by `AddrState::chunk_unit` below
+// (itself an `#[expect(dead_code)]` root whose references count); the
+// chunked map path (`inode/data.rs`, T-025) joins through that
+// accessor. The bridging `expect` was removed when the first
+// consumer landed.
 pub(super) const CHUNK_FORMAT_INDEXES: u16 = 0x0020;
 
 /// The union of the known chunk-format bits
@@ -486,9 +496,10 @@ pub(super) const NULL_ADDR: u32 = u32::MAX;
 /// bare `__le32[]` stream has no structure to host a layout
 /// assertion (U3 — no fabricated structures), so this constant is
 /// its only registered form.
-// First consumer: the INDEXES=0 extent unit of the chunked map path
-// (`inode/data.rs`, T-025).
-#[expect(dead_code)]
+// Live since T-022 S06: consumed by `AddrState::chunk_unit` below
+// (the INDEXES=0 unit of that accessor); the chunked extent walk
+// (`inode/data.rs`, T-025) joins through it. The bridging `expect`
+// was removed when the first consumer landed.
 pub(super) const BLOCK_MAP_ENTRY_SIZE: usize = 4;
 
 /// islotbits = ilog2(sizeof(erofs_inode_compact)) = 5 (super.c:336):
@@ -512,18 +523,436 @@ pub(super) const ISLOT_BITS: u32 = size_of::<RawInodeCompact>().ilog2();
 
 /// Extracts the version bit from `i_format` (the parity of
 /// `erofs_inode_version`, internal.h:296-299).
-// First consumer: `parse_i_format` (T-022 S06); the entry read
-// (T-022 S08) joins through it.
-#[expect(dead_code)]
+// Live since T-022 S06: called by `parse_i_format` below; the entry
+// read (T-022 S08) joins through it.
 fn inode_version(ifmt: u16) -> u8 {
     ((ifmt >> I_VERSION_BIT) & I_VERSION_MASK) as u8
 }
 
 /// Extracts the datalayout bits from `i_format` (the parity of
 /// `erofs_inode_datalayout`, internal.h:301-304).
-// First consumer: the I4 guard and the `DataLayout` construction of
-// `parse_i_format` (T-022 S06).
-#[expect(dead_code)]
+// Live since T-022 S06: called twice by `parse_i_format` below (the
+// I4 guard and the `DataLayout` construction).
 fn inode_datalayout(ifmt: u16) -> u8 {
     ((ifmt >> I_DATALAYOUT_BIT) & I_DATALAYOUT_MASK) as u8
+}
+
+// ---------------------------------------------------------------------------
+// The typed vocabulary: four enums, the InodeDesc mirror, the
+// xattr-size helper, and the entry's one-shot i_format validation
+// (T-022 S06; `docs/T-011/S05/index.md` §2/§3, `docs/T-011/S03/
+// index.md` §2.2, `docs/T-011/S06/index.md` §1.1, `docs/T-011/
+// analysis.md` §3.2).
+// ---------------------------------------------------------------------------
+
+/// The inode layout version (i_format bit 0; the discriminants are
+/// the on-disk `EROFS_INODE_LAYOUT_*` values).
+///
+/// No `Invalid` variant: the 1-bit domain has exactly two values, and
+/// the sole construction entrance is `parse_i_format` below — the
+/// source-side version switch default (inode.c:126-130,
+/// -EOPNOTSUPP) is structurally unreachable and is not fabricated as
+/// an error arm (G7, T-001 §9.7.1). The TryFrom conversions
+/// additionally carry the version statically in their input types,
+/// so no dispatch on it can miss a case.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InodeVersion {
+    /// The 32-byte on-disk form (`EROFS_INODE_LAYOUT_COMPACT`).
+    Compact = 0, // erofs_fs.h:132
+    /// The 64-byte on-disk form (`EROFS_INODE_LAYOUT_EXTENDED`).
+    Extended = 1, // erofs_fs.h:134
+}
+
+// The on-disk layout discriminants and the enum's own discriminants
+// are the same values — locked here at compile time so the version
+// construction of `parse_i_format` and the disk layout stay
+// same-sourced (C5). Underscore-named consts are dead-code-exempt
+// themselves yet count as uses of the referenced items.
+const _: () = {
+    assert!(INODE_LAYOUT_COMPACT == InodeVersion::Compact as u8);
+    assert!(INODE_LAYOUT_EXTENDED == InodeVersion::Extended as u8);
+};
+
+/// The data layout (i_format bits 1-3; the discriminants are the
+/// on-disk values, erofs_fs.h:98-104).
+///
+/// The reserved values 5-7 never become variants: the I4 guard of
+/// the entry validation rejects them before construction
+/// (EOPNOTSUPP, inode.c:61-67), so the type carries no
+/// reserved-value or `Invalid` variants and no unreachable match arm
+/// exists anywhere (T-001 §9.7.1). The exhaustive classification of
+/// the low nibble — 16 combinations, 0x0-0x9 passing (ten) and
+/// 0xA-0xF rejected by I4 (six) — is the design/verification ledger
+/// (`docs/T-011/S06/index.md` §3.2), not a runtime surface.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DataLayout {
+    /// Data sits at the `i_u` flat block address.
+    FlatPlain = 0, // erofs_fs.h:99
+    /// Compressed data, full form (`EROFS_INODE_FLAT_COMPRESSED`).
+    CompressedFull = 1, // erofs_fs.h:100
+    /// The file tail is inline after the inode record.
+    FlatInline = 2, // erofs_fs.h:101
+    /// Compressed data, compact form
+    /// (`EROFS_INODE_COMPACT_COMPRESSED`).
+    CompressedCompact = 3, // erofs_fs.h:102
+    /// The extent area is a chunk-index or block-map array.
+    ChunkBased = 4, // erofs_fs.h:103
+}
+
+impl DataLayout {
+    /// The parity of `erofs_is_data_compressed` (erofs_fs.h:107-111):
+    /// datalayout ∈ {1, 3}. The single source of this predicate —
+    /// the TryFrom D9/D12 accounting consumes it first, and the
+    /// layer-3 rejection site `inode/data.rs::map_blocks`
+    /// (datalayout ≠ flat → EOPNOTSUPP, T-025) forwards through it,
+    /// never rewrites it.
+    // First consumer: the D9/D12 segments of the TryFrom bodies
+    // (T-022 S07).
+    #[expect(dead_code)]
+    pub(super) fn is_compressed(&self) -> bool {
+        matches!(self, Self::CompressedFull | Self::CompressedCompact)
+    }
+}
+
+// The `i_mode` type-bit constants (include/uapi/linux/stat.h facts,
+// transcribed as the module-private host — no framework-wide host
+// exists: `InodeType` carries its own local `TYPE_MASK`, and its
+// `from_raw_mode` is the rejected precedent documented on `FileKind`).
+const S_IFMT: u16 = 0o170000;
+const S_IFIFO: u16 = 0o010000;
+const S_IFCHR: u16 = 0o020000;
+const S_IFDIR: u16 = 0o040000;
+const S_IFBLK: u16 = 0o060000;
+const S_IFREG: u16 = 0o100000;
+const S_IFLNK: u16 = 0o120000;
+const S_IFSOCK: u16 = 0o140000;
+
+/// The S_IFMT type segment of `i_mode`, typed (T-001 §9.7.4 full
+/// form; the parity of the source switch, inode.c:138-155).
+///
+/// The sole construction entrance is `from_raw_i_mode`. The
+/// framework's `InodeType::from_raw_mode`
+/// (`file/inode_attr/type.rs:38-48`) is deliberately not used: it
+/// special-cases mode==0 to `File` (linux reports -EFSCORRUPTED
+/// there) and reports unknown types as EINVAL — a double drift from
+/// the linux behavior this decode mirrors (the ext2 negative
+/// precedent, G-N01 candidate 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileKind {
+    /// S_IFREG.
+    Reg,
+    /// S_IFDIR.
+    Dir,
+    /// S_IFLNK.
+    Lnk,
+    /// S_IFCHR.
+    Chr,
+    /// S_IFBLK.
+    Blk,
+    /// S_IFIFO.
+    Fifo,
+    /// S_IFSOCK.
+    Sock,
+    /// Any S_IFMT value outside the seven kinds — nine of the
+    /// sixteen nibble values. The I8 guard rejects this variant with
+    /// EUCLEAN at construction, so a runtime `InodeDesc` never
+    /// carries it; the variant itself is the guard-carrying face and
+    /// keeps every kind match default-free (T-001 §9.7.4). The
+    /// payload is the nibble value, kept for diagnostics.
+    Other(#[expect(dead_code)] u8),
+}
+
+impl FileKind {
+    /// Types the S_IFMT segment of `i_mode`. Exhaustive over the 16
+    /// nibble values: the seven kinds {1, 2, 4, 6, 8, A, C} pass and
+    /// the other nine land in `Other` (the low 12 permission bits
+    /// are irrelevant here — they are carried losslessly by the
+    /// `mode` field, X3).
+    // First consumer: the kind decode and the I8 guard of the
+    // TryFrom bodies (T-022 S07).
+    #[expect(dead_code)]
+    fn from_raw_i_mode(i_mode: u16) -> Self {
+        match i_mode & S_IFMT {
+            S_IFIFO => Self::Fifo,
+            S_IFCHR => Self::Chr,
+            S_IFDIR => Self::Dir,
+            S_IFBLK => Self::Blk,
+            S_IFREG => Self::Reg,
+            S_IFLNK => Self::Lnk,
+            S_IFSOCK => Self::Sock,
+            other => Self::Other((other >> 12) as u8),
+        }
+    }
+}
+
+/// The D9 cross-cutting discrimination product — the decoded form of
+/// the second, datalayout-driven reading of `i_u` (T-001 §9.7.3,
+/// archive-A form).
+///
+/// The source-side `vi` union "one storage overwritten per stage"
+/// cannot exist under decode-once plus mutually-exclusive-layer
+/// trimming: the enum makes the alias-overwrite unrepresentable, and
+/// the D9 discrimination is driven by `datalayout` alone — it is
+/// structurally never placed inside a kind branch (the pathological
+/// kind x datalayout combinations are accepted parity behavior,
+/// T-003 §1.4).
+// The variants are constructed only by the TryFrom D9 segments
+// (T-022 S07); until then this expectation stays fulfilled on the
+// variant-level dead-code findings (the `bits` payload is likewise
+// first read by the T-025 map path).
+#[expect(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AddrState {
+    /// FLAT_PLAIN / FLAT_INLINE: the data start is the `raw_blkaddr`
+    /// reading of `i_u` (accessor landing with T-022 S07). Carries
+    /// no copy of the u32 — the value is always `i_u`, and a
+    /// duplicate would violate the single-data-source discipline.
+    Flat,
+    /// CHUNK_BASED: the chunk metadata materialized once at the
+    /// decode. `format` keeps the raw chunk-format word (the INDEXES
+    /// bit is consumed by `chunk_unit()`); `bits` = sb.blkszbits +
+    /// (format & CHUNK_FORMAT_BLKBITS_MASK) (inode.c:176-177; the
+    /// 5-bit domain is carried in full, no upper-bound check). The
+    /// I10 guard runs before the materialization, so a format with
+    /// unknown bits never enters this variant.
+    Chunked { format: u16, bits: u32 },
+    /// Compressed (archive A): decoded and accepted (T-003 §1.4),
+    /// with the `compressed_blocks` reading of `i_u` consumed inside
+    /// the conversion body by the nr_sectors accounting (D12) — no
+    /// post-decode consumer copy remains, and the layer-3 rejection
+    /// (I12) belongs to `inode/data.rs::map_blocks` (T-025).
+    /// Revival note: this variant gains its z_* payload with the
+    /// G-Z01 archive-C takeover.
+    Compressed,
+}
+
+impl AddrState {
+    /// The extent element unit of the chunked map path (the derived
+    /// supply of `docs/T-011/S03/index.md` §6.3): INDEXES (format
+    /// bit 5) set → `size_of::<RawInodeChunkIndex>()`, otherwise
+    /// `BLOCK_MAP_ENTRY_SIZE`; `None` outside the chunked state.
+    /// `data.rs` takes the unit through this accessor and does not
+    /// reference the mod.rs domain constants directly (the
+    /// cross-file discipline, T-010 §3.2).
+    // First consumer: the chunked extent walk (`inode/data.rs`,
+    // T-025).
+    #[expect(dead_code)]
+    pub(super) fn chunk_unit(&self) -> Option<usize> {
+        match self {
+            Self::Flat | Self::Compressed => None,
+            Self::Chunked { format, .. } => Some(if format & CHUNK_FORMAT_INDEXES != 0 {
+                size_of::<RawInodeChunkIndex>()
+            } else {
+                BLOCK_MAP_ENTRY_SIZE
+            }),
+        }
+    }
+}
+
+/// The erofs in-memory inode descriptor — the decoded mirror of the
+/// dual-format on-disk records (the ext2 counterpart is
+/// `ext2/inode/mod.rs:233-254`).
+///
+/// Decoded once, wholly immutable after construction (the
+/// mutually-exclusive-layer-trim model, T-010 §5.3 D2); the resident
+/// `Inode` handle (T-024) carries one. The sole construction
+/// entrances are the two TryFrom conversions (T-022 S07) — the
+/// filesystem is read-only, so there is no ext2-style `new()`
+/// creator and no write-direction `From<&InodeDesc>` either.
+///
+/// # Field liveness (dead-code ledger)
+///
+/// The same discipline as the `SuperBlock` mirror: the conversion
+/// (S07) writes every field but reads none, so a field is only live
+/// once live code reads it. `version` is read by `inode_isize()`
+/// below — an `#[expect(dead_code)]` method is a dead-code-analysis
+/// root, and its reads count — while every other field carries its
+/// own `#[expect(dead_code)]` with the first consumer annotated,
+/// firing `unfulfilled` as the removal prompt when that consumer
+/// lands.
+///
+/// # Not-mirrored ledger (explicit, `docs/T-011/analysis.md` §3.2)
+///
+/// `nid` (st_ino derives from it on the handle, X2), `i_ino` (never
+/// read, X2), `i_reserved`/`i_reserved2` (G5), `nblks` (the
+/// compressed-blocks reading is consumed inside the conversion body
+/// by the D12 accounting — no post-decode consumer exists in
+/// archive A), the `rdev` bit pattern (an accessor face, not a
+/// field), separate ctime/atime copies (D10: the three times are
+/// one field), and btime (no on-disk source, X9 — the assembler
+/// fills `None`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InodeDesc {
+    /// The on-disk layout version (carried statically by the TryFrom
+    /// input type; read by `inode_isize()` below).
+    pub(super) version: InodeVersion,
+    /// The data layout — the entry's one-shot discrimination product,
+    /// flowing in as a conversion parameter (I3/I4 are never
+    /// re-judged here).
+    // First readers: the path dispatch and the three-way compressed
+    // predicate of the handle (T-024); the layer-3 site joins in
+    // T-025 through `DataLayout::is_compressed`.
+    #[expect(dead_code)]
+    pub(super) datalayout: DataLayout,
+    /// Runtime invariant: never `Other` — the I8 guard rejects at
+    /// construction, so `Other` exists only on the guard-carrying
+    /// face.
+    // First readers: the accessor premises (T-022 S07) and the
+    // InodeType mapping (T-024).
+    #[expect(dead_code)]
+    pub(super) kind: FileKind,
+    /// The 12 permission bits, carried losslessly (X3: no permission
+    /// canonicalization at the decode).
+    // First reader: Metadata.mode (T-024).
+    #[expect(dead_code)]
+    pub(super) mode: InodeMode,
+    /// The owner id (zero-extended from le16 on the compact form).
+    // First reader: the Uid wrapper (T-024).
+    #[expect(dead_code)]
+    pub(super) uid: u32,
+    /// The group id (zero-extended from le16 on the compact form).
+    // First reader: the Gid wrapper (T-024).
+    #[expect(dead_code)]
+    pub(super) gid: u32,
+    /// The hard-link count, carried as-is including 0 — the ext2
+    /// link-count ESTALE door is an ext2-specific defense and is
+    /// deliberately not transcribed.
+    // First reader: Metadata.nr_hard_links (T-024, as usize).
+    #[expect(dead_code)]
+    pub(super) nlink: u32,
+    /// The file size. Construction invariant: <= i64::MAX (the
+    /// extended form via the I7 guard, the compact form by the le32
+    /// width).
+    // First readers: Metadata.size (T-024, as usize) and the data
+    // path (T-025).
+    #[expect(dead_code)]
+    pub(super) size: u64,
+    /// The inline-xattr area size, as converted by
+    /// `xattr_ibody_size` — an unvalidated value carried in the
+    /// mirror; the boundary guard belongs to the consumer (T-026).
+    // First readers: the extent-start location (T-025) and the
+    // three-state gate / ibody location (T-026).
+    #[expect(dead_code)]
+    pub(super) xattr_isize: usize,
+    /// The modification time (the F6/F6n carrier discipline: the
+    /// le64 seconds domain is carried unchanged — the `as i64`
+    /// truncation happens at the statx exit — and a malformed nsec
+    /// >= 1e9 normalizes through `duration_from_parts`, the F6n
+    /// known-diff, reachable only from malformed images). D10: the
+    /// three Metadata times are filled from this one field; the
+    /// compact form copies `sb.build_time` (the same-source
+    /// derivation).
+    // First reader: the three Metadata times (T-024).
+    #[expect(dead_code)]
+    pub(super) time: Duration,
+    /// The C union `i_u` as the single host-order source (the
+    /// conversion body's one `from_le`); every reading — the
+    /// first-pass kind views and the second-pass datalayout views —
+    /// is a view of this one value, never a re-interpretation in
+    /// place (the two-independent-passes fidelity, T-003 §1.3).
+    // First readers: the ID4 accessors `raw_blkaddr`/`rdev`
+    // (T-022 S07).
+    #[expect(dead_code)]
+    pub(super) i_u: u32,
+    /// The D9 discrimination product (see `AddrState`).
+    // First readers: the chunk-unit/bits consumption (T-024/T-025).
+    #[expect(dead_code)]
+    pub(super) addr_state: AddrState,
+    /// The 512-byte-sector accounting — the D12 dual-caliber product
+    /// (the formula's single source is the G-Z02 note inside the
+    /// conversion bodies, T-022 S07).
+    // First reader: Metadata.nr_sectors_allocated (T-024).
+    #[expect(dead_code)]
+    pub(super) nr_sectors: usize,
+}
+
+impl InodeDesc {
+    /// The per-version on-disk inode size (the source-side
+    /// `vi->inode_isize`, inode.c:70/:76): consumes `size_of`
+    /// directly — the layout assertions above already prove 32/64,
+    /// so no literal is written (C5). The suffix location (inline
+    /// xattr / inline data start = inode_isize + xattr_isize) is the
+    /// consumer.
+    // First consumers: the extent-start location of the chunked map
+    // path (T-025) and the ibody location (T-026).
+    #[expect(dead_code)]
+    pub(super) fn inode_isize(&self) -> usize {
+        match self.version {
+            InodeVersion::Compact => size_of::<RawInodeCompact>(),
+            InodeVersion::Extended => size_of::<RawInodeExtended>(),
+        }
+    }
+}
+
+/// The parity of `erofs_xattr_ibody_size` (erofs_fs.h:245-252):
+/// icount == 0 → 0, otherwise 12 + 4 × (icount − 1).
+///
+/// An unconditional conversion with no boundary check: the le16
+/// input domain caps the result at 262148 bytes and the mirror
+/// deliberately carries the unvalidated value — the boundary guard
+/// belongs to the consumption point (T-026). The literal 12 is the
+/// `RawXattrIbodyHeader` size, same-valued with its layout
+/// assertion in `xattr.rs` (a mutual proof — this file does not
+/// reference the xattr.rs type, the L4 direction forbids it). The
+/// two branches are exhaustive over the le16 domain, so the
+/// (icount == 0, result == 12) corner is structurally unreachable
+/// and no third arm exists (G7).
+// First consumer: the `xattr_isize` field decode of the TryFrom
+// bodies (T-022 S07).
+#[expect(dead_code)]
+fn xattr_ibody_size(icount: u16) -> usize {
+    if icount == 0 {
+        0
+    } else {
+        12 + 4 * (icount as usize - 1)
+    }
+}
+
+/// The entry's one-shot `i_format` validation (step 3 of the
+/// five-step decode, `docs/T-011/S05/index.md` §1.1): the I3/I4
+/// guards, then the typed pair.
+///
+/// Guard order = the source execution order
+/// (`docs/T-001/analysis.md` §9.2): I3 first — any bit above `I_ALL`
+/// (the 0xFFF0 remainder of the le16 domain) is "unsupported
+/// i_format" (EOPNOTSUPP, inode.c:53-59); I4 strictly after — an
+/// extracted datalayout of 5..=7 (the reserved discriminants) is
+/// "unsupported datalayout" (EOPNOTSUPP, inode.c:61-67). With both
+/// malformed values present the first error is I3's (the same-errno
+/// ordering, the observable face of the sequence).
+///
+/// The one-shot-validation defense: the discrimination read set is
+/// exactly the 2 pre-read bytes, so a malformed value never triggers
+/// the full-record read, any suffix read, or the cross-block stream
+/// (`docs/T-011/S06/index.md` §4).
+// First consumer: the decode entry `read_inode_desc` (T-022 S08).
+#[expect(dead_code)]
+fn parse_i_format(ifmt: u16) -> Result<(InodeVersion, DataLayout)> {
+    if ifmt & !I_ALL != 0 {
+        return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported i_format");
+    }
+    if inode_datalayout(ifmt) >= INODE_DATALAYOUT_MAX {
+        return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported datalayout");
+    }
+
+    // The two guards above are the whole rejection face, so the
+    // catch-all arms below fold only onto values already rejected
+    // there: the version extraction masks to its 1-bit domain, and a
+    // datalayout of 5..=7 has returned at I4 — no unreachable error
+    // arm is fabricated (G7).
+    let version = if inode_version(ifmt) == INODE_LAYOUT_EXTENDED {
+        InodeVersion::Extended
+    } else {
+        InodeVersion::Compact // == INODE_LAYOUT_COMPACT (erofs_fs.h:132)
+    };
+    let datalayout = match inode_datalayout(ifmt) {
+        0 => DataLayout::FlatPlain,         // erofs_fs.h:99
+        1 => DataLayout::CompressedFull,    // erofs_fs.h:100
+        2 => DataLayout::FlatInline,        // erofs_fs.h:101
+        3 => DataLayout::CompressedCompact, // erofs_fs.h:102
+        _ => DataLayout::ChunkBased,        // == 4 (erofs_fs.h:103); 5..=7 rejected at I4
+    };
+    Ok((version, datalayout))
 }
