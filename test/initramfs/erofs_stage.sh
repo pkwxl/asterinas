@@ -27,6 +27,14 @@
 # 与文件系统无关);该形态自 stage 清单移除并记录,改由 FX-INODE
 # crafted builder 承载(S06 口径),不虚构替代条目。LNK 尾检 = 4。
 #
+# T-018/S04 实测兜底移除(mkfs.erofs 1.7.1 拒收面,机制与决策见
+# docs/T-018/S04 §3/§5): n255_*(dirent 名长恰 255 = NAME_MAX =
+# EROFS_NAME_LEN)在 1.7.1 下 mkfs 构造源路径时被截为 254B(strace
+# 实测: stat 传入名比 dirent 恰短 1 字节),对在场文件 stat 得 ENOENT
+# → "Could not format the device" 硬败;名长 ≤254 全过。形态保留在
+# 静态树(git 可承载、S01 §3 规格可见),自 stage 清单移除并登记
+# FX-INODE crafted builder 承载(S06 口径)。REG 尾检 = 234。
+#
 # 版本门(T-016/S03 §6.1): 自检 #1 绑定 erofs-utils 1.7.1(mkfs 拼写逐字
 # 绑定该版本);异版硬停,须按 T-009 探针方法重核参数面后再放行,
 # 不得「先放行后补核」。
@@ -124,6 +132,13 @@ section "§4.2 步骤 1/8: 全量重建副本 + 两空目录补建"
 rm -rf "$DST"
 mkdir -p "$DST"
 cp -a "$SRC"/. "$DST"/
+# n255_* 自 stage 清单摘除(mkfs.erofs 1.7.1 拒收,见文件头注;形态保留
+# 静态树,只从 mkfs 消费面摘除,不虚构替代条目)。计数守卫防静默缩面:
+# 静态树若丢失该形态,此处硬停而非静默通过。
+N255_N="$(find "$DST/dirs/boundary_names" -maxdepth 1 -name 'n255_*' | wc -l)"
+[ "$N255_N" -eq 1 ] || die "步骤1: boundary_names n255_* 计数 $N255_N != 1(静态树名长边界形态异动,先核对 erofs_tree/ 与 S01 §3)"
+find "$DST/dirs/boundary_names" -maxdepth 1 -name 'n255_*' -exec rm -f -- {} +
+note "n255_*(名长恰 255)自 stage 摘除: mkfs.erofs 1.7.1 拒收(源路径截断 1B → stat ENOENT);FX-INODE 承载,静态树保留"
 mkdir -p "$DST/dirs/empty_dir" "$DST/xattr_host/acl_dir"
 note "cp -a 完成(保 symlink 与静态 mode);dirs/empty_dir、xattr_host/acl_dir 显式 mkdir -p(git 不追踪空目录,全新 clone 下为常态路径 — S08 修订①)"
 
@@ -287,23 +302,25 @@ CHR_N="$(find "$DST" -type c | wc -l)"
 BLK_N="$(find "$DST" -type b | wc -l)"
 FIFO_N="$(find "$DST" -type p | wc -l)"
 SOCK_N="$(find "$DST" -type s | wc -l)"
-[ "$REG_N"  -eq 235 ] || die "尾检: REG $REG_N != 235(34 静态 + 200 bulk + 1 sparse)"
+[ "$REG_N"  -eq 234 ] || die "尾检: REG $REG_N != 234(33 静态 + 200 bulk + 1 sparse;n255 自 stage 移除,见文件头注)"
 [ "$DIR_N"  -eq 19  ] || die "尾检: DIR $DIR_N != 19(15 静态 + empty_dir/many_entries/acl_dir/special)"
 [ "$LNK_N"  -eq 4   ] || die "尾检: LNK $LNK_N != 4(3 静态 + slink_near_max;slink_empty 按 S01 §8.4 移除,见文件头注)"
 [ "$CHR_N"  -eq 1   ] || die "尾检: CHR $CHR_N != 1"
 [ "$BLK_N"  -eq 1   ] || die "尾检: BLK $BLK_N != 1"
 [ "$FIFO_N" -eq 1   ] || die "尾检: FIFO $FIFO_N != 1"
 [ "$SOCK_N" -eq 1   ] || die "尾检: SOCK $SOCK_N != 1"
-for n in 253 254 255; do
+for n in 253 254; do
   M="$(find "$DST/dirs/boundary_names" -maxdepth 1 -name "n${n}_*" -type f)"
   [ -n "$M" ] || die "尾检: boundary_names 缺 n${n}_*"
   NB="$(find "$DST/dirs/boundary_names" -maxdepth 1 -name "n${n}_*" -type f -printf '%f' | wc -c)"
   [ "$NB" -eq "$n" ] || die "尾检: n${n}_* dirent 名长 $NB != $n"
 done
+[ -z "$(find "$DST/dirs/boundary_names" -maxdepth 1 -name 'n255_*')" ] \
+  || die "尾检: n255_* 应已自 stage 摘除(mkfs.erofs 1.7.1 拒收,FX-INODE 承载 — 见文件头注)"
 [ -z "$(ls -A "$DST/dirs/empty_dir")" ]     || die "尾检: dirs/empty_dir 非空"
 [ -z "$(ls -A "$DST/xattr_host/acl_dir")" ] || die "尾检: xattr_host/acl_dir 非空(仅 default ACL,无 dirent)"
 TOTAL=$((REG_N + DIR_N + LNK_N + CHR_N + BLK_N + FIFO_N + SOCK_N))
 note "REG=$REG_N DIR=$DIR_N LNK=$LNK_N CHR=$CHR_N BLK=$BLK_N FIFO=$FIFO_N SOCK=$SOCK_N(七型齐备,total=$TOTAL)"
-note "many_entries=$MANY_N(名长 ${MANY_NAMELEN}B)|boundary 名 253/254/255|sparse ${SPARSE_SIZE}B(blocks=$SP_BLK)|xattr 14 宿主/21 条目"
+note "many_entries=$MANY_N(名长 ${MANY_NAMELEN}B)|boundary 名 253/254(255 FX 承载)|sparse ${SPARSE_SIZE}B(blocks=$SP_BLK)|xattr 14 宿主/21 条目"
 printf 'STAGE-VERDICT: OK dst=%s reg=%d dir=%d lnk=%d chr=%d blk=%d fifo=%d sock=%d xattr_hosts=14 xattr_entries=21 many=%d sparse=%dB\n' \
   "$DST_REAL" "$REG_N" "$DIR_N" "$LNK_N" "$CHR_N" "$BLK_N" "$FIFO_N" "$SOCK_N" "$MANY_COUNT" "$SPARSE_SIZE"
