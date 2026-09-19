@@ -97,6 +97,20 @@ struct linux_dirent64 {
 #define EROFS_MANY_ENTRIES 200
 #define EROFS_BULK_NAME_LEN 40
 
+/*
+ * Width of one stored name column (NAME_MAX + NUL). The glibc-pass
+ * helper stores readdir(3) d_name strings, which may legally be up to
+ * 255 bytes long, so a bulk-name-width column would make the snprintf
+ * copy provably truncatable (-Wformat-truncation). Sizing at NAME_MAX
+ * also removes the silent-truncation false-pass risk; name-content
+ * correctness stays pinned by the exact strcmp against the template.
+ *
+ * AUTO-DECISION: widen the glibc-pass name column 48 -> 256 instead of
+ * suppressing -Wformat-truncation (<stdio.h> copies of unknown-length
+ * names must never be provably truncatable; no expected value moves).
+ */
+#define EROFS_NAME_COL 256
+
 /* many_entries enumerates 200 bulk rows + the two on-disk dot rows. */
 #define EROFS_MANY_TOTAL (EROFS_MANY_ENTRIES + 2)
 #define EROFS_ENUM_MAX (EROFS_MANY_TOTAL + 8)
@@ -107,7 +121,7 @@ struct linux_dirent64 {
 #define EROFS_DIR_SPECIAL EROFS_INIT_MNT "/special"
 
 struct ero_rec {
-	char name[256];
+	char name[EROFS_NAME_COL];
 	unsigned char type;
 	int64_t off;
 	unsigned short reclen;
@@ -174,8 +188,8 @@ static int ero_enumerate(const char *path, struct ero_rec *recs, int max,
 }
 
 /* glibc readdir(3) pass: collect the name sequence, return count. */
-static int ero_readdir_seq(const char *path,
-			   char names[][EROFS_BULK_NAME_LEN + 8], int max)
+static int ero_readdir_seq(const char *path, char names[][EROFS_NAME_COL],
+			   int max)
 {
 	DIR *dp = opendir(path);
 	struct dirent *ent;
@@ -189,8 +203,7 @@ static int ero_readdir_seq(const char *path,
 			errno = EOVERFLOW;
 			return -1;
 		}
-		snprintf(names[count], EROFS_BULK_NAME_LEN + 8, "%s",
-			 ent->d_name);
+		snprintf(names[count], EROFS_NAME_COL, "%s", ent->d_name);
 		count++;
 	}
 	closedir(dp);
@@ -322,7 +335,7 @@ END_TEST()
 FN_TEST(readdir_many_entries_full_pass)
 {
 	static struct ero_rec recs[EROFS_ENUM_MAX];
-	static char seq_b[EROFS_ENUM_MAX][EROFS_BULK_NAME_LEN + 8];
+	static char seq_b[EROFS_ENUM_MAX][EROFS_NAME_COL];
 	static int seen[EROFS_MANY_ENTRIES];
 	struct stat st;
 	char expect[EROFS_BULK_NAME_LEN + 1];
@@ -455,7 +468,7 @@ END_TEST()
  */
 FN_TEST(readdir_seekdir_telldir_resume)
 {
-	static char seq[EROFS_ENUM_MAX][EROFS_BULK_NAME_LEN + 8];
+	static char seq[EROFS_ENUM_MAX][EROFS_NAME_COL];
 	static const int points[] = { 3, 100, EROFS_MANY_TOTAL - 1 };
 	struct stat st;
 	DIR *dp;
@@ -528,12 +541,12 @@ FN_TEST(readdir_cookie_resume_and_small_buffer)
 	char buf[4096];
 	struct stat st;
 	unsigned short r0;
-	int fd, n;
+	int fd;
 	ssize_t r;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
-	n = TEST_RES(ero_enumerate(EROFS_DIR_MANY, recs, EROFS_ENUM_MAX, &st),
-		     _ret == EROFS_MANY_TOTAL);
+	TEST_RES(ero_enumerate(EROFS_DIR_MANY, recs, EROFS_ENUM_MAX, &st),
+		 _ret == EROFS_MANY_TOTAL);
 	fd = TEST_SUCC(open(EROFS_DIR_MANY, O_RDONLY | O_DIRECTORY));
 
 	/* G-N06 / element ①: d_off(N) = next-entry basis. */
