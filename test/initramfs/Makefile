@@ -40,6 +40,16 @@ XFSTESTS_DISK_SIZE ?= 12G
 EROFS_TREE_DIR := $(CUR_DIR)/erofs_tree
 EROFS_STAGE_SCRIPT := $(CUR_DIR)/erofs_stage.sh
 EROFS_TREE_STAGE := $(BUILD_DIR)/erofs_tree_stage
+# Stage recipe target is a stamp file, NOT the stage directory itself:
+# the S09 reproducibility fix pins every entry under the stage tree —
+# including the stage directory root — to mtime @0 (1970). A directory
+# target would therefore always compare older than its erofs_tree/
+# prerequisites and re-run the stage recipe on every no-op make, breaking
+# the incremental no-op gate (docs/T-016/S03 §3.4). The stamp lives outside
+# the pinned tree, so its mtime is the stage-run time and the gate holds.
+# mkfs recipes below depend on the stamp and keep consuming
+# $(EROFS_TREE_STAGE) as srcdir.
+EROFS_STAGE_STAMP := $(BUILD_DIR)/.erofs_tree_stage.stamp
 EROFS_BASE_IMAGE := $(BUILD_DIR)/erofs_base.img
 EROFS_BASE_CPT_IMAGE := $(BUILD_DIR)/erofs_base_cpt.img
 EROFS_UUID0_IMAGE := $(BUILD_DIR)/erofs_uuid0.img
@@ -245,9 +255,11 @@ $(XFSTESTS_SCRATCH_IMAGE):
 	@mkfs.ext2 $(XFSTESTS_SCRATCH_IMAGE)
 
 # erofs test image pipeline (T-018; blueprint: docs/T-016/S03/index.md §3).
-# Dependency chain: erofs_tree/ files + erofs_stage.sh -> $(EROFS_TREE_STAGE)
-# -> C1-C12 mkfs images (parallel; all read-only on the stage tree) -> D1/D2
-# derived images. Version gate (erofs-utils 1.7.1) rides the stage self-checks.
+# Dependency chain: erofs_tree/ files + erofs_stage.sh -> stage stamp
+# ($(EROFS_STAGE_STAMP), recipe runs the stage script which builds
+# $(EROFS_TREE_STAGE)) -> C1-C12 mkfs images (parallel; all read-only on
+# the stage tree) -> D1/D2 derived images. Version gate (erofs-utils 1.7.1)
+# rides the stage self-checks.
 #
 # The dependency set lists files and directories, NOT symlinks: make stats
 # prerequisites through symlinks, and the deliberately dangling pattern
@@ -257,56 +269,57 @@ $(XFSTESTS_SCRATCH_IMAGE):
 # dirent updates the parent directory's mtime, and directories are deps.
 EROFS_TREE_DEPS := $(shell find $(EROFS_TREE_DIR) \( -type f -o -type d \) 2>/dev/null)
 
-$(EROFS_TREE_STAGE): $(EROFS_STAGE_SCRIPT) $(EROFS_TREE_DEPS)
+$(EROFS_STAGE_STAMP): $(EROFS_STAGE_SCRIPT) $(EROFS_TREE_DEPS)
 	@$(EROFS_STAGE_SCRIPT) $(EROFS_TREE_DIR) $(EROFS_TREE_STAGE)
+	@touch $@
 
-$(EROFS_BASE_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_BASE_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -U $(EROFS_UUID_BASE) $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_BASE_CPT_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_BASE_CPT_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -U $(EROFS_UUID_BASE_CPT) -E force-inode-compact $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_UUID0_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_UUID0_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -U $(EROFS_UUID0) $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_BS512_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_BS512_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -b 512 $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_BS1024_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_BS1024_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -b 1024 $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_BS2048_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_BS2048_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -b 2048 $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_COMP_LZ4_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_COMP_LZ4_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -z lz4 $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_XATTR_SHARED_ALL_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_XATTR_SHARED_ALL_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -x0 $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_XATTR_NONE_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_XATTR_NONE_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs -x-1 $@ $(EROFS_TREE_STAGE)
 
-$(EROFS_PREFIX_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_PREFIX_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs --xattr-prefix=$(EROFS_XATTR_PREFIX) $@ $(EROFS_TREE_STAGE)
 
 # C11 (docs/T-016/S02/index.md §2): one mkfs call produces two files
 # (main image + blob) — grouped target
-$(EROFS_FLATDEV_IMAGE) $(EROFS_BLOB_IMAGE) &: $(EROFS_TREE_STAGE)
+$(EROFS_FLATDEV_IMAGE) $(EROFS_BLOB_IMAGE) &: $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs --chunksize=$(EROFS_FLATDEV_CHUNKSIZE) --blobdev=$(EROFS_BLOB_IMAGE) $(EROFS_FLATDEV_IMAGE) $(EROFS_TREE_STAGE)
 
-$(EROFS_CHUNK4B_IMAGE): $(EROFS_TREE_STAGE)
+$(EROFS_CHUNK4B_IMAGE): $(EROFS_STAGE_STAMP)
 	@mkdir -p $(BUILD_DIR)
 	@mkfs.erofs --chunksize=$(EROFS_CHUNK4B_CHUNKSIZE) $@ $(EROFS_TREE_STAGE)
 
