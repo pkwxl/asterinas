@@ -7,8 +7,7 @@
 //! identified by nid — erofs has no block groups, so inode numbers are
 //! linear and the FS-level cache in `fs.rs` is keyed by nid directly.
 //!
-//! Bring-up state (T-022 S05 + S06 + S07): the on-disk half, the
-//! typed vocabulary, and the dual-format conversion are in place —
+//! Bring-up state (T-022 S05–S08): the decode half is complete —
 //! the two raw inode records (`RawInodeCompact` 32B /
 //! `RawInodeExtended` 64B, sharing the discriminating prefix at
 //! offsets 0/2/4/16), the chunk-domain records (`RawInodeChunkInfo`,
@@ -21,10 +20,11 @@
 //! the decoded `InodeDesc` mirror with its 13-field set, the
 //! `xattr_ibody_size` helper, the dual `TryFrom` decode with the
 //! I7/I8/I10 guards and the G-Z02 dual-caliber `nr_sectors`
-//! accounting, and the two ID4 `i_u` accessors. The decode entry
-//! (`read_inode_desc`, the five-step sequence minus the iloc
-//! location) lands with the remaining T-022 subtask (S08). The
-//! `Inode` handle shell below
+//! accounting, the two ID4 `i_u` accessors, and the decode entry
+//! `read_inode_desc` — the five-step sequence from the 2-byte
+//! pre-read through the `TryFrom`, with the iloc computation and the
+//! iget cache left to the T-024 assembly. The `Inode` handle shell
+//! below
 //! — still the minimal shell required by the `FileSystem` trait
 //! surface — stays interim until T-024 (the nid, descriptor, and
 //! payload fields land then; payload shapes remain deliberately not
@@ -62,7 +62,7 @@ use core::mem::offset_of;
 
 use align_ext::AlignExt;
 use device_id::{DeviceId, MajorId, MinorId};
-use ostd::const_assert;
+use ostd::{const_assert, mm::VmIo};
 
 use super::{fs::Erofs, prelude::*, super_block::SuperBlock};
 use crate::fs::vfs::inode::Extension;
@@ -97,8 +97,8 @@ impl Inode {
 
     /// Returns the inode number (nid).
     ///
-    /// Placeholder: always 0 until the nid field lands with the T-022
-    /// decoding body.
+    /// Placeholder: always 0 until the nid field lands with the T-024
+    /// assembly.
     pub(super) fn ino(&self) -> ErofsNid {
         0
     }
@@ -986,8 +986,8 @@ fn xattr_ibody_size(icount: u16) -> usize {
 /// exactly the 2 pre-read bytes, so a malformed value never triggers
 /// the full-record read, any suffix read, or the cross-block stream
 /// (`docs/T-011/S06/index.md` §4).
-// First consumer: the decode entry `read_inode_desc` (T-022 S08).
-#[expect(dead_code)]
+// Live since T-022 S08: called by `read_inode_desc` below; the T-024
+// assembly (iloc computation + iget) joins through it.
 fn parse_i_format(ifmt: u16) -> Result<(InodeVersion, DataLayout)> {
     if ifmt & !I_ALL != 0 {
         return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported i_format");
@@ -1244,5 +1244,79 @@ impl TryFrom<(&RawInodeExtended, DataLayout, &SuperBlock)> for InodeDesc {
             addr_state,
             nr_sectors,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The decode entry (T-022 S08; sequence `docs/T-011/S05/index.md` §1.1,
+// read contract `docs/T-011/S07/index.md` §3–§4, D-domain table
+// `docs/T-011/analysis.md` §5.2).
+// ---------------------------------------------------------------------------
+
+/// Decodes the on-disk inode at byte offset `iloc` into an
+/// `InodeDesc` — steps 2–5 of the five-step decode sequence, in the
+/// source execution order (`docs/T-001/analysis.md` §9.2; behavioral
+/// baseline inode.c:27-197):
+///
+/// - Step 2, the 2-byte pre-read `read_val::<u16>(iloc)`: the single
+///   point where `i_format` enters the decode surface, and its
+///   single `u16::from_le` (E1 — the `TryFrom` conversions re-derive
+///   nothing from it). Read errors propagate unchanged (C2): `?`
+///   passthrough with no FS-layer message, no errno folding — a read
+///   past the device end surfaces the aster boundary errno EINVAL,
+///   a registered I/O-model known-diff against linux's EIO (RD2),
+///   deliberately not simulated here.
+/// - Step 3, `parse_i_format`: the I3 → I4 guards plus the typed
+///   pair. The discrimination read set is exactly the 2 pre-read
+///   bytes — a malformed value returns before any full-record read,
+///   any suffix read, or the cross-block region is touched.
+/// - Step 4, the version dispatch: one single-point read of the
+///   selected record straight at `iloc`. The extended record is
+///   *always* fetched by the one 64-byte `read_val` (RD0):
+///   cross-block fetch is built into the byte-stream primitive (the
+///   device address space knows no block boundaries), so the
+///   source-side boundary test and two-segment splice (inode.c:72-96)
+///   exist as no code here; the compact record never crosses a block
+///   (32 always divides the block size). Fixture note for the
+///   regression family (T-027, RD1): on a 4k volume the unique
+///   cross-block slot is ofs = 4064 (nid ≡ 127 mod 128), while
+///   ofs = 4032 (nid ≡ 126) is the exact-block-boundary corner and
+///   does *not* cross — the landed single-form read treats both
+///   slots identically.
+/// - Step 5, `InodeDesc::try_from((&raw, datalayout, sb))`: the pure
+///   in-memory conversion carrying the I7/I8/I10 guards (T-022 S07).
+///
+/// Step 1 — the iloc location
+/// `(meta_blkaddr << blkszbits) + (nid << ISLOT_BITS)` — and the
+/// iget cache belong to the T-024 assembly; this entry starts from
+/// the already-computed byte offset. No decoder-side caching (RD3):
+/// every call reads the device directly, so repeat reads of one nid
+/// are the iget caller's business.
+// I6 (kmalloc ENOMEM) unreachable: no heap allocation on this path (F4/G-M21)
+//
+// First consumer: the iget assembly (`Inode::new`, T-024), which also
+// computes the `iloc` argument (step 1).
+#[expect(dead_code)]
+fn read_inode_desc(device: &dyn BlockDevice, sb: &SuperBlock, iloc: usize) -> Result<InodeDesc> {
+    // Step 2: the 2-byte pre-read of `i_format` — an I2 read error
+    // propagates before any guard runs (the source's first metabuf
+    // read, inode.c:45-50, holds the same position).
+    let ifmt = u16::from_le(device.read_val::<u16>(iloc)?);
+    // Step 3: the one-shot I3 -> I4 validation plus the typed pair;
+    // on a malformed value the read set stays at the 2 pre-read
+    // bytes.
+    let (version, datalayout) = parse_i_format(ifmt)?;
+    // Step 4: the version dispatch — one single-point read per form,
+    // straight at `iloc` (RD0: no boundary test, no two-segment
+    // splice, either form).
+    match version {
+        InodeVersion::Compact => {
+            let raw = device.read_val::<RawInodeCompact>(iloc)?;
+            InodeDesc::try_from((&raw, datalayout, sb))
+        }
+        InodeVersion::Extended => {
+            let raw = device.read_val::<RawInodeExtended>(iloc)?;
+            InodeDesc::try_from((&raw, datalayout, sb))
+        }
     }
 }
