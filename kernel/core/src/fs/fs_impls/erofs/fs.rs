@@ -1125,10 +1125,9 @@ impl DeviceTable {
 
     /// Valid-bit mask for chunk device ids (super.c:242; data-path
     /// consumption, G-O06 → T-014).
-    // First consumer: the chunk-8B device-id masking of the map walk
-    // (T-025 S04 — the flat half landed in S03 consumes only
-    // flatdev/slot).
-    #[expect(dead_code)]
+    // Live since T-025 S04: the chunk-8B device-id masking of the
+    // map walk (`DataBackend::map_blocks_chunked`, through the
+    // fs-upgrade single source S03-D8).
     pub(super) fn device_id_mask(&self) -> u32 {
         self.device_id_mask
     }

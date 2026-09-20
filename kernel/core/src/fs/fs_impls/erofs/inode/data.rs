@@ -12,11 +12,12 @@
 //! `FlatLayout`/`InlineTail` pair in place, per the §1.1 seam — the
 //! constructor parameter set never churned. The remaining T-025
 //! slices evolve this file in place: the map layer landed with S03
-//! (`map_blocks` flat branches M1/M2 + the three-arm `map_dev` walk,
-//! neither consumed by the minimal backend yet), the chunk mapping
-//! (M4–M7) lands with S04, and the four-arm submit_read_bio rewrite
-//! — including the crafted-edge validation (e.g. the "inline data
-//! across blocks" EFSCORRUPTED arm of data.c:103-108) — with S05.
+//! (`map_blocks` flat branches M1/M2 + the three-arm `map_dev` walk)
+//! and grew its chunk branches with S04 (M4–M7) — neither consumed
+//! by the minimal backend yet — and the four-arm submit_read_bio
+//! rewrite — including the crafted-edge validation (e.g. the
+//! "inline data across blocks" EFSCORRUPTED arm of data.c:103-108) —
+//! lands with S05.
 //!
 //! Seam contract carried from T-024 into T-025 (§1.1):
 //! - the constructor parameter set is final (`Weak<Erofs>` +
@@ -50,6 +51,7 @@
 
 use core::mem::offset_of;
 
+use align_ext::AlignExt;
 use aster_block::{
     bio::{BioCompleteFn, BioSegment, BioStatus},
     id::Bid,
@@ -201,7 +203,7 @@ pub(in crate::fs::fs_impls::erofs) struct DataBackend {
     /// (mount geometry and device-table walks, T-025 S03/S04); the
     /// minimal face reads the device it already holds instead.
     // Live since T-025 S03: `upgrade_fs` reads it on every nonzero-id
-    // map_dev walk (the chunk-8B mask fetch joins with S04).
+    // map_dev walk, and since S04 on every chunk-8B mask fetch too.
     fs: Weak<Erofs>,
     /// The backing device: flat-region BIOs and inline-tail byte
     /// reads both go through it.
@@ -244,9 +246,10 @@ impl DataBackend {
     }
 
     // -------------------------------------------------------------------
-    // The map layer (T-025 S03): map_blocks flat branches + map_dev.
-    // Pure submit-context code — no completion-context entry, no
-    // blocking locks (`&self` is immutable post-construction).
+    // The map layer (T-025 S03/S04): the map_blocks flat + chunk
+    // branches and the map_dev walk. Pure submit-context code — no
+    // completion-context entry, no blocking locks (`&self` is
+    // immutable post-construction).
     // -------------------------------------------------------------------
 
     /// Map one non-compressed extent covering logical offset `m_la`.
@@ -325,18 +328,7 @@ impl DataBackend {
         debug_assert!(self.geom.chunk.is_none() || !self.geom.tail_inline);
         match self.geom.chunk {
             None => self.map_blocks_flatmode(m_la),
-            // TRANSITIONAL ARM (T-025 decomposition decision 4):
-            // purpose — keep every chunk-based mapping query failing
-            // EOPNOTSUPP until the chunk walk (M4–M7) lands; removal
-            // — S04 replaces the arm through the `chunked` helper.
-            // The main-column image family carries no chunk-based
-            // inode, so behavior is unchanged meanwhile.
-            Some(_) => {
-                return_errno_with_message!(
-                    Errno::EOPNOTSUPP,
-                    "chunk-based mapping lands with the data-path task"
-                );
-            }
+            Some(cg) => self.map_blocks_chunked(m_la, cg),
         }
     }
 
@@ -401,6 +393,119 @@ impl DataBackend {
                 m_flags: MapFlags::MAPPED | MapFlags::META,
             })
         }
+    }
+
+    /// data.c:136-178 (`erofs_map_blocks`, CHUNK_BASED branch) — the
+    /// chunk walk M4–M7. Unlike the flat helper this is not pure
+    /// geometry: every call reads exactly one extent-area element
+    /// through the metadata byte channel (the S03-D7 `read_val`
+    /// single read point; linux reads one metabuf per call,
+    /// data.c:145-149 — never a cached array, S02-D2).
+    fn map_blocks_chunked(&self, m_la: u64, cg: ChunkGeometry) -> Result<MapBlocks> {
+        // M4 (data.c:136-139): the INDEXES bit selects the
+        // extent-area element width; aster carries it as
+        // `ChunkGeometry.unit`, collapsed once by
+        // `AddrState::chunk_unit` at the decode (the single INDEXES
+        // knowledge point). The discrimination goes through
+        // `size_of` (the C5 same-source form); the debug assert is
+        // the unit validity domain — an API-misuse face, not an
+        // on-disk check.
+        debug_assert!(cg.unit == size_of::<RawInodeChunkIndex>() || cg.unit == size_of::<u32>());
+        // M5 (data.c:141-143): the chunk number and the table
+        // position — extent_base aligns the inline prefix up to the
+        // element width, `unit * chunknr` walks the array.
+        let chunknr = m_la >> cg.chunkbits;
+        let pos = self.extent_base(cg.unit) + (cg.unit as u64) * chunknr;
+        // The one table-element read of the whole walk, typed by the
+        // unit: 4-byte block-map entries (#9) vs 8-byte chunk
+        // indexes (#8, the S01-D6 record). The 8B form reads the
+        // `advise` field (all 8 bytes land) but consumes it nowhere
+        // — the RD2① read-granularity known-diff family. Errors
+        // travel unfolded (C2): the framework byte-channel bound
+        // answers EINVAL past the device end (RD2②). Linux reads
+        // the element BEFORE the m_la write-back (data.c:145-149
+        // before :150) — by-value output makes the order
+        // unobservable, the placement keeps the trace.
+        let (blkaddr, device_id) = if cg.unit == size_of::<u32>() {
+            (u32::from_le(self.device.read_val::<u32>(pos as usize)?), 0u16)
+        } else {
+            let idx = self.device.read_val::<RawInodeChunkIndex>(pos as usize)?;
+            (u32::from_le(idx.blkaddr), u16::from_le(idx.device_id))
+        };
+        // M5 (data.c:150-152): the chunk-aligned m_la write-back —
+        // the output m_la may sit BELOW the query la; consumers
+        // recover the in-extent offset as `query_la − m_la`. Then
+        // the last-chunk clamp: `size − chunk_la` cannot underflow
+        // (chunk_la ≤ m_la < size — the post-EOF guard ran first),
+        // and align_up is linux round_up (the same formula). The
+        // extent is always a whole-block multiple — a chunk extent
+        // never has a sub-block tail (§4.6), so last-page zerofill
+        // stays a backend duty (G-P02).
+        let chunk_la = chunknr << cg.chunkbits;
+        let m_plen = (1u64 << cg.chunkbits)
+            .min((self.geom.size - chunk_la).align_up(1u64 << self.geom.block_bits));
+        // M6/M7 (data.c:155-178): the shared NULL_ADDR predicate —
+        // linux's `default:` arm means "non-NULL maps", there is no
+        // third state.
+        if blkaddr == NULL_ADDR {
+            // Hole: flags empty, m_pa/m_deviceid the deterministic
+            // zeros (linux leaves residue — unobservable, consumers
+            // never read m_pa while !MAPPED).
+            return Ok(MapBlocks {
+                m_la: chunk_la,
+                m_llen: m_plen,
+                m_pa: 0,
+                m_plen,
+                m_deviceid: 0,
+                m_flags: MapFlags::empty(),
+            });
+        }
+        // M6 (4B block map): no device_id field exists — the C5
+        // single-volume fold keeps m_deviceid structurally 0. M7
+        // (8B chunk index): `device_id & mask` (data.c:173-174),
+        // the mask fetched through the fs upgrade so the
+        // DeviceTable stays the single source (S03-D8; mask == 0
+        // folds every id to the primary device — the MD7
+        // silent-drop mechanism itself, pure arithmetic, no branch).
+        // The `as u16` mirrors the C assignment truncation
+        // (m_deviceid is u16); production masks never exceed
+        // 0xFFFF (extra_devices is 16-bit on disk).
+        let m_deviceid = if cg.unit == size_of::<u32>() {
+            0
+        } else {
+            (u32::from(device_id) & self.device_id_mask()?) as u16
+        };
+        Ok(MapBlocks {
+            m_la: chunk_la,
+            m_llen: m_plen,
+            m_pa: u64::from(blkaddr) << self.geom.block_bits,
+            m_plen,
+            m_deviceid,
+            m_flags: MapFlags::MAPPED,
+        })
+    }
+
+    /// The extent-area base point of a CHUNK_BASED inode (T-011
+    /// §5.2): `ALIGN(iloc + inode_isize + xattr_isize, unit)`
+    /// (data.c:142-143) — the inline prefix already collapsed into
+    /// `geom.inline_data_start`, rounded up to the element width.
+    ///
+    /// Computed on every mapping (S03-D6): one align_up is
+    /// noise-level next to the channel read each chunk mapping
+    /// already performs, so the geometry field face stays at the
+    /// §1.1 bound (no cached field).
+    fn extent_base(&self, unit: usize) -> u64 {
+        self.geom.inline_data_start.align_up(unit as u64)
+    }
+
+    /// The chunk-id validity mask (super.c:242), fetched through the
+    /// fs upgrade so the DeviceTable stays its single source
+    /// (S03-D8 — a geometry snapshot would be sb-level state posing
+    /// as desc-derived, a double source). One `Weak::upgrade` per
+    /// chunk-8B mapping is noise next to the channel read (W-P02
+    /// family note, no acceptance).
+    fn device_id_mask(&self) -> Result<u32> {
+        Ok(self.upgrade_fs()?.device_table().device_id_mask())
     }
 
     /// Resolve a mapped extent onto the primary device byte stream.
@@ -500,8 +605,8 @@ impl DataBackend {
     /// Defensive-only: inode-cache strong references outlive every
     /// DataBackend consumer (S01 §1.5), so failure is unreachable;
     /// the EIO guard follows the family form (the ext2 block-manager
-    /// and Inode::fs precedents). Shared by `map_dev` and (from S04)
-    /// the chunk-8B mask fetch (S04-D5).
+    /// and Inode::fs precedents). Shared by `map_dev` and the
+    /// chunk-8B mask fetch (S04-D5).
     fn upgrade_fs(&self) -> Result<Arc<Erofs>> {
         self.fs
             .upgrade()
@@ -617,13 +722,13 @@ impl BlockAsPageCacheBackend for DataBackend {
                 }
             }
             // TRANSITIONAL ARM (T-025 decomposition decision 4):
-            // purpose — keep every chunk-based read failing
-            // EOPNOTSUPP until the chunk mapping (M4–M7) lands;
-            // removal — S04 replaces the mapping through the
-            // map_blocks face and S05's four-arm rewrite of
-            // submit_read_bio removes the last transitional
-            // annotation. The main-column image family carries no
-            // chunk-based inode, so behavior is unchanged meanwhile.
+            // purpose — the map layer has carried the real chunk
+            // walk since S04, but this minimal face still bypasses
+            // it, so every chunk-based read keeps failing
+            // EOPNOTSUPP here; removal — S05's four-arm rewrite of
+            // submit_read_bio routes this face through map_blocks.
+            // The main-column image family carries no chunk-based
+            // inode, so behavior is unchanged meanwhile.
             Some(_) => {
                 return_errno_with_message!(
                     Errno::EOPNOTSUPP,
@@ -713,9 +818,8 @@ const_assert!(offset_of!(RawInodeChunkIndex, blkaddr) == 4); // erofs_fs.h:272
 
 /// `EROFS_NULL_ADDR = -1` (erofs_fs.h:263): the chunk-index/block-map
 /// value representing a zeroed chunk — a hole.
-// First consumer: the hole semantics of the chunked map path
-// (T-025 S04).
-#[expect(dead_code)]
+// Live since T-025 S04: the hole predicate of the chunked walk —
+// both the 4B block-map and the 8B chunk-index arms (data.c:157/168).
 pub(super) const NULL_ADDR: u32 = u32::MAX;
 
 #[cfg(ktest)]
@@ -726,6 +830,7 @@ mod tests {
     use super::*;
     use crate::fs::fs_impls::erofs::{
         Erofs,
+        fs::DeviceTable,
         test_utils::{
             ErofsMemoryDisk, ktest_data_geometry, ktest_flat_geometry, ktest_flatdev_table,
             ktest_fs_on, ktest_single_device_table, ktest_super_block,
@@ -744,6 +849,60 @@ mod tests {
             geom,
             npages,
         )
+    }
+
+    /// A chunked-geometry backend over a fresh memory disk and the
+    /// given device table (the S03-IF-5/6/9 fixture form): the disk
+    /// comes back for table staging (two pages — the extent areas
+    /// sit past the 4 KiB mark to exercise the align_up), the fs
+    /// handle must outlive the queries (the 8B mask fetch upgrades
+    /// the Weak).
+    fn ktest_chunk_backend(
+        table: DeviceTable,
+        size: u64,
+        unit: usize,
+        chunkbits: u32,
+        inline_data_start: u64,
+    ) -> (Arc<ErofsMemoryDisk>, Arc<Erofs>, DataBackend) {
+        let disk = Arc::new(ErofsMemoryDisk::new(2 * PAGE_SIZE));
+        let fs = ktest_fs_on(disk.clone(), ktest_super_block(12, 0), table);
+        let geom = ktest_data_geometry(
+            size,
+            12,
+            0,
+            false,
+            inline_data_start,
+            Some(ChunkGeometry {
+                unit,
+                chunkbits,
+            }),
+            false,
+        );
+        let npages = size.div_ceil(PAGE_SIZE as u64) as usize;
+        let backend = DataBackend::new(
+            fs.self_ref().clone(),
+            fs.block_device().clone(),
+            geom,
+            npages,
+        );
+        (disk, fs, backend)
+    }
+
+    /// Stages one 8-byte chunk-index record at `pos` in the little-
+    /// endian on-disk form (`advise`, `device_id`, `blkaddr`) — the
+    /// bytes `read_val::<RawInodeChunkIndex>` parses back.
+    fn stage_chunk_index(
+        disk: &ErofsMemoryDisk,
+        pos: usize,
+        advise: u16,
+        device_id: u16,
+        blkaddr: u32,
+    ) {
+        let mut bytes = [0u8; 8];
+        bytes[..2].copy_from_slice(&advise.to_le_bytes());
+        bytes[2..4].copy_from_slice(&device_id.to_le_bytes());
+        bytes[4..].copy_from_slice(&blkaddr.to_le_bytes());
+        disk.stage_bytes(pos, &bytes);
     }
 
     /// S03-IF-1/S03-IF-10 (anchor `docs/T-014/S03/index.md` §10): the
@@ -951,6 +1110,242 @@ mod tests {
         // Guard order: even a post-EOF la sees the compressed arm.
         let err = backend.map_blocks(1 << 40, PAGE_SIZE as u64).unwrap_err();
         assert_eq!(err.error(), Errno::EOPNOTSUPP);
+    }
+
+    /// S03-IF-5 (anchor `docs/T-014/S03/index.md` §10): the chunk 4B
+    /// block-map arm — NULL_ADDR → hole (flags empty, deterministic
+    /// zeros), blkaddr → MAPPED (pa = blkaddr << bsb), the
+    /// chunk-aligned m_la write-back (a mid-chunk query la maps from
+    /// the chunk start), and the last-chunk clamp of m_plen; the 8B
+    /// layout run over the SAME chunk slots must produce the
+    /// identical mapping (the same-slot comparison half; only the
+    /// extent-area encoding differs).
+    #[ktest]
+    fn map_blocks_chunk_4b_block_map() {
+        const BS: u64 = 4096;
+        const CHUNK: u64 = 2 * BS; // chunkbits = 13
+        // inline_data_start = 4000 is 4-misaligned: extent_base(4) =
+        // 4004 (the IF-9 unaligned corner rides along).
+        let (disk, _fs, backend) =
+            ktest_chunk_backend(ktest_single_device_table(), 5 * BS + 100, 4, 13, 4000);
+        // Table: chunk 0 → block 100, chunk 1 → hole, chunk 2 →
+        // block 200.
+        disk.stage_bytes(4004, &100u32.to_le_bytes());
+        disk.stage_bytes(4008, &NULL_ADDR.to_le_bytes());
+        disk.stage_bytes(4012, &200u32.to_le_bytes());
+
+        // MAPPED over chunk 0: la 0, a mid-chunk la, and the last
+        // byte of the chunk all share chunknr 0 — the write-back
+        // moves m_la below every query la but 0.
+        for la in [0u64, 100, CHUNK - 1] {
+            let m = backend.map_blocks(la, PAGE_SIZE as u64).unwrap();
+            assert_eq!(m.m_flags, MapFlags::MAPPED, "la={la}");
+            assert_eq!(m.m_la, 0, "chunk-aligned write-back, la={la}");
+            assert_eq!(m.m_pa, 100 << 12, "pa formula, la={la}");
+            assert_eq!(m.m_plen, CHUNK, "plen = the chunk length, la={la}");
+            assert_eq!(m.m_llen, m.m_plen, "M8, la={la}");
+            assert_eq!(m.m_deviceid, 0, "no device_id field (C5), la={la}");
+        }
+        // Hole over chunk 1: flags empty, the zeros, and the SAME
+        // chunk-long plen (the hole still spans the whole chunk).
+        for la in [CHUNK, CHUNK + 37] {
+            let m = backend.map_blocks(la, PAGE_SIZE as u64).unwrap();
+            assert_eq!(m.m_flags, MapFlags::empty(), "la={la}");
+            assert_eq!(m.m_la, CHUNK, "write-back, la={la}");
+            assert_eq!(m.m_plen, CHUNK, "hole spans the chunk, la={la}");
+            assert_eq!(m.m_llen, m.m_plen, "M8, la={la}");
+            assert_eq!(m.m_pa, 0, "la={la}");
+            assert_eq!(m.m_deviceid, 0, "la={la}");
+        }
+        // The last chunk: the remainder 4106 rounds up to exactly
+        // one chunk — no clamp here.
+        let m = backend.map_blocks(2 * CHUNK + 37, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_flags, MapFlags::MAPPED);
+        assert_eq!(m.m_la, 2 * CHUNK);
+        assert_eq!(m.m_pa, 200 << 12);
+        assert_eq!(m.m_plen, CHUNK);
+        assert_eq!(m.m_llen, m.m_plen);
+
+        // The last-chunk clamp (chunkbits = 14 → 4-block chunks,
+        // extent_base at an aligned 4100): the final chunk of the
+        // same size carries only 4106 bytes → m_plen clamps to the
+        // block-rounded remainder 8192 < 16384, while chunk 0 keeps
+        // the full chunk length.
+        let (disk, _fs, big) =
+            ktest_chunk_backend(ktest_single_device_table(), 5 * BS + 100, 4, 14, 4100);
+        disk.stage_bytes(4100, &100u32.to_le_bytes());
+        disk.stage_bytes(4104, &200u32.to_le_bytes());
+        let m = big.map_blocks(0, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_plen, 4 * BS, "an interior chunk keeps the full length");
+        let m = big.map_blocks(4 * BS, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_flags, MapFlags::MAPPED);
+        assert_eq!(m.m_la, 4 * BS);
+        assert_eq!(m.m_pa, 200 << 12);
+        assert_eq!(m.m_plen, 2 * BS, "the last chunk clamps to round_up(4106)");
+        assert_eq!(m.m_llen, m.m_plen);
+
+        // The same-slot 8B comparison: identical chunk slots through
+        // the 8-byte index encoding (ids 4000 is 8-aligned — a
+        // different extent base than the 4B run, the mapping must
+        // not care).
+        let (disk, _fs, indexed) =
+            ktest_chunk_backend(ktest_single_device_table(), 5 * BS + 100, 8, 13, 4000);
+        stage_chunk_index(&disk, 4000, 0, 0, 100);
+        stage_chunk_index(&disk, 4008, 0, 0, NULL_ADDR);
+        stage_chunk_index(&disk, 4016, 0, 0, 200);
+        for la in [0u64, 100, CHUNK - 1, CHUNK, CHUNK + 37, 2 * CHUNK + 37] {
+            let four = backend.map_blocks(la, PAGE_SIZE as u64).unwrap();
+            let eight = indexed.map_blocks(la, PAGE_SIZE as u64).unwrap();
+            assert_eq!(eight.m_flags, four.m_flags, "same-slot parity, la={la}");
+            assert_eq!(eight.m_la, four.m_la, "la={la}");
+            assert_eq!(eight.m_pa, four.m_pa, "la={la}");
+            assert_eq!(eight.m_plen, four.m_plen, "la={la}");
+            assert_eq!(eight.m_llen, four.m_llen, "la={la}");
+            assert_eq!(eight.m_deviceid, four.m_deviceid, "la={la}");
+        }
+    }
+
+    /// S03-IF-6 (anchor S03 §10): the chunk 8B index arm — NULL →
+    /// hole regardless of the device id; a value → MAPPED with
+    /// `m_deviceid = device_id & mask`: mask = 0 silently folds
+    /// every id onto the primary device (MD7 — the mechanism is the
+    /// arithmetic itself, no branch), mask ≠ 0 keeps the masked
+    /// value (the flatdev extra=1 → mask=1 form). The `advise`
+    /// field is staged non-zero in one entry and must not disturb
+    /// anything (read, never consumed — RD2①).
+    #[ktest]
+    fn map_blocks_chunk_8b_device_mask() {
+        const CHUNK: u64 = 2 * 4096;
+        // mask = 0 (single-device table): ids 7 and 5 both fold to 0.
+        let (disk, _fs, backend) =
+            ktest_chunk_backend(ktest_single_device_table(), 3 * CHUNK, 8, 13, 4000);
+        stage_chunk_index(&disk, 4000, 0, 7, 10);
+        stage_chunk_index(&disk, 4008, 0, 7, NULL_ADDR);
+        stage_chunk_index(&disk, 4016, 0, 5, 20);
+        let m = backend.map_blocks(0, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_flags, MapFlags::MAPPED);
+        assert_eq!(m.m_deviceid, 0, "mask=0 folds id 7 onto the primary device");
+        assert_eq!(m.m_pa, 10 << 12);
+        // NULL wins over any device id: the hole arm.
+        let m = backend.map_blocks(CHUNK, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_flags, MapFlags::empty());
+        assert_eq!(m.m_deviceid, 0);
+        assert_eq!(m.m_plen, CHUNK);
+        let m = backend.map_blocks(2 * CHUNK, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_deviceid, 0, "mask=0 folds id 5");
+        assert_eq!(m.m_pa, 20 << 12);
+        assert_eq!(m.m_llen, m.m_plen);
+
+        // mask = 1 (flatdev extra=1): the masked values ride along
+        // for map_dev to resolve later.
+        let table = ktest_flatdev_table(&[(10, 100)], 1);
+        let (disk, _fs, backend) = ktest_chunk_backend(table, 4 * CHUNK, 8, 13, 4000);
+        stage_chunk_index(&disk, 4000, 0, 1, 10); // 1 & 1 = 1
+        stage_chunk_index(&disk, 4008, 0, 5, 20); // 5 & 1 = 1
+        stage_chunk_index(&disk, 4016, 0, 2, 30); // 2 & 1 = 0
+        stage_chunk_index(&disk, 4024, 3, 3, 40); // 3 & 1 = 1, advise ignored
+        for (la, want_id, want_pa) in [
+            (0u64, 1u16, 10u64 << 12),
+            (CHUNK, 1, 20 << 12),
+            (2 * CHUNK, 0, 30 << 12),
+            (3 * CHUNK, 1, 40 << 12),
+        ] {
+            let m = backend.map_blocks(la, PAGE_SIZE as u64).unwrap();
+            assert_eq!(m.m_flags, MapFlags::MAPPED, "la={la}");
+            assert_eq!(m.m_deviceid, want_id, "la={la}");
+            assert_eq!(m.m_pa, want_pa, "la={la}");
+            assert_eq!(m.m_llen, m.m_plen, "M8, la={la}");
+        }
+    }
+
+    /// S03-IF-9 (anchor S03 §10): the extent-area base point —
+    /// `align_up(inline_data_start, unit)` over the {misaligned,
+    /// aligned} × {unit 4, 8} grid, both as the pure helper formula
+    /// and wired through the chunk branch: the candidate area is
+    /// 0xFF-filled (any base drift reads 0xFF… = NULL_ADDR and maps
+    /// a hole), sentinels land only at `base + unit × chunknr`, so
+    /// a MAPPED hit proves the exact entry position — chunknr
+    /// scaling included.
+    #[ktest]
+    fn map_blocks_chunk_extent_base_grid() {
+        // The pure formula: 4002 is misaligned for both widths,
+        // 4008 is aligned for both.
+        for (ids, unit, want) in [
+            (4002u64, 4usize, 4004u64),
+            (4002, 8, 4008),
+            (4008, 4, 4008),
+            (4008, 8, 4008),
+        ] {
+            let geom = ktest_data_geometry(
+                3 * 2 * 4096,
+                12,
+                0,
+                false,
+                ids,
+                Some(ChunkGeometry {
+                    unit,
+                    chunkbits: 13,
+                }),
+                false,
+            );
+            let backend = ktest_null_backend(geom);
+            assert_eq!(backend.extent_base(unit), want, "ids={ids} unit={unit}");
+        }
+
+        // Wired through the branch, both widths over one disk: the
+        // 4B sentinels (base 4004) and the 8B sentinels (base 4008)
+        // occupy disjoint byte ranges of the 0xFF-filled area.
+        let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
+        let fs = ktest_fs_on(
+            disk.clone(),
+            ktest_super_block(12, 0),
+            ktest_single_device_table(),
+        );
+        let mk_backend = |unit: usize| {
+            let geom = ktest_data_geometry(
+                3 * 2 * 4096,
+                12,
+                0,
+                false,
+                4002,
+                Some(ChunkGeometry {
+                    unit,
+                    chunkbits: 13,
+                }),
+                false,
+            );
+            DataBackend::new(
+                fs.self_ref().clone(),
+                fs.block_device().clone(),
+                geom,
+                6,
+            )
+        };
+        let backend4 = mk_backend(4);
+        let backend8 = mk_backend(8);
+        disk.stage_bytes(4000, &[0xffu8; 32]);
+        disk.stage_bytes(4008, &500u32.to_le_bytes()); // 4B chunknr 1
+        disk.stage_bytes(4012, &600u32.to_le_bytes()); // 4B chunknr 2
+        stage_chunk_index(&disk, 4016, 0, 0, 500); // 8B chunknr 1
+        stage_chunk_index(&disk, 4024, 0, 0, 600); // 8B chunknr 2
+        for (la, blk) in [(2 * 4096u64, 500u64), (4 * 4096, 600)] {
+            let m4 = backend4.map_blocks(la + 5, PAGE_SIZE as u64).unwrap();
+            assert_eq!(m4.m_flags, MapFlags::MAPPED, "unit=4 la={la}");
+            assert_eq!(
+                m4.m_pa,
+                blk << 12,
+                "entry read at base+unit*chunknr, unit=4 la={la}"
+            );
+            assert_eq!(m4.m_la, la, "write-back, unit=4 la={la}");
+            let m8 = backend8.map_blocks(la + 5, PAGE_SIZE as u64).unwrap();
+            assert_eq!(m8.m_flags, MapFlags::MAPPED, "unit=8 la={la}");
+            assert_eq!(
+                m8.m_pa,
+                blk << 12,
+                "entry read at base+unit*chunknr, unit=8 la={la}"
+            );
+            assert_eq!(m8.m_la, la, "write-back, unit=8 la={la}");
+        }
     }
 
     /// S04-IF-1 (anchor `docs/T-014/S04/index.md` §9): the identity
