@@ -103,8 +103,20 @@ use ostd::{const_assert, mm::VmIo};
 // visibility-form precedent `virtiofs/inode/page_cache.rs:175`,
 // re-export precedent `ext2/inode/block_manager/mod.rs:13`).
 pub(super) use self::data::DataBackend;
+// The ktest fixture face of the geometry names: `test_utils`
+// (T-025 S02) constructs `DataGeometry`/`ChunkGeometry` literals
+// directly. The re-export is cfg-gated because production code
+// consumes the names only inside this module — the plain `use`
+// below carries the non-ktest builds, and an ungated
+// `pub(super) use` would have no non-ktest reader and would trip
+// `unused_imports` under `make check` (the same reason S01 left
+// the re-export unlanded).
+#[cfg(ktest)]
+pub(super) use self::data::{ChunkGeometry, DataGeometry};
+#[cfg(not(ktest))]
+use self::data::{ChunkGeometry, DataGeometry};
 use self::{
-    data::{ChunkGeometry, DataGeometry, RawInodeChunkIndex},
+    data::RawInodeChunkIndex,
     symlink::{is_fast_symlink, read_inline_target},
 };
 use super::{fs::Erofs, prelude::*, super_block::SuperBlock};

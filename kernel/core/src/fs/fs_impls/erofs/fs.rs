@@ -635,13 +635,33 @@ impl Erofs {
     /// `Erofs`/`DeviceTable` are only visible inside this module.
     /// The real image-builder fixture (staged disk bytes + `open`)
     /// lands with T-027; until then no ktest may assume readable
-    /// device content.
+    /// device content (the data-path suites use `ktest_new_with`
+    /// with an explicit in-memory disk instead).
     #[cfg(ktest)]
     pub(super) fn ktest_new(super_block: SuperBlock) -> Arc<Self> {
-        Arc::new_cyclic(|weak_self| Self {
-            block_device: Arc::new(super::test_utils::ErofsNullDevice),
+        Self::ktest_new_with(
+            Arc::new(super::test_utils::ErofsNullDevice),
             super_block,
-            device_table: DeviceTable::single_device(0),
+            DeviceTable::single_device(0),
+        )
+    }
+
+    /// The extended ktest constructor behind [`Erofs::ktest_new`]
+    /// (T-025 S02): an explicit backing device and device table —
+    /// the data-path fixtures pair the in-memory disk with crafted
+    /// flatdev tables. Everything else takes the same defaults as
+    /// `ktest_new`; handle-derived paths behave identically to
+    /// `open`-assembled mounts.
+    #[cfg(ktest)]
+    pub(super) fn ktest_new_with(
+        block_device: Arc<dyn BlockDevice>,
+        super_block: SuperBlock,
+        device_table: DeviceTable,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| Self {
+            block_device,
+            super_block,
+            device_table,
             mount_options: RwMutex::new(ErofsMountOptions::default()),
             flags: AtomicFsFlags::new(FsFlags::RDONLY),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
@@ -1044,6 +1064,35 @@ impl DeviceTable {
             slots: Vec::new(),
             total_blocks,
             device_id_mask: 0,
+        }
+    }
+
+    /// Direct ktest construction (T-025 S02): every field is a knob
+    /// so the crafted-table vectors of the map-dev suite (S04-IF-2/3:
+    /// extra=1/mask=1 and extra=2/mask=3, mirroring
+    /// `roundup_pow_of_two(extra + 1) - 1`) bypass the V10 scan
+    /// without crafting on-disk slots. `slots` are
+    /// `(blocks, mapped_blkaddr)` pairs addressed 1-based by
+    /// `slot(id)` — `slots[0]` is extra device 1. `total_blocks`
+    /// collapses to 0: only the statfs path reads it, and the
+    /// data-path fixtures never call statfs.
+    ///
+    /// Lives here (not in `test_utils`) because the fields are
+    /// only visible inside this module, exactly like
+    /// [`Erofs::ktest_new_with`].
+    #[cfg(ktest)]
+    pub(super) fn ktest_new(flatdev: bool, slots: &[(u32, u32)], device_id_mask: u32) -> Self {
+        Self {
+            flatdev,
+            slots: slots
+                .iter()
+                .map(|&(blocks, mapped_blkaddr)| DeviceSlot {
+                    blocks,
+                    mapped_blkaddr,
+                })
+                .collect(),
+            total_blocks: 0,
+            device_id_mask,
         }
     }
 
