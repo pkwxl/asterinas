@@ -66,8 +66,10 @@ impl FileOps for ErofsInode {
 
 impl Inode for ErofsInode {
     fn size(&self) -> usize {
-        // Interim shape: the placeholder root is an empty directory;
-        // real sizes come from the decoded descriptors (T-022/T-024).
+        // Interim shape: sizes stay zero until the metadata assembly
+        // lands (T-024); the transitional handle already carries the
+        // decoded descriptor, but this trait face does not read it
+        // yet.
         0
     }
 
@@ -76,10 +78,11 @@ impl Inode for ErofsInode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        // Interim shape: fields come from the decoded descriptor once
-        // T-022/T-024 land; the placeholder reports an empty
-        // read-only directory owned by root. Erofs records no birth
-        // time on disk, so `birth_at: None` is final.
+        // Interim shape: the metadata assembly reads the descriptor
+        // with T-024; until then this reports an empty read-only
+        // directory owned by root (ino/type_ are already real — they
+        // derive from the transitional handle). Erofs records no
+        // birth time on disk, so `birth_at: None` is final.
         let fs = self.fs()?;
         let nr_hard_links = if self.type_() == InodeType::Dir { 2 } else { 1 };
         Ok(Metadata {
@@ -111,7 +114,7 @@ impl Inode for ErofsInode {
 
     fn mode(&self) -> Result<InodeMode> {
         // Interim shape: 0555 — a read-only directory — until the
-        // decoded descriptor lands (T-022/T-024).
+        // metadata assembly lands (T-024).
         Ok(InodeMode::from_bits_truncate(0o555))
     }
 
@@ -120,8 +123,8 @@ impl Inode for ErofsInode {
     }
 
     fn owner(&self) -> Result<Uid> {
-        // Interim shape: root-owned until the decoded descriptor
-        // lands (T-022/T-024).
+        // Interim shape: root-owned until the metadata assembly
+        // lands (T-024).
         Ok(Uid::new_root())
     }
 
@@ -138,8 +141,8 @@ impl Inode for ErofsInode {
     }
 
     fn atime(&self) -> Duration {
-        // Interim shape: the decoded timestamps land with
-        // T-022/T-024.
+        // Interim shape: the decoded timestamps land with the
+        // metadata assembly (T-024).
         Duration::ZERO
     }
 
