@@ -148,6 +148,17 @@ bitflags! {
 /// `struct erofs_map_blocks` (internal.h:330-339). Not carried:
 /// `buf`/`mpage` (no cross-call metabuf, S02-D1/D2) and
 /// `m_algorithmformat` (set only by zmap, archive A).
+// Dead-code ledger (staged landing): the S03 map layer constructs
+// this record but only writes it — the field readers land with the
+// S05 submit_read_bio dispatch (m_flags/m_pa/m_plen) and the S07
+// DIO copy; until then the ktest assertions are the only readers
+// and they are compiled out of regular builds. Struct-level rather
+// than the per-field super_block.rs form because all six fields
+// flip live at the same S05 milestone; the `cfg_attr` form keeps
+// the ktest cfg clean of an unfulfilled `expect` (utils.rs
+// precedent). The expect half fires `unfulfilled` once the first
+// regular-build reader lands — the removal prompt.
+#[cfg_attr(not(ktest), expect(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapBlocks {
     /// Logical start. Input echo, except the CHUNK_BASED branch
@@ -262,6 +273,18 @@ impl DataBackend {
     /// branch then reports `m_plen == 0` (linux iomap patches this up
     /// at its own layer, data.c:318-319 — aster callers never pass
     /// 0).
+    // Dead-code ledger (staged landing): the S03-IF suite below is
+    // the only caller until the production consumers land (the S05
+    // submit_read_bio rewrite, then S07 DIO / S08 read_at) — the
+    // suite is compiled out of regular builds, so the map face needs
+    // this root to stay lint-clean there. The `cfg_attr` form, not a
+    // bare `expect`, because the ktest cfg keeps this item live and
+    // a bare `expect` would only be reported unfulfilled there (the
+    // utils.rs precedent). Root semantics: `MapBlocks` and
+    // `map_blocks_flatmode` follow this item's liveness. The expect
+    // half fires `unfulfilled` the moment the S05 consumer lands —
+    // the removal prompt.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn map_blocks(&self, m_la: u64, m_llen: u64) -> Result<MapBlocks> {
         // (a) Layer-3 defensive half (I12; S01-D3 bool snapshot) —
         //     the SINGLE carrying point of the compressed rejection:
@@ -413,6 +436,15 @@ impl DataBackend {
     /// resolved pa, data.c:328) and, vacuously, the empty state
     /// (holes keep `m_deviceid == 0`, so the call is the identity
     /// and the pa is unused).
+    // Dead-code ledger (staged landing, same form as `map_blocks`
+    // above): ktest-suite-only caller until S05/S07/S08; the
+    // `cfg_attr` form keeps the ktest cfg clean of an unfulfilled
+    // `expect`. Root semantics: `upgrade_fs` below, the `fs` field it
+    // reads, and the `Erofs::device_table` / `DeviceTable::flatdev`
+    // / `slot` accessors (fs.rs) all follow this item's liveness in
+    // regular builds. The expect half fires `unfulfilled` when the
+    // first production consumer lands — the removal prompt.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn map_dev(&self, m_pa: u64, m_deviceid: u16) -> Result<u64> {
         // AUTO-TODO(G-M16): Linux sets the backing device's logical block size
         // at mount and switches to a larger one when the superblock demands it
@@ -736,11 +768,11 @@ mod tests {
         let las = |size: u64, lastblk_pos: u64| {
             vec![0, 1, BS - 1, BS, lastblk_pos - 1]
                 .into_iter()
-                .filter(|&la| la < lastblk_pos && la < size)
+                .filter(move |&la| la < lastblk_pos && la < size)
                 .chain(
                     [lastblk_pos / 2]
                         .into_iter()
-                        .filter(|&la| la < lastblk_pos && la < size),
+                        .filter(move |&la| la < lastblk_pos && la < size),
                 )
         };
         for &(size, tail_inline, raw) in cases {
@@ -766,7 +798,11 @@ mod tests {
             }
             // The no-clamp pin: the last MAPPED extent of a partial
             // final block reaches past i_size to the block end.
-            if size % BS != 0 {
+            // FLAT_PLAIN only — the inline family is excluded: its
+            // flat MAPPED segment ends at lastblk_pos < i_size by
+            // construction (the tail block is the META extent, not
+            // part of the flat run), so the pin is vacuous there.
+            if size % BS != 0 && !tail_inline {
                 let m = backend.map_blocks(0, PAGE_SIZE as u64).unwrap();
                 assert!(
                     m.m_plen > size,
