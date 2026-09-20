@@ -31,8 +31,9 @@
  *     oversize value first), and the registered W-X05/W-X01 residues
  *     (lazy reader -> path error first; kernel-range value pointer;
  *     trusted-no-cap EPERM);
- *   - fd variant gates on MNT: EBADF, W-X04 pipe-fd EINVAL and
- *     O_PATH-fd EBADF (both registered differences);
+ *   - fd variant gates on MNT: EBADF, W-X04 pipe-fd EOPNOTSUPP
+ *     (erratum T-024/S06 round 3 -- see the header note below) and
+ *     O_PATH-fd EBADF (registered difference);
  *   - nouser_xattr gate on a self-mounted BASE (X3 EOPNOTSUPP for
  *     user.*, trusted./security. unaffected, X4 list filtering);
  *   - form faces on self-mounted modulated images: C8 = -x0
@@ -81,6 +82,21 @@
  * T-016/S01 sec. 3.4/3.6 (hosts, names, values, chmod/chown faces);
  * image variants T-016/S02 sec. 2 (C8/C9/C10 mkfs forms; digest-pinned
  * by T-018).
+ *
+ * One first-ATTACH erratum is recorded inline (T-024/S06 round 3),
+ * a premise correction at the framework level with the erofs side
+ * uninvolved (not observed-behavior masking): the W-X04 sample 17
+ * pipe-fd expectation read EINVAL, but the registered difference
+ * itself does not exist -- aster's pipe ends ARE InodeHandles
+ * (kernel/core/src/fs/pipe/anon_pipe.rs new_file_pair), so the fd
+ * gate in lookup_path_for_xattr passes and AnonPipeInode keeps the
+ * Inode::get_xattr trait default EOPNOTSUPP -- the same errno Linux
+ * answers (pipefs has no s_xattr). The EINVAL registration was a
+ * code-reading blind spot of the R-01 survey (it assumed a
+ * non-inode-backed fd would hit as_inode_handle_or_err's EINVAL);
+ * every historical boot had this test SKIPped (T-020/S18, S19,
+ * T-021/S04, T-023/S09), so the premise had never been exercised
+ * until the T-024/S04 INIT_MNT activation.
  */
 
 #include "erofs_common.h"
@@ -732,9 +748,14 @@ END_TEST()
 /*
  * Matrix sec. 6.1 row 1 fd face + sec. 6.6 W-X04 (registered
  * differences), on MNT: an invalid fd answers EBADF (parity); a pipe
- * fd answers EINVAL where Linux answers EOPNOTSUPP (pipefs has no
- * s_xattr); an O_PATH fd on an erofs file answers EBADF where Linux
- * performs the get normally.
+ * fd answers EOPNOTSUPP -- ERRATUM (T-024/S06 round 3): the W-X04
+ * sample 17 registration (aster EINVAL vs Linux EOPNOTSUPP) was a
+ * survey-time code-reading blind spot; aster's pipe ends are
+ * InodeHandles, so the fd gate passes and the Inode::get_xattr
+ * trait default answers EOPNOTSUPP -- the parity errno, the
+ * registered difference does not exist; an O_PATH fd on an erofs
+ * file answers EBADF where Linux performs the get normally (that
+ * sample's registration stands, setxattr.rs O_PATH gate).
  */
 FN_TEST(xattr_fd_variant_gates)
 {
@@ -747,10 +768,10 @@ FN_TEST(xattr_fd_variant_gates)
 	/* Entry row 1: invalid fd -> EBADF. */
 	TEST_ERRNO(fgetxattr(-1, "user.x", buf, sizeof(buf)), EBADF);
 
-	/* W-X04 sample 17 (登记差异): pipe fd -> EINVAL (Linux
-	 * EOPNOTSUPP). */
+	/* W-X04 sample 17 (ERRATUM, T-024/S06 round 3): pipe fd ->
+	 * EOPNOTSUPP, parity (see the header erratum note). */
 	TEST_SUCC(pipe(pfd));
-	TEST_ERRNO(fgetxattr(pfd[0], "user.x", buf, sizeof(buf)), EINVAL);
+	TEST_ERRNO(fgetxattr(pfd[0], "user.x", buf, sizeof(buf)), EOPNOTSUPP);
 	TEST_SUCC(close(pfd[0]));
 	TEST_SUCC(close(pfd[1]));
 
