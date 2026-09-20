@@ -41,9 +41,12 @@
 //! SEEK_END anchor (`seek_end`) live on the handle below, the
 //! unified `read_link` exit in `inode/symlink.rs`, and the `read_at`
 //! guard positions in `inode/file.rs` (the data body itself is
-//! T-025). The namei/dir faces and the VFS dispatch rewrite are the
-//! remaining subtasks of T-024; until the rewrite lands, the VFS
-//! adapter keeps its transitional answers.
+//! T-025). Since T-024 S03 both dirent walks live in `inode/dir.rs`
+//! — the namei binary search (lookup) and the getdents iteration
+//! (readdir), kept apart by the two-strictness-domains contract of
+//! that module. The VFS dispatch rewrite is the remaining subtask of
+//! T-024; until it lands, the VFS adapter keeps its transitional
+//! answers.
 //!
 //! # Submodules
 //!
@@ -52,7 +55,7 @@
 //! | `mod`     | The inode handle, payload assembly, and decoding (T-022 + T-024) |
 //! | `data`    | Minimal flat page-cache backend; final mapping (T-025)           |
 //! | `file`    | `read_at` guards; the data body lands with T-025                  |
-//! | `dir`     | Dirent decoding and name lookup (T-024)                          |
+//! | `dir`     | Both dirent walks: namei lookup + getdents (T-024 S03)           |
 //! | `symlink` | Fast/slow split, inline target reads, `read_link` (T-024)         |
 //!
 //! # Locking
@@ -262,11 +265,12 @@ impl Inode {
     /// Data-backed page-cache view; `None` for every other payload
     /// (the Some/None mapping is locked by the S02 §2.6 table:
     /// DataBacked only).
-    // First consumer: the directory walks (S03, T-024); the
-    // dispatch face joins with S05. (The slow-symlink read arm
-    // matches the payload field in place instead of going through
-    // this Option face — the S04 §4.1 terminal sample.)
-    #[expect(dead_code)]
+    // Live since T-024 S03: both directory walks (the namei binary
+    // search and the getdents iteration in `inode/dir.rs`) read
+    // through this face; the dispatch face joins with S05. (The
+    // slow-symlink read arm matches the payload field in place
+    // instead of going through this Option face — the S04 §4.1
+    // terminal sample.)
     pub(super) fn page_cache(&self) -> Option<&PageCache> {
         match &self.payload {
             InodePayload::DataBacked { page_cache, .. } => Some(page_cache),
