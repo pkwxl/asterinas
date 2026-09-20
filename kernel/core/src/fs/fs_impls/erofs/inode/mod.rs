@@ -11,12 +11,14 @@
 //! half is complete —
 //! the two raw inode records (`RawInodeCompact` 32B /
 //! `RawInodeExtended` 64B, sharing the discriminating prefix at
-//! offsets 0/2/4/16), the chunk-domain records (`RawInodeChunkInfo`,
-//! a registration-only host for its layout assertions, and
-//! `RawInodeChunkIndex` for element-wise reads), the `i_format` bit
+//! offsets 0/2/4/16), the chunk-domain record `RawInodeChunkInfo`
+//! (a registration-only host for its layout assertions; the
+//! element-wise `RawInodeChunkIndex` lives in `inode/data.rs` since
+//! T-025 S01), the `i_format` bit
 //! family with the two extraction helpers and the entry's
 //! `parse_i_format` validation, the inode-domain constants — 13 + 15
-//! + 4 + 5 layout assertions in total — plus the four vocabulary
+//! + 4 layout assertions here (5 more moved with the chunk index) —
+//! plus the four vocabulary
 //! enums (`InodeVersion`, `DataLayout`, `FileKind`, `AddrState`),
 //! the decoded `InodeDesc` mirror with its 13-field set, the
 //! `xattr_ibody_size` helper, the dual `TryFrom` decode with the
@@ -34,8 +36,9 @@
 //! (S02-R1: compressed REG/DIR/LNK fail iget with EOPNOTSUPP,
 //! uncached and replayed on every call) and the fast/slow symlink
 //! split (the judgement and the inline-target read live in
-//! `inode/symlink.rs`); the data backend is the minimal flat face in
-//! `inode/data.rs` (final mapping shape lands with T-025). Since
+//! `inode/symlink.rs`); the data backend in `inode/data.rs` carries
+//! the final data geometry since T-025 S01 (the mapping faces land
+//! with the remaining slices). Since
 //! T-024 S02 the cross-seven-kind inherent faces are in place: the
 //! statx assembly (`metadata`), the open dispatch (`open`), and the
 //! SEEK_END anchor (`seek_end`) live on the handle below, the
@@ -53,7 +56,7 @@
 //! | Submodule | Responsibility                                                   |
 //! |-----------|------------------------------------------------------------------|
 //! | `mod`     | The inode handle, payload assembly, and decoding (T-022 + T-024) |
-//! | `data`    | Minimal flat page-cache backend; final mapping (T-025)           |
+//! | `data`    | Flat page-cache backend on the final geometry (T-025)           |
 //! | `file`    | `read_at` guards; the data body lands with T-025                  |
 //! | `dir`     | Both dirent walks: namei lookup + getdents (T-024 S03)           |
 //! | `symlink` | Fast/slow split, inline target reads, `read_link` (T-024)         |
@@ -101,7 +104,7 @@ use ostd::{const_assert, mm::VmIo};
 // re-export precedent `ext2/inode/block_manager/mod.rs:13`).
 pub(super) use self::data::DataBackend;
 use self::{
-    data::{FlatLayout, InlineTail},
+    data::{ChunkGeometry, DataGeometry, RawInodeChunkIndex},
     symlink::{is_fast_symlink, read_inline_target},
 };
 use super::{fs::Erofs, prelude::*, super_block::SuperBlock};
@@ -548,8 +551,8 @@ pub(super) fn inline_data_start(sb: &SuperBlock, nid: ErofsNid, desc: &InodeDesc
 pub(super) enum InodePayload {
     /// REG / DIR / slow LNK (datalayout ∈ {0, 2, 4}): data reachable
     /// through the framework page cache; mapping mechanics live in
-    /// `inode/data.rs` (minimal flat face since T-024 S01, final
-    /// shape with T-025).
+    /// `inode/data.rs` (final geometry since T-025 S01; the mapping
+    /// faces land with the remaining slices).
     DataBacked {
         page_cache: PageCache,
         /// Ownership root of the data-mapping backend — the page
@@ -649,51 +652,18 @@ impl InodePayload {
     }
 
     /// The REG/DIR/slow-LNK data payload (S02 §2.2): page cache +
-    /// minimal flat backend. The `nid` parameter (beyond the S02 §2.2
-    /// sample signature) feeds the inline-tail geometry, which
-    /// derives from the iloc base — zero behavior change.
+    /// data backend. The `nid` parameter (beyond the S02 §2.2
+    /// sample signature) feeds the geometry collapse, which derives
+    /// from the iloc base — zero behavior change.
     ///
-    /// Minimal flat face — final shape lands with T-025 (§1.1 seam):
-    /// the backend construction parameters are final so T-025
-    /// evolves the type in place without churning this call site.
+    /// Since T-025 S01 the geometry collapse happens once here —
+    /// the private pure function `data_geometry` below — and the
+    /// backend re-derives its flat-region arithmetic from the
+    /// bundle at read time (the consumer-side recompute, per the
+    /// §1.1 seam; the flat_blocks/tail precomputation of the
+    /// T-024 minimal face is gone).
     fn new_data_backed(fs: &Erofs, nid: ErofsNid, desc: &InodeDesc) -> InodePayload {
-        let sb = fs.super_block();
-        let bs = sb.block_size();
-        // 4k-only scope (AR-S01-1/G-M08): the erofs block size, the
-        // BIO `BLOCK_SIZE`, and `PAGE_SIZE` coincide — the
-        // page-granular identity mapping of the minimal backend
-        // rests on this premise, pinned structurally by the mount
-        // gate (blkszbits == 12). The assert documents it at the
-        // only place that relies on the identity.
-        debug_assert_eq!(bs, PAGE_SIZE);
-        // erofs_iblks(i_size) = ceil(size / bs) in block units
-        // (internal.h:222); tailendpacking subtracts the inline
-        // last block (data.c:84). Saturating: a zero-size FLAT_INLINE
-        // inode has iblks == 0 and no readable page at all, so the
-        // 0−1 wrap of the C unsigned arithmetic is clamped instead
-        // (no read can reach either geometry).
-        let iblks = desc.size.div_ceil(bs as u64);
-        let tailendpacking = matches!(desc.datalayout, DataLayout::FlatInline);
-        let flat_blocks = iblks.saturating_sub(u64::from(tailendpacking));
-        // The layout discrimination reads `datalayout` only — the
-        // `addr_state` mirror stays untouched for the T-025 chunk
-        // face (its own first-consumer wave).
-        let layout = match desc.datalayout {
-            DataLayout::FlatPlain | DataLayout::FlatInline => FlatLayout::Flat {
-                raw_blkaddr: u64::from(desc.raw_blkaddr()),
-                flat_blocks,
-                tail: if tailendpacking && desc.size > 0 {
-                    Some(InlineTail {
-                        start: inline_data_start(sb, nid, desc),
-                        len: (desc.size - flat_blocks * bs as u64) as usize,
-                    })
-                } else {
-                    None
-                },
-            },
-            DataLayout::ChunkBased => FlatLayout::Chunked,
-            DataLayout::CompressedFull | DataLayout::CompressedCompact => FlatLayout::Compressed,
-        };
+        let geom = data_geometry(fs.super_block(), nid, desc);
         // Page-cache capacity aligned with the inode size from
         // mount time (ext2 precedent `ext2/inode/mod.rs:614-627`);
         // the npages bound handed to the backend is the same value
@@ -702,7 +672,7 @@ impl InodePayload {
         let backend = Arc::new(DataBackend::new(
             fs.self_ref().clone(),
             fs.block_device().clone(),
-            layout,
+            geom,
             page_cache_size / PAGE_SIZE,
         ));
         let page_cache_backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&backend) as _;
@@ -714,6 +684,56 @@ impl InodePayload {
             page_cache,
             backend,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The geometry collapse (T-025 S01; `docs/T-014/analysis.md` §1.1/
+// §1.2, S01-D2/D3): one private PURE function folding the decoded
+// descriptor plus the superblock geometry into the plain-value
+// bundle `DataGeometry` — zero I/O, zero locks (R1-safe inside the
+// iget critical section), the L3 half of the acyclic L2/L3 edge
+// (rule 5: data.rs never sees the descriptor itself).
+// ---------------------------------------------------------------------------
+
+/// Collapses the desc/sb-derived data geometry of one DataBacked
+/// inode into plain values (S01-D2). Field notes:
+///
+/// - `raw_blkaddr` goes through the ID4 accessor — the kind premise
+///   ({Reg, Dir, Lnk}) holds on every production call site (only
+///   the DataBacked arm of `InodePayload::new` lands here);
+/// - `tail_inline` mirrors the datalayout BIT only and never
+///   predicts whether an inline tail EXISTS: the size=0 and
+///   exact-block-size corners keep the bit set with an empty tail
+///   region (the M2 positioning is arithmetic in the consumer,
+///   context.md risk 2);
+/// - `chunk` carries the Chunked unit (through `chunk_unit()`, the
+///   INDEXES single source) and chunkbits; Flat/Compressed → None;
+/// - `compressed` is the single consumption snapshot of the
+///   layer-3 predicate (S01-D3): `is_data_compressed()` evaluated
+///   once here — the map_blocks entry guard (S03) reads the stored
+///   bit, never re-derives.
+fn data_geometry(sb: &SuperBlock, nid: ErofsNid, desc: &InodeDesc) -> DataGeometry {
+    let chunk = match &desc.addr_state {
+        AddrState::Chunked { bits, .. } => Some(ChunkGeometry {
+            // The INDEXES-bit single source (the derived supply of
+            // T-011 §6.3): the Chunked state always maps to a unit.
+            unit: desc
+                .addr_state
+                .chunk_unit()
+                .expect("the Chunked state always yields a chunk unit"),
+            chunkbits: *bits,
+        }),
+        AddrState::Flat | AddrState::Compressed => None,
+    };
+    DataGeometry {
+        size: desc.size,
+        block_bits: u32::from(sb.blkszbits),
+        raw_blkaddr: desc.raw_blkaddr(),
+        tail_inline: desc.datalayout == DataLayout::FlatInline,
+        inline_data_start: inline_data_start(sb, nid, desc),
+        chunk,
+        compressed: desc.is_data_compressed(),
     }
 }
 
@@ -939,51 +959,10 @@ const_assert!(align_of::<RawInodeChunkInfo>() == 2); // the le16 members pin the
 const_assert!(offset_of!(RawInodeChunkInfo, format) == 0); // erofs_fs.h:137
 const_assert!(offset_of!(RawInodeChunkInfo, reserved) == 2); // erofs_fs.h:138
 
-/// The erofs on-disk chunk index (`erofs_inode_chunk_index`,
-/// linux/fs/erofs/erofs_fs.h:269-273; field semantics single-sourced
-/// in `docs/T-001/analysis.md` §6.7).
-///
-/// The INDEXES=1 extent-area element, read element-wise through
-/// `read_val` (the extent array itself is deliberately not wrapped
-/// in a structure, U3). The INDEXES=0 sibling form is the bare
-/// `__le32[]` block map, registered only through
-/// `BLOCK_MAP_ENTRY_SIZE` below — no structure is fabricated for it
-/// either.
-///
-/// The source-side keep-in-sync assertion against
-/// `z_erofs_lcluster_index` (erofs_fs.h:452-454) is deferred together
-/// with the whole compression family (both sides of the comparison):
-/// landing it now would dangle on an undefined type (the archive-C
-/// compression domain, G-Z01).
-// No deadness attribute — same const_assert liveness rationale as
-// `RawInodeCompact` above.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct RawInodeChunkIndex {
-    /// "always 0, don't care for now" (source comment): carried
-    /// without validation — a non-zero value is silently accepted.
-    pub advise: u16, // @0 __le16
-    /// The back-end storage id, masked at consumption:
-    /// `roundup_pow_of_two(extra_devices + 1) - 1` — on a
-    /// single-device volume the mask folds to 0 with no
-    /// out-of-range error (consumption: T-025).
-    pub device_id: u16, // @2 __le16
-    /// The start block address of this chunk. `== NULL_ADDR` means a
-    /// hole (a zero read); otherwise the physical address is
-    /// `blkaddr * blocksize`. No bounds check — a corrupted address
-    /// only moves the read position or surfaces the device error
-    /// (consumption: T-025).
-    pub blkaddr: u32, // @4 __le32
-}
-
-// Layout triple and per-field offsets (A1), each anchored to
-// linux/fs/erofs/erofs_fs.h; the source-side counterpart of the size
-// assertion is BUILD_BUG_ON at erofs_fs.h:448.
-const_assert!(size_of::<RawInodeChunkIndex>() == 8); // erofs_fs.h:448
-const_assert!(align_of::<RawInodeChunkIndex>() == 4); // the le32 member pins the alignment
-const_assert!(offset_of!(RawInodeChunkIndex, advise) == 0); // erofs_fs.h:270
-const_assert!(offset_of!(RawInodeChunkIndex, device_id) == 2); // erofs_fs.h:271
-const_assert!(offset_of!(RawInodeChunkIndex, blkaddr) == 4); // erofs_fs.h:272
+// The element-wise chunk record `RawInodeChunkIndex` (with its 5
+// layout assertions) and the `NULL_ADDR` hole sentinel live in
+// `inode/data.rs` since T-025 S01 (S01-D6): their only runtime
+// consumers are the map-path reads hosted there.
 
 // ---------------------------------------------------------------------------
 // The i_format bit family and the inode-domain constants (T-011 §2.2;
@@ -1066,11 +1045,10 @@ pub(super) const CHUNK_FORMAT_BLKBITS_MASK: u16 = 0x001F;
 /// The chunk-index flag (`EROFS_CHUNK_FORMAT_INDEXES`,
 /// erofs_fs.h:126): extent area made of 8-byte chunk indexes versus a
 /// bare 4-byte blkaddr array.
-// Live since T-022 S06: consumed by `AddrState::chunk_unit` below
-// (itself an `#[expect(dead_code)]` root whose references count); the
-// chunked map path (`inode/data.rs`, T-025) joins through that
-// accessor. The bridging `expect` was removed when the first
-// consumer landed.
+// Live since T-022 S06: consumed by `AddrState::chunk_unit` below —
+// live since T-025 S01 through `data_geometry` (the chunk unit of
+// `ChunkGeometry`); the chunked map path (`inode/data.rs`, S04)
+// joins through the stored unit.
 pub(super) const CHUNK_FORMAT_INDEXES: u16 = 0x0020;
 
 /// The union of the known chunk-format bits
@@ -1081,13 +1059,6 @@ pub(super) const CHUNK_FORMAT_INDEXES: u16 = 0x0020;
 // decode. The bridging `expect` was removed when the first consumer
 // landed.
 pub(super) const CHUNK_FORMAT_ALL: u16 = 0x003F;
-
-/// `EROFS_NULL_ADDR = -1` (erofs_fs.h:263): the chunk-index/block-map
-/// value representing a zeroed chunk — a hole.
-// First consumer: the hole semantics of the chunked map path
-// (`inode/data.rs`, T-025).
-#[expect(dead_code)]
-pub(super) const NULL_ADDR: u32 = u32::MAX;
 
 /// `EROFS_BLOCK_MAP_ENTRY_SIZE = sizeof(__le32)` (erofs_fs.h:266):
 /// the element width of the INDEXES=0 bare block-address array. The
@@ -1333,7 +1304,9 @@ impl From<FileKind> for InodeType {
 // analysis, so the conversions' constructions are already visible
 // and the expectation came out unfulfilled (the standalone probe had
 // predicted the bodies stay invisible — it diverged). The `bits`
-// payload is first read by the T-025 map path.
+// payload is read by the geometry collapse (`data_geometry`,
+// T-025 S01); the map-path dispatch joins through the stored
+// chunkbits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AddrState {
     /// FLAT_PLAIN / FLAT_INLINE: the data start is the `raw_blkaddr`
@@ -1362,14 +1335,15 @@ pub(super) enum AddrState {
 impl AddrState {
     /// The extent element unit of the chunked map path (the derived
     /// supply of `docs/T-011/S03/index.md` §6.3): INDEXES (format
-    /// bit 5) set → `size_of::<RawInodeChunkIndex>()`, otherwise
+    /// bit 5) set → `size_of::<RawInodeChunkIndex>()` (the record
+    /// migrated to `inode/data.rs`, T-025 S01), otherwise
     /// `BLOCK_MAP_ENTRY_SIZE`; `None` outside the chunked state.
     /// `data.rs` takes the unit through this accessor and does not
     /// reference the mod.rs domain constants directly (the
     /// cross-file discipline, T-010 §3.2).
-    // First consumer: the chunked extent walk (`inode/data.rs`,
-    // T-025).
-    #[expect(dead_code)]
+    // Live since T-025 S01: consumed by `data_geometry` (the chunk
+    // unit of `ChunkGeometry`); the chunked extent walk
+    // (`inode/data.rs`, S04) joins through the stored unit.
     pub(super) fn chunk_unit(&self) -> Option<usize> {
         match self {
             Self::Flat | Self::Compressed => None,
@@ -1402,7 +1376,8 @@ impl AddrState {
 /// eight first-consumer expects that came out unfulfilled). Writes
 /// are not reads, though: a field is only live once live code reads
 /// it. `version` (through `inode_isize()`), `datalayout`, `kind`,
-/// `i_u`, `size`, and `xattr_isize` are live through the decode /
+/// `i_u`, `size`, `xattr_isize`, and `addr_state` (read by
+/// `data_geometry` since T-025 S01) are live through the decode /
 /// payload-assembly chain (the iget slow path reads them all since
 /// T-024 S01), while the remaining fields carry their own
 /// `#[expect(dead_code)]` with the first consumer annotated, firing
@@ -1493,8 +1468,9 @@ pub(super) struct InodeDesc {
     // Live since T-022 S07: read by the ID4 accessors below.
     pub(super) i_u: u32,
     /// The D9 discrimination product (see `AddrState`).
-    // First readers: the chunk-unit/bits consumption (T-024/T-025).
-    #[expect(dead_code)]
+    // Live since T-025 S01: read by `data_geometry` (the chunk
+    // geometry supply and the chunk_unit single source); the
+    // map-path dispatch (S03) joins through the stored geometry.
     pub(super) addr_state: AddrState,
     /// The 512-byte-sector accounting — the D12 dual-caliber product
     /// (the formula's single source is the G-Z02 note inside the
@@ -1968,6 +1944,218 @@ pub(super) fn read_inode_desc(
         InodeVersion::Extended => {
             let raw = device.read_val::<RawInodeExtended>(iloc)?;
             InodeDesc::try_from((&raw, datalayout, sb))
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+
+    use super::*;
+    use crate::fs::fs_impls::erofs::test_utils::ktest_super_block;
+
+    /// A knob-complete `InodeDesc` literal for the geometry suites:
+    /// the `ktest_lnk_desc` fixture is LNK-shaped with a fixed Flat
+    /// addr state and a zero `i_u`; the data-geometry vectors need
+    /// the addr-state, kind, and i_u knobs too.
+    fn geometry_desc(
+        version: InodeVersion,
+        datalayout: DataLayout,
+        kind: FileKind,
+        size: u64,
+        xattr_isize: usize,
+        addr_state: AddrState,
+        i_u: u32,
+    ) -> InodeDesc {
+        InodeDesc {
+            version,
+            datalayout,
+            kind,
+            mode: InodeMode::from_bits_truncate(0o644),
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            size,
+            xattr_isize,
+            time: Duration::ZERO,
+            i_u,
+            addr_state,
+            nr_sectors: 0,
+        }
+    }
+
+    /// S01-IF-2 (anchor `docs/T-014/S01/index.md` §9): `data_geometry`
+    /// pointwise over layout {0, 2, 4} × version {C, E}. The
+    /// inline_data_start oracle is pinned by hand — (meta_blkaddr <<
+    /// 12) + (nid << ISLOT_BITS) + inode_isize + xattr_isize with
+    /// meta = 3, nid = 64, blkszbits = 12 (iloc = 14336; compact
+    /// suffix 14368, extended 14400) — not by calling the formula
+    /// family: a circular oracle would pin nothing.
+    #[ktest]
+    fn data_geometry_pointwise_vectors() {
+        use DataLayout::{ChunkBased, FlatInline, FlatPlain};
+        use InodeVersion::{Compact, Extended};
+
+        let sb = ktest_super_block(12, 3);
+        type Case = (
+            InodeVersion,
+            DataLayout,
+            u64,
+            usize,
+            AddrState,
+            u32,
+            bool,
+            u64,
+            Option<(usize, u32)>,
+        );
+        // (version, datalayout, size, xattr_isize, addr_state, i_u,
+        //  exp_tail_inline, exp_inline_data_start, exp_chunk)
+        let cases: &[Case] = &[
+            (Compact, FlatPlain, 10_000, 0, AddrState::Flat, 7, false, 14_368, None),
+            (Compact, FlatInline, 5_000, 32, AddrState::Flat, 9, true, 14_400, None),
+            // The risk-2 corners: tail_inline is the LAYOUT BIT only —
+            // size = 0 (empty tail) and the exact-block size keep the
+            // bit set; existence is consumer arithmetic, not stored.
+            (Compact, FlatInline, 0, 0, AddrState::Flat, 0, true, 14_368, None),
+            (Compact, FlatInline, 4_096, 0, AddrState::Flat, 2, true, 14_368, None),
+            (Extended, FlatPlain, 200_000, 4, AddrState::Flat, 123, false, 14_404, None),
+            (Extended, FlatInline, 1, 0, AddrState::Flat, 5, true, 14_400, None),
+            // Chunked: unit 4 vs 8 by the INDEXES bit, chunkbits =
+            // 12 + (format & 0x1F) as the decode would carry it.
+            (
+                Compact,
+                ChunkBased,
+                1 << 20,
+                0,
+                AddrState::Chunked { format: 0x00, bits: 12 },
+                0x0000,
+                false,
+                14_368,
+                Some((4, 12)),
+            ),
+            (
+                Compact,
+                ChunkBased,
+                1 << 20,
+                0,
+                AddrState::Chunked { format: 0x20, bits: 12 },
+                0x0020,
+                false,
+                14_368,
+                Some((8, 12)),
+            ),
+            (
+                Extended,
+                ChunkBased,
+                1 << 20,
+                0,
+                AddrState::Chunked { format: 0x25, bits: 17 },
+                0x0025,
+                false,
+                14_400,
+                Some((8, 17)),
+            ),
+            (
+                Extended,
+                ChunkBased,
+                1 << 20,
+                0,
+                AddrState::Chunked { format: 0x1F, bits: 43 },
+                0x001F,
+                false,
+                14_400,
+                Some((4, 43)),
+            ),
+        ];
+        for &(ver, dl, size, xattr, st, iu, exp_tail, exp_ids, exp_chunk) in cases {
+            let desc = geometry_desc(ver, dl, FileKind::Reg, size, xattr, st, iu);
+            let geom = data_geometry(&sb, 64, &desc);
+            assert_eq!(geom.size, size, "size (dl = {:?})", dl);
+            assert_eq!(geom.block_bits, 12, "block_bits (dl = {:?})", dl);
+            assert_eq!(geom.raw_blkaddr, iu, "raw_blkaddr (dl = {:?})", dl);
+            assert_eq!(geom.tail_inline, exp_tail, "tail_inline (dl = {:?})", dl);
+            assert_eq!(geom.inline_data_start, exp_ids, "ids (dl = {:?})", dl);
+            assert_eq!(
+                geom.chunk.map(|cg| (cg.unit, cg.chunkbits)),
+                exp_chunk,
+                "chunk (dl = {:?})",
+                dl
+            );
+            assert!(!geom.compressed, "compressed (dl = {:?})", dl);
+        }
+    }
+
+    /// S01-IF-3 (anchor S01 §9): the construction snapshot equals the
+    /// single-source predicate on its whole production domain
+    /// (REG/DIR/LNK × every datalayout — the compressed rows are the
+    /// bypass-the-assembly-gate pure-function form: the real I12
+    /// gate rejects them before construction), and the predicate
+    /// matches the T-013 §1.2 table over the full seven-kind ×
+    /// five-datalayout grid. The special-file rows assert the
+    /// predicate only: `data_geometry` never runs for them (the
+    /// payload matrix routes Chr/Blk/Fifo/Sock away from
+    /// new_data_backed, and `raw_blkaddr`'s kind premise pins the
+    /// same domain).
+    #[ktest]
+    fn data_geometry_predicate_consistency() {
+        let sb = ktest_super_block(12, 3);
+        let addr_state_for = |datalayout: DataLayout| match datalayout {
+            DataLayout::FlatPlain | DataLayout::FlatInline => AddrState::Flat,
+            DataLayout::CompressedFull | DataLayout::CompressedCompact => AddrState::Compressed,
+            DataLayout::ChunkBased => AddrState::Chunked { format: 0, bits: 12 },
+        };
+        const KINDS: [FileKind; 7] = [
+            FileKind::Reg,
+            FileKind::Dir,
+            FileKind::Lnk,
+            FileKind::Chr,
+            FileKind::Blk,
+            FileKind::Fifo,
+            FileKind::Sock,
+        ];
+        const DATALAYOUTS: [DataLayout; 5] = [
+            DataLayout::FlatPlain,
+            DataLayout::CompressedFull,
+            DataLayout::FlatInline,
+            DataLayout::CompressedCompact,
+            DataLayout::ChunkBased,
+        ];
+        for kind in KINDS {
+            for datalayout in DATALAYOUTS {
+                // The T-013 §1.2 oracle: dl ∈ {1, 3} ∧ kind ∈
+                // {Reg, Dir, Lnk}.
+                let expected = matches!(
+                    datalayout,
+                    DataLayout::CompressedFull | DataLayout::CompressedCompact
+                ) && matches!(kind, FileKind::Reg | FileKind::Dir | FileKind::Lnk);
+                let desc = geometry_desc(
+                    InodeVersion::Compact,
+                    datalayout,
+                    kind,
+                    4_096,
+                    0,
+                    addr_state_for(datalayout),
+                    5,
+                );
+                assert_eq!(
+                    desc.is_data_compressed(),
+                    expected,
+                    "predicate (kind = {:?}, dl = {:?})",
+                    kind,
+                    datalayout
+                );
+                if matches!(kind, FileKind::Reg | FileKind::Dir | FileKind::Lnk) {
+                    let geom = data_geometry(&sb, 64, &desc);
+                    assert_eq!(
+                        geom.compressed,
+                        expected,
+                        "snapshot (kind = {:?}, dl = {:?})",
+                        kind,
+                        datalayout
+                    );
+                }
+            }
         }
     }
 }
