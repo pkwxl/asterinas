@@ -247,14 +247,14 @@ static inline int ero_data_face_ready(void)
  * (probe fails); after it, hits return >= 0 and misses ENODATA — both
  * prove the query reached a real xattr layer.
  */
-#define EROFS_XATTR_PROBE_PATH \
-	EROFS_INIT_MNT "/xattr_host/xattr_user_short.bin"
+#define EROFS_XATTR_PROBE_PATH EROFS_INIT_MNT "/xattr_host/xattr_user_short.bin"
 
 static inline int ero_xattr_face_ready(void)
 {
 	char buf[4];
 
-	return getxattr(EROFS_XATTR_PROBE_PATH, "user.v", buf, sizeof(buf)) >= 0;
+	return getxattr(EROFS_XATTR_PROBE_PATH, "user.v", buf, sizeof(buf)) >=
+	       0;
 }
 
 #define EROFS_SKIP_IF_NO_XATTR_FACE() SKIP_TEST_IF(!ero_xattr_face_ready())

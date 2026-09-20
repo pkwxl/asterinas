@@ -325,8 +325,8 @@ FN_TEST(data_path_flat_size_gradient)
 	 * from observed behavior; the negative-control essence (no
 	 * writable channel exists) is carried by the write refusal. */
 	{
-		int wfd = TEST_SUCC(open(EROFS_REG_DIR "/flat_4096b.bin",
-					 O_WRONLY));
+		int wfd = TEST_SUCC(
+			open(EROFS_REG_DIR "/flat_4096b.bin", O_WRONLY));
 
 		TEST_ERRNO(write(wfd, buf, 1), EROFS);
 		TEST_SUCC(close(wfd));

@@ -416,8 +416,8 @@ FN_TEST(statfs_remount_rw_request_stays_ro)
 	 * SB_RDONLY gate, so open(O_WRONLY) SUCCEEDS and the first
 	 * refusal lands on write(2). Revised from the authority, never
 	 * from observed behavior. */
-	fd = TEST_SUCC(open(EROFS_SELF_MNT "/regular/empty_file.bin",
-			    O_WRONLY));
+	fd = TEST_SUCC(
+		open(EROFS_SELF_MNT "/regular/empty_file.bin", O_WRONLY));
 	TEST_ERRNO(write(fd, "x", 1), EROFS);
 	TEST_SUCC(close(fd));
 	/* O1 witness: f_flags still carries ST_RDONLY. */

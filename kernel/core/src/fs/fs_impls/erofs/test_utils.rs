@@ -16,9 +16,9 @@
 //!   directly (`Erofs::ktest_new` in `fs.rs`) instead of walking the
 //!   real `Erofs::open` chain.
 //! * **The in-memory disk and the erofs image builder**: still
-//!   T-027's, mirroring the ext2 `test_utils` shape (staged disk bytes
-//!   + `Erofs::open`). Until it lands, no ktest may assume readable
-//!   device content.
+//!   T-027's, mirroring the ext2 `test_utils` shape (staged disk
+//!   bytes + `Erofs::open`). Until it lands, no ktest may assume
+//!   readable device content.
 //!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
@@ -27,7 +27,7 @@
 use core::fmt;
 
 use aster_block::{
-    BlockDevice, BlockDeviceMeta,
+    BlockDeviceMeta,
     bio::{BioEnqueueError, BioStatus, SubmittedBio},
 };
 use device_id::{DeviceId, MajorId, MinorId};
@@ -49,7 +49,7 @@ use super::{
 /// than fabricating zero bytes).
 pub(super) struct ErofsNullDevice;
 
-impl fmt::Debug for ErofsNullDevice {
+impl Debug for ErofsNullDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ErofsNullDevice")
     }

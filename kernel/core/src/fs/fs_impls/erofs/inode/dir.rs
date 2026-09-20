@@ -711,7 +711,7 @@ mod tests {
             // transcription (implementation-side execution = T-027).
             let r5 = raw as usize == 0
                 || raw as usize >= bs
-                || raw as usize % size_of::<RawDirent>() != 0;
+                || !(raw as usize).is_multiple_of(size_of::<RawDirent>());
             assert_eq!(r5, iter_rejects, "R5 expectation of raw = {}", raw);
             if lookup_accepts && iter_rejects {
                 visible_divergence += 1;

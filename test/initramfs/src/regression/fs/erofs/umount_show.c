@@ -315,9 +315,8 @@ FN_TEST(umount_show_open_fd_no_busy_check)
 	 * refusal lands on write(2). Revised from the authority, never
 	 * from observed behavior. */
 	{
-		int wfd = TEST_SUCC(
-			open(EROFS_SELF_MNT "/regular/inline_64b.bin",
-			     O_WRONLY));
+		int wfd = TEST_SUCC(open(
+			EROFS_SELF_MNT "/regular/inline_64b.bin", O_WRONLY));
 
 		TEST_ERRNO(write(wfd, "x", 1), EROFS);
 		TEST_SUCC(close(wfd));
