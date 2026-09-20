@@ -43,7 +43,7 @@ use ostd::mm::VmIo;
 use super::{
     inode::Inode,
     prelude::*,
-    super_block::{FeatureIncompatSet, RawDeviceSlot, SuperBlock, DEVT_SLOT_SIZE},
+    super_block::{DEVT_SLOT_SIZE, FeatureIncompatSet, RawDeviceSlot, SuperBlock},
 };
 use crate::fs::vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags};
 
@@ -373,7 +373,10 @@ fn scan_devices(
     // (super.c:225-228): without the bit the on-disk field reads as 0.
     // `from_bits_truncate` drops unknown incompat bits but DEVICE_TABLE
     // is a known bit (0x8), so the contains() test is unaffected (G4).
-    let ondisk: usize = if sb.feature_incompat().contains(FeatureIncompatSet::DEVICE_TABLE) {
+    let ondisk: usize = if sb
+        .feature_incompat()
+        .contains(FeatureIncompatSet::DEVICE_TABLE)
+    {
         sb.extra_devices as usize // u16 mirror, host order
     } else {
         0
@@ -409,7 +412,7 @@ fn scan_devices(
         // Main column has no fscache mode, so linux's
         // `!erofs_is_fscache_mode(sb)` guard is constant-true here
         // (F9 note); no rwsem (single-threaded assembly, no idr).
-        let pos_base = sb.devt_slotoff as u64 * DEVT_SLOT_SIZE as u64;
+        let pos_base = sb.devt_slotoff as usize * DEVT_SLOT_SIZE;
         // Upper bound 65535 slots * 8 bytes = 512 KiB, one-shot
         // allocation; growth failure aborts, not an errno (G-M21).
         let mut slots = Vec::with_capacity(ondisk);
@@ -424,8 +427,7 @@ fn scan_devices(
             // same registered-drift family as the V5 read, see the
             // G-M10 note at the checksum arm in read_superblock;
             // collected by the drift-ledger summary.)
-            let raw: RawDeviceSlot =
-                device.read_val(pos_base + i as u64 * DEVT_SLOT_SIZE as u64)?;
+            let raw: RawDeviceSlot = device.read_val(pos_base + i * DEVT_SLOT_SIZE)?;
             // flatdev guards skip tag handling and device opening
             // (super.c:171-205 are guarded by `!flatdev`): the tag
             // field is neither read nor validated (MD4 — corrupted
@@ -435,9 +437,17 @@ fn scan_devices(
             let blocks = u32::from_le(raw.blocks);
             let mapped_blkaddr = u32::from_le(raw.mapped_blkaddr);
             total_blocks += blocks as u64;
-            slots.push(DeviceSlot { blocks, mapped_blkaddr });
+            slots.push(DeviceSlot {
+                blocks,
+                mapped_blkaddr,
+            });
         }
-        Ok(DeviceTable { flatdev: true, slots, total_blocks, device_id_mask })
+        Ok(DeviceTable {
+            flatdev: true,
+            slots,
+            total_blocks,
+            device_id_mask,
+        })
     } else {
         // G-M13 — true multi-device transitional rejection (given ==
         // ondisk > 0 here; every linux path below the count check is
@@ -493,7 +503,12 @@ impl DeviceTable {
     fn single_device(total_blocks: u64) -> Self {
         // mask = roundup_pow_of_two(0+1) - 1 = 0: device ids always
         // resolve to the primary device (MD7).
-        Self { flatdev: false, slots: Vec::new(), total_blocks, device_id_mask: 0 }
+        Self {
+            flatdev: false,
+            slots: Vec::new(),
+            total_blocks,
+            device_id_mask: 0,
+        }
     }
 
     // First consumer: the data path's chunk translation branch (the
@@ -532,6 +547,8 @@ impl DeviceTable {
     // T-014).
     #[expect(dead_code)]
     pub(super) fn slot(&self, id: u32) -> Option<(u32, u32)> {
-        self.slots.get(id as usize - 1).map(|s| (s.blocks, s.mapped_blkaddr))
+        self.slots
+            .get(id as usize - 1)
+            .map(|s| (s.blocks, s.mapped_blkaddr))
     }
 }
