@@ -9,11 +9,12 @@
 //! root inode -> construct the handle via `Arc::new_cyclic`) is owned
 //! by `Erofs::open` and lands stepwise with T-023: option parsing (the
 //! first step) is in force and fails malformed data strings with the
-//! parser's `EINVAL` surface, and the V10 device-scan half
-//! (`scan_devices`, producing the immutable `DeviceTable`) has landed
-//! below in wait of its caller, while every mount that survives
-//! parsing is still rejected with `EOPNOTSUPP` until the remaining
-//! steps land — a clear error, no panic, no swallowing.
+//! parser's `EINVAL` surface, and the superblock half has landed below
+//! (`read_superblock`: the V1–V10 validation order whose tail step
+//! `scan_devices` produces the immutable `DeviceTable`), in wait of
+//! its only caller — the assembly step of `open` — while every mount
+//! that survives parsing is still rejected with `EOPNOTSUPP` (a clear
+//! error, no panic, no swallowing) until the remaining steps land.
 //!
 //! Erofs is strictly read-only: there is no write path, no dirty
 //! tracking, and no block allocation anywhere below this handle, so the
@@ -43,7 +44,11 @@ use ostd::mm::VmIo;
 use super::{
     inode::Inode,
     prelude::*,
-    super_block::{DEVT_SLOT_SIZE, FeatureIncompatSet, RawDeviceSlot, SuperBlock},
+    super_block::{
+        BLKSZBITS_MAX, BLKSZBITS_MIN, DEVT_SLOT_SIZE, FeatureCompatSet, FeatureIncompatSet,
+        RawDeviceSlot, RawSuperBlock, SUPER_MAGIC_V1, SUPER_OFFSET, SUPER_REGION_MAX, SuperBlock,
+        SUPPORTED_BLKSZBITS,
+    },
 };
 use crate::fs::vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags};
 
@@ -265,16 +270,16 @@ impl Erofs {
     /// Interim shape (T-023 in progress): step 1 of the assembly
     /// sequence — parse the mount-option data string before any
     /// on-disk structure is read — is in force, so a malformed data
-    /// string fails fast with the parser's `EINVAL` surface. The
-    /// remaining steps — read the superblock, validate
-    /// magic/blkszbits/features/checksum, scan the device table, read
-    /// the root inode, and construct the handle via `Arc::new_cyclic`
-    /// — land with the rest of T-023; until then every mount that
-    /// survives parsing is rejected with a clear `EOPNOTSUPP`
-    /// ("capability deferred"), deliberately distinct from the
-    /// `EINVAL`/`EUCLEAN`/`EBADMSG` door that the final validation
-    /// sequence will report, so no interim observation can be confused
-    /// with the formal error surface.
+    /// string fails fast with the parser's `EINVAL` surface. The body
+    /// of step 2 — `read_superblock` below, the V1–V10 validation
+    /// order including the device scan — has landed; wiring it here,
+    /// then reading the root inode and constructing the handle via
+    /// `Arc::new_cyclic`, lands with the remaining steps of T-023;
+    /// until then every mount that survives parsing is rejected with
+    /// a clear `EOPNOTSUPP` ("capability deferred"), deliberately
+    /// distinct from the `EINVAL`/`EUCLEAN`/`EBADMSG` door that the
+    /// formal validation sequence reports, so no interim observation
+    /// can be confused with the formal error surface.
     // AUTO-FIXME(G-M21): Several Linux mount-path allocation sites can
     // return -ENOMEM (superblock-private data, device slots, inode-cache
     // nodes, xattr scratch). Under Rust global-allocation semantics a failed
@@ -293,9 +298,10 @@ impl Erofs {
         // superblock, so unknown keys and malformed values fail with
         // EINVAL regardless of the image content.
         let _mount_options = ErofsMountOptions::parse(data)?;
-        // Steps 2.. — read_superblock (V1–V10 incl. the device scan),
-        // handle construction, and the packed/root inode reads land
-        // with the remaining T-023 subtasks; `device` and `flags` are
+        // Steps 2.. — `read_superblock` below (V1–V10 incl. the
+        // device scan) has landed and is wired in by the assembly
+        // subtask of this task, together with the handle construction
+        // and the packed/root inode reads; `device` and `flags` are
         // only consumed by those steps.
         let _ = (device, flags);
         return_errno_with_message!(
@@ -334,11 +340,151 @@ impl Erofs {
 }
 
 // ---------------------------------------------------------------------------
+// Mount-time superblock read: `read_superblock` — the V1–V10
+// validation order of `erofs_read_superblock` (`super.c:276-367`) as
+// one straight-line function (design: `docs/T-012/S02/index.md`,
+// folded into `docs/T-012/analysis.md` §2).
+// ---------------------------------------------------------------------------
+
+/// Reads and validates the erofs superblock: the mount validation
+/// order V1–V10 of `erofs_read_superblock` (`super.c:276-367`),
+/// expressed as ONE straight-line function whose code order is the
+/// assertion surface for the order-crossing rows (baseline matrix
+/// §2.2: first failure stops; V5 before V6, V3 before V5, V7 before
+/// V8/V9/V10).
+///
+/// Layering: this function owns the validation ORDER; `super_block.rs`
+/// supplies the decode mirror and predicates only. Reads are exact
+/// byte intervals (read sites #1/#2 of the decoder contract).
+///
+/// G-M21: no ENOMEM arm anywhere on this path (stack buffers only;
+/// allocation failure is an abort in this tree, not an errno).
+// First consumer: step 2 of `Erofs::open` (wired by the assembly
+// subtask of this task); ktest fixtures call it directly from the
+// same host (design §9).
+#[expect(dead_code)]
+fn read_superblock(
+    device: &Arc<dyn BlockDevice>,
+    mount_options: &ErofsMountOptions,
+) -> Result<(SuperBlock, DeviceTable)> {
+    // V1 — superblock read (read site #1, `super.c:284-288`).
+    // Read errors pass through unchanged (media -> EIO; beyond device
+    // end -> EINVAL from the device stack, see the G-M10 note at V5).
+    let raw: RawSuperBlock = device.read_val(SUPER_OFFSET)?;
+    // Decode-then-gate (decision D2): pure field decode first — no
+    // errors, no side effects, no ordering. Every gate below reads
+    // host-order mirror fields or predicates; `raw` survives (Copy)
+    // solely as the csum expected-value input (E1 category ②).
+    let sb = SuperBlock::from(raw);
+
+    // V2 — magic (`super.c:290-295`).
+    if sb.magic != SUPER_MAGIC_V1 {
+        return_errno_with_message!(Errno::EINVAL, "cannot find valid erofs superblock");
+    }
+    // V3a — blkszbits range, Linux parity [9, PAGE_SHIFT]
+    // (`super.c:297-301`).
+    if sb.blkszbits < BLKSZBITS_MIN || sb.blkszbits > BLKSZBITS_MAX {
+        return_errno_with_message!(Errno::EINVAL, "blkszbits isn't supported");
+    }
+    // V3b — 4k-only gate (scope decision AR-S01-1).
+    // AUTO-FIXME(G-M08): Linux accepts blkszbits in [9, PAGE_SHIFT]
+    // (512B/1k/2k/4k block images all mount, super.c:298). This tree is
+    // 4k-only by scope decision AR-S01-1: every blkszbits != 12 is
+    // rejected here, so healthy 512B/1k/2k images that Linux mounts fail
+    // with EINVAL (registered drift, matrix row G-M08 / AT6-8). Two
+    // downstream judgements deliberately stay in general form although
+    // only the 4k row is reachable: the csum coverage formula and the
+    // page-bound sb_size check below. Reopening requires a dedicated
+    // scope task (see the AR-S01-1 revival notes in the scope ledger).
+    if sb.blkszbits != SUPPORTED_BLKSZBITS {
+        return_errno_with_message!(Errno::EINVAL, "currently only 4096-byte block size");
+    }
+    // V4 — dirblkbits (`super.c:302-305`).
+    if sb.dirblkbits != 0 {
+        return_errno_with_message!(Errno::EINVAL, "dirblkbits isn't supported");
+    }
+    // V5 — superblock checksum, conditional on SB_CHKSUM
+    // (`super.c:307-312`, algorithm `super.c:55-80`).
+    if sb.feature_compat().contains(FeatureCompatSet::SB_CHKSUM) {
+        // AUTO-FIXME(G-M10): Reads here are exact byte intervals into the
+        // block device; an interval extending past the device end fails in
+        // the device stack with EINVAL. Linux reads page-granular data and
+        // zero-fills the tail, so a truncated image that declares blkszbits=12
+        // with SB_CHKSUM set reaches the checksum compare and fails with
+        // EBADMSG, where aster fails the interval read with EINVAL. A device
+        // shorter than the superblock itself fails with EINVAL on both sides
+        // (Linux: zero-fill then bad magic) — errno-identical, different
+        // mechanism. Registered drift (zero-fill emulation rejected as
+        // candidate B); the same family covers out-of-range slot and inode
+        // reads later in the mount path. See the drift-ledger summary.
+        let mut buf = [0u8; SUPER_REGION_MAX];
+        let len = sb.checksummed_len(); // general formula; 4k row effective
+        device.read_bytes(SUPER_OFFSET, &mut buf[..len])?;
+        // kmemdup ENOMEM unreachable: stack buffer, no heap allocation
+        // (G-M21 family).
+        if !verify_superblock_checksum(&mut buf[..len], raw.checksum) {
+            return_errno_with_message!(Errno::EBADMSG, "invalid checksum");
+        }
+    }
+    // V6 — unknown incompat bits (`super.c:314-320`). The known-bit
+    // union is NOT shrinkable (G3); known compression bits are
+    // parsed-but-ignored, zero linkage with V9 (G-Z03).
+    // AUTO-TODO(G-Z03): The known compression-half incompat bits —
+    // ZERO_PADDING, COMPR_CFGS, ZTAILPACKING, and the compression
+    // halves behind the dual-name bits 0x8/0x20 — are parsed into the
+    // feature set but deliberately carry no mount-time action under
+    // the compression shelving (scope decision AR-S01-5): accepting
+    // them is the parity surface, an image with any of them set mounts
+    // exactly as if they were clear. The V9 guard below does NOT
+    // consult COMPR_CFGS either — compressed-image rejection flows
+    // from the u1 test alone — and ZERO_PADDING's runtime zero-fill
+    // optimisation has no counterpart. Do not reject or special-case
+    // these bits, and do not cross-check them against u1 or against
+    // inode datalayouts. Revive together with the compression
+    // takeover (scope ledger G-Z01).
+    if sb.has_unknown_incompat() {
+        return_errno_with_message!(Errno::EINVAL, "unidentified incompatible feature");
+    }
+    // V7 — sb_size upper bound (`super.c:322-327`). The judgement is
+    // PAGE-derived (PAGE_SIZE − SUPER_OFFSET) and MUST NOT be rewritten
+    // as a block-size bound (matrix §2.2 hard requirement; under
+    // 4k-only the two coincide, which is exactly why the simplification
+    // would be wrong).
+    if sb.sb_size() > SUPER_REGION_MAX {
+        return_errno_with_message!(Errno::EINVAL, "invalid sb_extslots");
+    }
+    // V8 — volume_name NIL gate (`super.c:346-352`). Must run before
+    // any `volume_name()` consumption: the accessor silently truncates
+    // (T-011 §5.5). This function never calls the accessor itself.
+    if !sb.volume_name_is_nul_terminated() {
+        return_errno_with_message!(Errno::EUCLEAN, "bad volume name without nil terminator");
+    }
+    // V9 — compression cfg guard, rejection-chain layer 1
+    // (`super.c:147-157,354-357`). Unconditional u1 zero test; the
+    // stub does NOT consult the COMPR_CFGS bit (G-Z03). Chain-level
+    // narrative (layers 1/3, G-M11/G-M15) belongs to the compression
+    // rejection-chain design (`docs/T-012/S05/index.md` §2).
+    if sb.u1 != 0 {
+        return_errno_with_message!(
+            Errno::EOPNOTSUPP,
+            "compression disabled, unable to mount compressed erofs"
+        );
+    }
+    // V10 — device scan (`super.c:159-274,359-360`): G-M12 count
+    // check / G-M14 flatdev / G-M13 transitional rejection — body:
+    // `scan_devices` below.
+    let device_table = scan_devices(device, &sb, mount_options)?;
+    Ok((sb, device_table))
+    // (linux tail: fscache deprecation warning `super.c:362-363` —
+    // no such branch in the main column; not migrated.)
+}
+
+// ---------------------------------------------------------------------------
 // V10 device scan: `scan_devices` and the `DeviceTable` it produces
 // (design: `docs/T-012/S03/index.md`, folded into `docs/T-012/analysis.md`
-// §4). The scan is the tail step of `read_superblock` (wired by the
-// read_superblock subtask); the table is installed into `Erofs` as an
-// immutable field by the assembly sequence.
+// §4). The scan is the tail step of `read_superblock` above; the table
+// is installed into `Erofs` as an immutable field by the assembly
+// sequence.
 // ---------------------------------------------------------------------------
 
 /// V10 device scan (`erofs_scan_devices`, `super.c:159-274`):
@@ -352,10 +498,10 @@ impl Erofs {
 /// `super.c:224-270`.
 ///
 /// G-M21: no ENOMEM arm (Vec growth failure aborts in this tree).
-// First consumer: the V10 tail call of `read_superblock` (this task's
-// read_superblock subtask); ktest fixtures call it directly from the
-// same host (design §9).
-#[expect(dead_code)]
+// Live since T-023 S03: the V10 tail call of `read_superblock` above
+// invokes it; ktest fixtures call it directly from the same host
+// (design §9). The bridging `expect` was removed when the first
+// consumer landed.
 fn scan_devices(
     device: &Arc<dyn BlockDevice>,
     sb: &SuperBlock,

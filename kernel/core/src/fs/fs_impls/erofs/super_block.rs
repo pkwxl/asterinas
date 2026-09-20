@@ -16,11 +16,14 @@
 //! 26 + 6 layout assertions) and the mirror side (the decoded
 //! `SuperBlock`, the pure `From<RawSuperBlock>` conversion, the
 //! checksum verification, and the predicate/accessor surface). The
-//! mount-time validation sequence — which door runs first and what
-//! each failure reports — lands with T-023; until a caller wires the
-//! mirror into `Erofs::open`, every dormant surface below carries
-//! its own `#[expect(dead_code)]` removal prompt with its first
-//! consumer annotated.
+//! mount-time validation order (`read_superblock` in `fs.rs`,
+//! T-023 S03) consumes the mirror: every V-door predicate, the
+//! checksum helper, and the magic/dirblkbits/u1 fields are live
+//! through it. Surfaces whose consumers land later — the
+//! root-inode/geometry fields (the assembly and statfs faces of this
+//! task), the xattr prefix family (T-026), and the packed-inode nid
+//! (G-Z01 revival) — still carry their own `#[expect(dead_code)]`
+//! removal prompt with their first consumer annotated.
 //!
 //! Boundary: field-level decoding and predicates only — the assembly
 //! and validation *order* decisions belong solely to
@@ -29,7 +32,7 @@
 use core::mem::offset_of;
 
 use aster_util::fixed_str::FixedCStr;
-use ostd::const_assert;
+use ostd::{const_assert, mm::PAGE_SIZE};
 
 use super::prelude::*;
 
@@ -50,9 +53,10 @@ pub(super) const SUPER_OFFSET: usize = 1024;
 
 /// The erofs V1 magic number
 /// (`linux/include/uapi/linux/magic.h:23`; consumed at super.c:292).
-// First consumers: the mount-time magic door (`fs.rs`, T-023) and the
-// statfs `f_type` field (`impl_for_vfs/fs.rs`, T-023).
-#[expect(dead_code)]
+// Live since T-023 S03: the V2 magic door of `read_superblock`
+// (`fs.rs`) compares against it; the statfs `f_type` field joins with
+// the statfs face of this task. The bridging `expect` was removed
+// when the first consumer landed.
 pub(super) const SUPER_MAGIC_V1: u32 = 0xE0F5E1E2;
 
 /// The maximum length of an erofs name (`EROFS_NAME_LEN`,
@@ -71,6 +75,44 @@ pub(super) const NAME_LEN: usize = 255;
 // references count. The bridging `expect` was removed when that
 // consumer landed.
 const SB_EXTSLOT_SIZE: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Mount-validation geometry constants: the V3 blkszbits bounds, the
+// 4k-only scope gate, and the PAGE-derived superblock-region bound
+// (design: `docs/T-012/S02/index.md` §8, folded into
+// `docs/T-012/analysis.md` §2.6). Consumers: `read_superblock` in
+// `fs.rs` — the validation order belongs solely there (T-010 §1.4
+// rule 4); this file supplies the judgement inputs only. Liveness:
+// born consumed by `read_superblock` (live since T-023 S03), an
+// `#[expect(dead_code)]` dead-code-analysis root whose references
+// count — no bridging `expect` needed.
+// ---------------------------------------------------------------------------
+
+/// The minimum blkszbits the mount validation accepts
+/// (`super.c:297-301`, the literal 9 lower arm). V3a lower bound.
+pub(super) const BLKSZBITS_MIN: u8 = 9;
+
+/// The maximum blkszbits the mount validation accepts — PAGE-derived
+/// single source: the `super.c:298` upper arm is
+/// `blkszbits > PAGE_SHIFT`. Exported from the framework page size so
+/// a page-size change re-derives the bound instead of silently
+/// diverging (design decision D4). V3a upper bound.
+pub(super) const BLKSZBITS_MAX: u8 = PAGE_SIZE.trailing_zeros() as u8;
+
+/// The only blkszbits this tree mounts: 4k. A literal on purpose —
+/// 4k-only is a scope property (AR-S01-1), not a page property: on a
+/// 64K-page arch the scope still means 12, so a PAGE-derived form
+/// would drift with the architecture (design decision D4). V3b gate.
+pub(super) const SUPPORTED_BLKSZBITS: u8 = 12;
+
+/// The superblock region upper bound, `PAGE_SIZE - SUPER_OFFSET`
+/// (= 3072). Dual duty (design decisions D4/D5): the V7 `sb_size`
+/// upper bound — PAGE-derived on purpose; under the 4k-only gate it
+/// coincides with a block-derived bound, which is exactly why the
+/// block form must not be substituted (the 512B/1k/2k rows stay
+/// dormant, not deleted) — and the V5 stack-buffer capacity, which is
+/// also the checksummed-region upper bound for blkszbits <= PAGE_SHIFT.
+pub(super) const SUPER_REGION_MAX: usize = PAGE_SIZE - SUPER_OFFSET;
 
 // ---------------------------------------------------------------------------
 // Feature bitflag sets (erofs_fs.h:14-42; bit tables single-sourced in
@@ -415,31 +457,33 @@ struct RawZstdCfgs {
 /// (G5) — with the two build timestamp fields collapsed into the
 /// single `build_time: Duration`: 21 fields in total.
 ///
-/// # Field liveness (dead-code ledger)
-///
-/// The `From` conversion *writes* every field but reads none, and the
-/// derived `Clone`/`Copy`/`Debug` impls are intentionally ignored by
-/// dead-code analysis, so a mirror field is only live once live code
-/// reads it. Fields consumed through accessors (`blkszbits`,
-/// `sb_extslots`, `feature_compat`, `feature_incompat`,
-/// `volume_name`) are read by the `#[expect(dead_code)]` accessor
-/// roots below — an item carrying an `expect` is a dead-code-analysis
-/// root, so its reads count. Every other field carries its own
-/// `#[expect(dead_code)]` with its first consumer annotated: the
-/// `expect` fires `unfulfilled` the moment that consumer lands, which
-/// is the removal prompt (the cut-domain pair additionally carries
-/// its SB5 revival note). The design sketch marked only the
-/// cut-domain pair with a deadness attribute; the landed form
-/// generalizes it to every not-yet-read field, for the same reason
-/// S01 replaced `#[allow]` with `#[expect]` — the workspace bans
-/// allow attributes, and the `expect` doubles as the revival alarm.
+    /// # Field liveness (dead-code ledger)
+    ///
+    /// The `From` conversion *writes* every field but reads none, and the
+    /// derived `Clone`/`Copy`/`Debug` impls are intentionally ignored by
+    /// dead-code analysis, so a mirror field is only live once live code
+    /// reads it. Fields consumed through accessors (`blkszbits`,
+    /// `sb_extslots`, `feature_compat`, `feature_incompat`,
+    /// `volume_name`) follow their accessors' liveness — an item
+    /// carrying an `expect` is a dead-code-analysis root, so its reads
+    /// count, and an accessor consumed by the mount validation order
+    /// (`read_superblock` in `fs.rs`, live since T-023 S03) keeps its
+    /// field live without any attribute. Every other field carries its
+    /// own `#[expect(dead_code)]` with its first consumer annotated:
+    /// the `expect` fires `unfulfilled` the moment that consumer lands,
+    /// which is the removal prompt (the cut-domain pair additionally
+    /// carries its SB5 revival note). The design sketch marked only the
+    /// cut-domain pair with a deadness attribute; the landed form
+    /// generalizes it to every not-yet-read field, for the same reason
+    /// S01 replaced `#[allow]` with `#[expect]` — the workspace bans
+    /// allow attributes, and the `expect` doubles as the revival alarm.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
     /// The file system magic number (host order; the `From` body is
     /// its single `from_le`).
-    // First consumer: the mount-time magic door (`fs.rs`, T-023,
-    // EINVAL on mismatch).
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V2 magic door of `read_superblock`
+    // (`fs.rs`) reads it (EINVAL on mismatch). The bridging `expect`
+    // was removed when the first consumer landed.
     pub(super) magic: u32,
     /// Compatible feature bits, host order; decoded by the
     /// `feature_compat()` accessor. Unknown compat bits are silently
@@ -509,10 +553,12 @@ pub(super) struct SuperBlock {
     /// otherwise `lz4_max_distance` (the legacy LZ4 sliding window).
     /// The mirror stores the host-order bits only; reading
     /// discrimination is mount-time and compression-domain business.
-    // First consumer: the mount-time V9 door (u1 != 0 → EOPNOTSUPP,
-    // T-023) and the COMPR_CFGS algorithm-config records (G-Z01
-    // revival).
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V9 compression-cfg guard of
+    // `read_superblock` (`fs.rs`) tests the zero condition (u1 != 0
+    // -> EOPNOTSUPP, layer 1 of the compression rejection chain); the
+    // COMPR_CFGS algorithm-config records join with the G-Z01
+    // revival. The bridging `expect` was removed when the first
+    // consumer landed.
     pub(super) u1: u16,
     /// The number of devices besides the primary device (host order).
     // Live since T-023 S02: the V10 device scan (`scan_devices`,
@@ -534,8 +580,9 @@ pub(super) struct SuperBlock {
     pub(super) devt_slotoff: u16,
     /// The directory block size in bit shift; non-zero is a
     /// mount-time error (T-023).
-    // First consumer: the mount-time dirblkbits door (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V4 dirblkbits door of
+    // `read_superblock` (`fs.rs`) rejects non-zero with EINVAL. The
+    // bridging `expect` was removed when the first consumer landed.
     pub(super) dirblkbits: u8,
     /// The number of long xattr name prefixes; read directly (u8).
     // First consumer: the long-prefix domain (`xattr.rs`, T-026).
@@ -623,9 +670,11 @@ impl SuperBlock {
     /// assertions (C5); the slot unit is `SB_EXTSLOT_SIZE`. The V7
     /// upper-bound door (sb_size > PAGE_SIZE − SUPER_OFFSET → EINVAL)
     /// is mount-time (T-023).
-    // First consumer: the mount-time V7 door and the volume-level
-    // metadata record area start (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V7 door of `read_superblock` (`fs.rs`)
+    // bounds `sb_size()` by `SUPER_REGION_MAX`; the volume-level
+    // metadata record area start joins with the assembly face of this
+    // task. The bridging `expect` was removed when the first consumer
+    // landed.
     pub(super) fn sb_size(&self) -> usize {
         size_of::<RawSuperBlock>() + SB_EXTSLOT_SIZE * self.sb_extslots as usize
     }
@@ -634,9 +683,11 @@ impl SuperBlock {
     /// `from_bits_truncate`: linux has no unknown-compat-bit check
     /// (super.c:307), so unknown bits are silently accepted —
     /// dropped by the truncation without any rejection (G4).
-    // First consumers: the SB_CHKSUM verification trigger and the
-    // XATTR_FILTER bloom gate (T-023/T-026).
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V5 checksum trigger of
+    // `read_superblock` (`fs.rs`) tests SB_CHKSUM through this
+    // accessor; the XATTR_FILTER bloom gate joins with the xattr
+    // domain (T-026). The bridging `expect` was removed when the
+    // first consumer landed.
     pub(super) fn feature_compat(&self) -> FeatureCompatSet {
         FeatureCompatSet::from_bits_truncate(self.feature_compat)
     }
@@ -660,8 +711,9 @@ impl SuperBlock {
     /// (G3); `ext2/super_block.rs:245-248` is the structural
     /// precedent. The EINVAL door itself is mount-time (T-023,
     /// super.c:315-320).
-    // First consumer: the mount-time unknown-incompat door (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V6 unknown-incompat door of
+    // `read_superblock` (`fs.rs`) consumes it. The bridging `expect`
+    // was removed when the first consumer landed.
     pub(super) fn has_unknown_incompat(&self) -> bool {
         self.feature_incompat & !FeatureIncompatSet::all().bits() != 0
     }
@@ -669,8 +721,9 @@ impl SuperBlock {
     /// Returns whether `volume_name` contains a NUL byte within its
     /// 16 bytes. The NIL door (no NUL → EUCLEAN, the mapping of the
     /// linux EFSCORRUPTED, super.c:346-352) is mount-time (T-023).
-    // First consumer: the mount-time volume-name door (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V8 NIL door of `read_superblock`
+    // (`fs.rs`) consumes it. The bridging `expect` was removed when
+    // the first consumer landed.
     pub(super) fn volume_name_is_nul_terminated(&self) -> bool {
         self.volume_name.contains(&0)
     }
@@ -691,14 +744,15 @@ impl SuperBlock {
     /// Returns the length of the checksummed superblock region, in
     /// the general blkszbits form of super.c:57-62: `len = 1 <<
     /// blkszbits`, then `len -= 1024` only when the block size
-    /// exceeds `SUPER_OFFSET` (T-001 §3.5). The covered device
-    /// interval is `[SUPER_OFFSET, SUPER_OFFSET + len)`; for
+    /// exceeds `SUPER_OFFSET` (T-001 §3.5 single source). The covered
+    /// device interval is `[SUPER_OFFSET, SUPER_OFFSET + len)`; for
     /// blkszbits < 10 the region deliberately extends past the end of
     /// block 0 — a parity fact of the conditional, not a defect.
-    // First consumer: the mount-time SB_CHKSUM door (T-023), which
-    // reads exactly this many bytes at SUPER_OFFSET before handing
-    // them to `verify_superblock_checksum`.
-    #[expect(dead_code)]
+    // Live since T-023 S03: the V5 arm of `read_superblock` (`fs.rs`)
+    // reads exactly this many bytes at SUPER_OFFSET into its stack
+    // buffer before handing them to `verify_superblock_checksum`.
+    // The bridging `expect` was removed when the first consumer
+    // landed.
     pub(super) fn checksummed_len(&self) -> usize {
         let block_size = 1 << self.blkszbits;
         if block_size > SUPER_OFFSET {
@@ -720,13 +774,14 @@ impl SuperBlock {
 /// offsets are the same-sourced layout anchors, C5 — the zeroing
 /// touches only the in-memory copy, never the device; this is the
 /// kmemdup-and-clear of super.c:64-71 without a heap allocation),
-/// then compares `crc32c(!0, region)` with the disk value. The
-/// single E1 conversion of `checksum` happens here. The trigger bit
+/// then compares `crc32c(!0, region)` with the disk value. The single
+/// E1 conversion of `checksum` happens here. The trigger bit
 /// (`FeatureCompatSet::SB_CHKSUM`), the failure errno (EBADMSG,
 /// "invalid checksum"), and the call position in the door sequence
 /// belong to the mount-time sequence (T-023).
-// First consumer: the mount-time SB_CHKSUM door (T-023).
-#[expect(dead_code)]
+// Live since T-023 S03: the V5 arm of `read_superblock` (`fs.rs`)
+// feeds it the freshly read coverage interval and `raw.checksum`.
+// The bridging `expect` was removed when the first consumer landed.
 pub(super) fn verify_superblock_checksum(region: &mut [u8], raw_checksum: u32) -> bool {
     region[offset_of!(RawSuperBlock, checksum)..offset_of!(RawSuperBlock, feature_compat)].fill(0);
     super::utils::crc32c(!0, region) == u32::from_le(raw_checksum)
