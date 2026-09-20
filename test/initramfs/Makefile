@@ -39,6 +39,7 @@ XFSTESTS_SCRATCH_IMAGE := $(BUILD_DIR)/xfstests_scratch.img
 XFSTESTS_DISK_SIZE ?= 12G
 EROFS_TREE_DIR := $(CUR_DIR)/erofs_tree
 EROFS_STAGE_SCRIPT := $(CUR_DIR)/erofs_stage.sh
+EROFS_SB_CSUM_FIX := $(CUR_DIR)/erofs_sb_csum_fix.py
 EROFS_TREE_STAGE := $(BUILD_DIR)/erofs_tree_stage
 # Stage recipe target is a stamp file, NOT the stage directory itself:
 # the S09 reproducibility fix pins every entry under the stage tree —
@@ -329,6 +330,14 @@ $(EROFS_FLATDEV_CONCAT_IMAGE): $(EROFS_FLATDEV_IMAGE) $(EROFS_BLOB_IMAGE)
 $(EROFS_FLATDEV_BADTAG_IMAGE): $(EROFS_FLATDEV_IMAGE)
 	@cp $< $@
 	@printf 'XBADTAG!' | dd of=$@ bs=1 seek=$$(( $(EROFS_DEVT_SLOTOFF) * 128 )) conv=notrunc
+# T-023/S09 fix: the tag patch lands inside the superblock-checksum
+# coverage region (4k image: [1024, 4096), which contains devslot[0]
+# at slotoff*128 = 1152), so the mkfs-finalized checksum goes stale
+# and every checksum-verifying mount rejects the image with EBADMSG
+# before the tag-blind gate is ever reached. Recompute and write back
+# the field so the image tests a bad tag, not a broken checksum
+# (single-source formula: kernel-side checksummed_len()).
+	@python3 $(EROFS_SB_CSUM_FIX) $@
 
 .PHONY: format
 format:
