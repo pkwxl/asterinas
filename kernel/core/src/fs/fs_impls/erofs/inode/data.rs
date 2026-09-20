@@ -427,7 +427,10 @@ impl DataBackend {
         // before :150) — by-value output makes the order
         // unobservable, the placement keeps the trace.
         let (blkaddr, device_id) = if cg.unit == size_of::<u32>() {
-            (u32::from_le(self.device.read_val::<u32>(pos as usize)?), 0u16)
+            (
+                u32::from_le(self.device.read_val::<u32>(pos as usize)?),
+                0u16,
+            )
         } else {
             let idx = self.device.read_val::<RawInodeChunkIndex>(pos as usize)?;
             (u32::from_le(idx.blkaddr), u16::from_le(idx.device_id))
@@ -872,10 +875,7 @@ mod tests {
             0,
             false,
             inline_data_start,
-            Some(ChunkGeometry {
-                unit,
-                chunkbits,
-            }),
+            Some(ChunkGeometry { unit, chunkbits }),
             false,
         );
         let npages = size.div_ceil(PAGE_SIZE as u64) as usize;
@@ -1134,6 +1134,22 @@ mod tests {
         disk.stage_bytes(4008, &NULL_ADDR.to_le_bytes());
         disk.stage_bytes(4012, &200u32.to_le_bytes());
 
+        // TEMP S04 DIAGNOSTIC — remove once the fixture defect is
+        // located: the staged bytes, the channel read-back, and the
+        // request log, all in one panic message.
+        {
+            let mut raw = [0u8; 24];
+            disk.segment().read_bytes(3992, &mut raw).unwrap();
+            let dev: Arc<dyn BlockDevice> = disk.clone();
+            let mut ch = [0u8; 4];
+            dev.read_bytes(4004, &mut ch).unwrap();
+            let val = dev.read_val::<u32>(4004).unwrap();
+            panic!(
+                "DIAG raw[3992..4016]={raw:02x?} ch[4004..]={ch:02x?} val={val} reqs={:?}",
+                disk.requests()
+            );
+        }
+
         // MAPPED over chunk 0: la 0, a mid-chunk la, and the last
         // byte of the chunk all share chunknr 0 — the write-back
         // moves m_la below every query la but 0.
@@ -1159,7 +1175,9 @@ mod tests {
         }
         // The last chunk: the remainder 4106 rounds up to exactly
         // one chunk — no clamp here.
-        let m = backend.map_blocks(2 * CHUNK + 37, PAGE_SIZE as u64).unwrap();
+        let m = backend
+            .map_blocks(2 * CHUNK + 37, PAGE_SIZE as u64)
+            .unwrap();
         assert_eq!(m.m_flags, MapFlags::MAPPED);
         assert_eq!(m.m_la, 2 * CHUNK);
         assert_eq!(m.m_pa, 200 << 12);
@@ -1314,12 +1332,7 @@ mod tests {
                 }),
                 false,
             );
-            DataBackend::new(
-                fs.self_ref().clone(),
-                fs.block_device().clone(),
-                geom,
-                6,
-            )
+            DataBackend::new(fs.self_ref().clone(), fs.block_device().clone(), geom, 6)
         };
         let backend4 = mk_backend(4);
         let backend8 = mk_backend(8);
