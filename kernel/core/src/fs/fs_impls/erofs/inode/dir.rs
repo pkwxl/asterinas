@@ -378,7 +378,7 @@ impl Inode {
     #[expect(dead_code)]
     pub(in crate::fs::fs_impls::erofs) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
         let nid = self.lookup_nid(name)?; // erofs_namei
-        Ok(self.fs()?.iget(nid)?) // erofs_iget (N14; I-family incl. I12)
+        self.fs()?.iget(nid) // erofs_iget (N14; I-family incl. I12)
     }
 }
 
@@ -447,7 +447,7 @@ impl Inode {
             // lookup half masks via lookup_nameoff — the two
             // strictness domains of the module doc).
             let nameoff0 = u16::from_le(de0.nameoff) as usize;
-            if nameoff0 == 0 || nameoff0 >= bs || nameoff0 % size_of::<RawDirent>() != 0 {
+            if nameoff0 == 0 || nameoff0 >= bs || !nameoff0.is_multiple_of(size_of::<RawDirent>()) {
                 return_errno_with_message!(Errno::EUCLEAN, "invalid de[0].nameoff");
             }
             // R6 — min_t(unsigned int, size - dbstart, bsz): the u32
