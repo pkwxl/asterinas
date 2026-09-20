@@ -665,7 +665,13 @@ mod tests {
         // The window [512, 1024): content byte-exact, and the sole
         // device touch is the whole-block page-cache fill — the
         // channel discriminator against the DIO 1-sector bounce.
+        // The writer is shrunk to the window first: a buffered read
+        // consumes whatever the writer offers (the count IS
+        // avail()), so the fixture must offer exactly the window —
+        // the `limit(len)` step the DIO helper folds in, spelled
+        // out here since no ktest_dio_writer is involved.
         let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+        writer.limit(512);
         assert_eq!(inode.read_at(512, &mut writer).unwrap(), 512);
         for (i, &byte) in buf.iter().enumerate().take(512) {
             assert_eq!(byte, pattern(PAGE_SIZE + 512 + i), "byte {i}");
