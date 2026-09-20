@@ -17,7 +17,11 @@
  *     T-018/S07 sec. 8 item 1);
  *   - G-P02 last-page tail zero-fill via mmap (flat_4097b / flat_16k
  *     final pages; inline tail zero-fill rides inline_64b, 分歧行③);
- *   - F11 splice to a pipe with content and offset-advance checks;
+ *   - F11 splice to a pipe -- REGISTERED DIFFERENCE (erratum
+ *     T-025/S09): aster has no splice(2) syscall at all, so the
+ *     case asserts ENOSYS with a never-advancing offset (full
+ *     evidence chain in the case comment and
+ *     docs/T-025/S09/index.md sec. 5.1);
  *   - G-P01 DIO alignment gate (SECTOR_SIZE = 512 constant, three-factor
  *     EINVAL) via O_DIRECT pread on an MNT file;
  *   - G-P03 fiemap/FIBMAP whole-face trim -> ENOTTY (registered
@@ -457,22 +461,37 @@ FN_TEST(data_path_tail_zerofill_mmap)
 END_TEST()
 
 /*
- * Matrix sec. 4.1 F11 (parity): splice from an MNT file into a pipe
- * preserves content and advances the explicit file offset.
+ * Matrix sec. 4.1 F11 (REGISTERED DIFFERENCE, erratum T-025/S09):
+ * aster carries NO splice(2) syscall at all -- the syscall tables
+ * (kernel/core/src/syscall/arch/) register no SYS_SPLICE, LTP
+ * splice01-09 are disabled in the conformance list, the kselftest
+ * blocklist masks the splice family, and kernel/core/src/syscall/
+ * sendfile.rs notes that FileLike has no splice_read yet. The F11
+ * parity registration (and the T-014/S07 sec. 7.2 assumption that
+ * "aster splice goes through the generic FileLike read face")
+ * predates that verified fact, so content preservation and offset
+ * advance are unassertable here; revised per the erratum record
+ * (docs/T-025/S09/index.md sec. 5.1), never from observed behavior.
+ * Linux baseline: splice moves the bytes and advances the explicit
+ * offset by the moved count. aster baseline: ENOSYS for every call,
+ * the offset never advances, shape-identical on ext2 (whole-kernel
+ * facility gap, same registration class as the G-P03 ENOTTY trim;
+ * framework-side, erofs itself carries no splice face).
+ * 登记差异(F11 勘误): Linux 基线 splice 移动字节并推进 off;aster
+ * 整设施缺位 splice(2),一律 ENOSYS、off 零推进(erofs 与 ext2 同形)。
  */
 FN_TEST(data_path_splice_pipe)
 {
-	char buf[EROFS_IMG_BS];
 	int pfd[2];
 	loff_t off = 0;
-	ssize_t n;
 	int fd;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
 	/*
-	 * Activation-boundary guard (T-024/S04): splice pulls file
-	 * CONTENT and asserts it against the formula — the data-read
-	 * face (T-025). SKIP until the data face is served.
+	 * Activation-boundary guard (T-024/S04): unchanged -- the case
+	 * still opens an MNT file through the served data face; only
+	 * the splice expectation is revised (the 88/13 activation
+	 * boundary itself does not move).
 	 */
 	EROFS_SKIP_IF_NO_DATA_FACE();
 	fd = TEST_SUCC(open(EROFS_REG_DIR "/flat_16k_plus_100b.bin", O_RDONLY));
@@ -480,24 +499,11 @@ FN_TEST(data_path_splice_pipe)
 		return;
 	TEST_SUCC(pipe(pfd));
 
-	n = TEST_RES(splice(fd, &off, pfd[1], NULL, EROFS_IMG_BS, 0),
-		     _ret == (ssize_t)EROFS_IMG_BS);
-	if (n == (ssize_t)EROFS_IMG_BS) {
-		TEST_RES(read(pfd[0], buf, EROFS_IMG_BS),
-			 _ret == (ssize_t)EROFS_IMG_BS);
-		TEST_RES(ero_buf_matches_formula(buf, EROFS_IMG_BS, 0),
-			 _ret == 0);
-	}
-
-	n = TEST_RES(splice(fd, &off, pfd[1], NULL, 1024, 0),
-		     _ret == (ssize_t)1024);
-	if (n == (ssize_t)1024) {
-		TEST_RES(read(pfd[0], buf, 1024), _ret == (ssize_t)1024);
-		TEST_RES(ero_buf_matches_formula(buf, 1024, EROFS_IMG_BS),
-			 _ret == 0);
-	}
-	/* The explicit offset advanced across both splices. */
-	TEST_RES((unsigned long long)off, _ret == EROFS_IMG_BS + 1024);
+	/* 登记差异: both sizes ENOSYS; nothing is ever moved. */
+	TEST_ERRNO(splice(fd, &off, pfd[1], NULL, EROFS_IMG_BS, 0), ENOSYS);
+	TEST_ERRNO(splice(fd, &off, pfd[1], NULL, 1024, 0), ENOSYS);
+	/* The explicit offset never advances (no bytes moved). */
+	TEST_RES((unsigned long long)off, _ret == 0);
 
 	TEST_SUCC(close(pfd[0]));
 	TEST_SUCC(close(pfd[1]));
