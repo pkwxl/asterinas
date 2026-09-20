@@ -46,8 +46,8 @@ use super::{
     prelude::*,
     super_block::{
         BLKSZBITS_MAX, BLKSZBITS_MIN, DEVT_SLOT_SIZE, FeatureCompatSet, FeatureIncompatSet,
-        RawDeviceSlot, RawSuperBlock, SUPER_MAGIC_V1, SUPER_OFFSET, SUPER_REGION_MAX, SuperBlock,
-        SUPPORTED_BLKSZBITS,
+        RawDeviceSlot, RawSuperBlock, SUPER_MAGIC_V1, SUPER_OFFSET, SUPER_REGION_MAX,
+        SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
 };
 use crate::fs::vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags};

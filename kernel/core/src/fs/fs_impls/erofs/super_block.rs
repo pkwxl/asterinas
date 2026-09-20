@@ -32,7 +32,7 @@
 use core::mem::offset_of;
 
 use aster_util::fixed_str::FixedCStr;
-use ostd::{const_assert, mm::PAGE_SIZE};
+use ostd::const_assert;
 
 use super::prelude::*;
 
@@ -457,26 +457,26 @@ struct RawZstdCfgs {
 /// (G5) — with the two build timestamp fields collapsed into the
 /// single `build_time: Duration`: 21 fields in total.
 ///
-    /// # Field liveness (dead-code ledger)
-    ///
-    /// The `From` conversion *writes* every field but reads none, and the
-    /// derived `Clone`/`Copy`/`Debug` impls are intentionally ignored by
-    /// dead-code analysis, so a mirror field is only live once live code
-    /// reads it. Fields consumed through accessors (`blkszbits`,
-    /// `sb_extslots`, `feature_compat`, `feature_incompat`,
-    /// `volume_name`) follow their accessors' liveness — an item
-    /// carrying an `expect` is a dead-code-analysis root, so its reads
-    /// count, and an accessor consumed by the mount validation order
-    /// (`read_superblock` in `fs.rs`, live since T-023 S03) keeps its
-    /// field live without any attribute. Every other field carries its
-    /// own `#[expect(dead_code)]` with its first consumer annotated:
-    /// the `expect` fires `unfulfilled` the moment that consumer lands,
-    /// which is the removal prompt (the cut-domain pair additionally
-    /// carries its SB5 revival note). The design sketch marked only the
-    /// cut-domain pair with a deadness attribute; the landed form
-    /// generalizes it to every not-yet-read field, for the same reason
-    /// S01 replaced `#[allow]` with `#[expect]` — the workspace bans
-    /// allow attributes, and the `expect` doubles as the revival alarm.
+/// # Field liveness (dead-code ledger)
+///
+/// The `From` conversion *writes* every field but reads none, and the
+/// derived `Clone`/`Copy`/`Debug` impls are intentionally ignored by
+/// dead-code analysis, so a mirror field is only live once live code
+/// reads it. Fields consumed through accessors (`blkszbits`,
+/// `sb_extslots`, `feature_compat`, `feature_incompat`,
+/// `volume_name`) follow their accessors' liveness — an item
+/// carrying an `expect` is a dead-code-analysis root, so its reads
+/// count, and an accessor consumed by the mount validation order
+/// (`read_superblock` in `fs.rs`, live since T-023 S03) keeps its
+/// field live without any attribute. Every other field carries its
+/// own `#[expect(dead_code)]` with its first consumer annotated:
+/// the `expect` fires `unfulfilled` the moment that consumer lands,
+/// which is the removal prompt (the cut-domain pair additionally
+/// carries its SB5 revival note). The design sketch marked only the
+/// cut-domain pair with a deadness attribute; the landed form
+/// generalizes it to every not-yet-read field, for the same reason
+/// S01 replaced `#[allow]` with `#[expect]` — the workspace bans
+/// allow attributes, and the `expect` doubles as the revival alarm.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
     /// The file system magic number (host order; the `From` body is
