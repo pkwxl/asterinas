@@ -54,12 +54,14 @@ use super::{
     prelude::*,
     super_block::{
         BLKSZBITS_MAX, BLKSZBITS_MIN, DEVT_SLOT_SIZE, FeatureCompatSet, FeatureIncompatSet,
-        RawDeviceSlot, RawSuperBlock, SUPER_MAGIC_V1, SUPER_OFFSET, SUPER_REGION_MAX,
+        NAME_LEN, RawDeviceSlot, RawSuperBlock, SUPER_MAGIC_V1, SUPER_OFFSET, SUPER_REGION_MAX,
         SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
     xattr::load_xattr_prefixes,
 };
-use crate::fs::vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags};
+use crate::fs::vfs::file_system::{
+    AtomicFsFlags, FsEventSubscriberStats, FsFlags, SuperBlock as VfsSuperBlock,
+};
 
 /// Top-level handle for a mounted erofs filesystem.
 ///
@@ -78,11 +80,11 @@ pub struct Erofs {
     super_block: SuperBlock,
     /// Device table assembled by the V10 device scan (immutable
     /// after `open`; remount never rescans).
-    // First consumer: the statfs face of this task (`total_blocks()`,
-    // the f_blocks single source); the data-path accessors (slots,
-    // mask) join with the data-path domain. The bridging `expect`
-    // will be removed when that consumer lands.
-    #[expect(dead_code)]
+    // Live since T-023 S06: read by `Erofs::vfs_super_block` through
+    // `DeviceTable::total_blocks()` — the statfs f_blocks single
+    // source; the data-path accessors (slots, mask) join with the
+    // data-path domain, their own expects stay until then. The
+    // bridging `expect` was removed when the first consumer landed.
     device_table: DeviceTable,
     /// Parsed mount options, guarded for the remount whole-reset
     /// path (readers copy out under a short guard; see `# Locking`).
@@ -419,9 +421,97 @@ impl Erofs {
         self.block_device.id()
     }
 
-    /// Returns the per file system flags.
+    /// Read-side snapshot of the per-fs flags (ext2 fs.rs:212-215
+    /// shape). RDONLY is permanently present: set by the open
+    /// constructor (F1) and re-forced by every remount (RM13, S07).
+    /// One single source feeds the FsCache RO/RW reuse check
+    /// (G6/G7 via FileSystem::flags) and the statfs f_flags
+    /// assembly (SF11 via vfs_super_block).
     pub(super) fn fs_flags(&self) -> FsFlags {
         self.flags.load(Ordering::Relaxed)
+    }
+
+    /// The VFS-facing superblock: the erofs_statfs translation
+    /// (super.c:984-1003) plus the framework-only container_dev_id
+    /// field (mountinfo major:minor, fact M23). Assembled fresh on
+    /// every call — pure arithmetic over immutable mirrors plus the
+    /// live flag snapshot, no I/O, no caching (a cached copy would
+    /// freeze f_flags across remount, S07/RM13).
+    // AUTO-FIXME(W-M03): Linux always sets ST_VALID (1 << 31) in
+    // f_flags (vfs_statfs assembles it outside the filesystem). The
+    // aster statfs syscall layer has no ST_VALID bit in its flag set,
+    // so statfs(2) here always reports bit31 == 0 where Linux reports
+    // 1 — a registered framework-level drift, asserted as-is by the
+    // baseline matrix. The fix belongs to the statfs syscall layer
+    // (one constant, every filesystem benefits; scope ledger keeps it
+    // as a candidacy). It cannot be emulated from this side:
+    // StatfsFlags::from_bits_truncate strips any bit the syscall flag
+    // set does not define, and setting bit31 in sb().flags would be
+    // silently dropped here while polluting every other FsFlags
+    // consumer. Do not try either.
+    pub(super) fn vfs_super_block(&self) -> VfsSuperBlock {
+        // SF2/SF10 — one evaluation, two consumers. Linux sets
+        // f_bsize = s_blocksize and relies on the vfs_statfs
+        // fallback for f_frsize; aster has no fallback (M12), so
+        // both fields carry the same explicit value.
+        let bsize = self.super_block.block_size();
+
+        // SF8/SF9 — fsid two-branch. `uuid_is_null` is a plain
+        // 16-zero-byte test. The linux "no bdev -> 0" sub-branch
+        // (super.c:998, fscache mode) is unreachable in the main
+        // column: bdev mounts only.
+        let fsid = if self.super_block.uuid == [0u8; 16] {
+            new_encode_dev(self.block_device.id()) as u64
+        } else {
+            fold_uuid_to_fsid(&self.super_block.uuid)
+        };
+
+        // SF11 — live flag snapshot; see the flags field row below
+        // for the assembly notes (RDONLY permanence, no-NOATIME
+        // structural guarantee).
+        let fs_flags = self.fs_flags();
+
+        VfsSuperBlock {
+            // SF1 — the V1 magic constant, NOT the mirror field
+            // (the mirror's magic is the V2 gate input only,
+            // T-011/S02 §5.2 note).
+            magic: SUPER_MAGIC_V1 as u64,
+            bsize,
+            // SF3 — single source: DeviceTable::total_blocks()
+            // (primary + Σ flatdev slot blocks, AT6-26/MD8);
+            // do NOT re-sum from the mirror here (S03 §6).
+            blocks: self.device_table.total_blocks() as usize,
+            // SF4 — a read-only fs is always full: free = 0
+            // (super.c:992). Explicit on purpose; SuperBlock::new
+            // would silently default the same value — do not
+            // "fix" in either direction.
+            bfree: 0,
+            bavail: 0,
+            // SF5 — linux fills ULLONG_MAX; the framework default
+            // is 0, so this MUST be explicit (anti-default-drift,
+            // matrix §2.4 names this field).
+            files: u64::MAX as usize,
+            // SF6 — inos is a mount-time snapshot (mirror field,
+            // immutable afterwards); inos = 0 -> ULLONG_MAX, and
+            // ULLONG_MAX - inos cannot underflow.
+            ffree: (u64::MAX - self.super_block.inos) as usize,
+            fsid,
+            // SF7 — EROFS_NAME_LEN = 255 (erofs_fs.h:289; XA2
+            // host: super_block.rs, usize).
+            namelen: NAME_LEN,
+            frsize: bsize,
+            // SF11 — FsFlags bits only. RDONLY is always set
+            // (F1/RM13); FsFlags has no NOATIME bit, so a "silent
+            // noatime" cannot leak into f_flags — the per-mount
+            // ST_NOATIME bit is assembled by the syscall layer
+            // from PerMountFlags for explicit `-o noatime` only
+            // (same shape as linux flags_by_sb, which maps
+            // RDONLY/SYNC/MANDLOCK only, not SB_NOATIME).
+            flags: fs_flags.bits() as u64,
+            // Framework-only field (no kstatfs counterpart):
+            // mountinfo major:minor consumes the same value (M23).
+            container_dev_id: self.block_device.id(),
+        }
     }
 
     /// Returns the fs event subscriber stats.
@@ -847,9 +937,9 @@ impl DeviceTable {
 
     /// statfs f_blocks single source (SF3/AT6-26; consumed by the
     /// statfs design — must NOT re-sum from the mirror there).
-    // First consumer: the statfs assembly (this task's statfs
-    // subtask).
-    #[expect(dead_code)]
+    // Live since T-023 S06: the SF3 field of `Erofs::vfs_super_block`
+    // above consumes it. The bridging `expect` was removed when the
+    // first consumer landed.
     pub(super) fn total_blocks(&self) -> u64 {
         self.total_blocks
     }
@@ -877,5 +967,98 @@ impl DeviceTable {
         self.slots
             .get(id as usize - 1)
             .map(|s| (s.blocks, s.mapped_blkaddr))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// statfs fsid folds: the two private pure functions consumed by the
+// SF8/SF9 branches of `Erofs::vfs_super_block` (design:
+// `docs/T-012/S06/index.md` §3, folded into `docs/T-012/analysis.md`
+// §5.2). No I/O, no state — direct ktest vectors at the tail of this
+// file.
+// ---------------------------------------------------------------------------
+
+/// SF8 — the `uuid_to_fsid` fold (statfs.h:54-59 via super.c:1000-
+/// 1001): v = le64(uuid[0..8]) XOR le64(uuid[8..16]). aster's
+/// f_fsid is a single u64; on little-endian targets the low 32
+/// bits land in fsid_t.val[0] and the high 32 in val[1], which is
+/// byte-identical to Linux's two-u32 layout (x86_64/riscv64/
+/// loongarch64 are all LE; revisit on any big-endian port).
+fn fold_uuid_to_fsid(uuid: &[u8; 16]) -> u64 {
+    // try_into on fixed-length slices cannot fail; unwrap is
+    // infallible.
+    let lo = u64::from_le_bytes(uuid[0..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(uuid[8..16].try_into().unwrap());
+    lo ^ hi
+}
+
+/// SF9 — device-encoded fsid for zero-uuid images (super.c:997-999):
+/// `huge_encode_dev` literally returns `new_encode_dev(dev)`
+/// (kdev_t.h:53-56, verified in-tree), so u64_to_fsid yields
+/// { val[0] = new_encode_dev(dev), val[1] = 0 }. Replicated from
+/// the DeviceId accessors (12-bit major / 20-bit minor, device-id
+/// crate lib.rs:38-45); every term fits in u32, no overflow.
+fn new_encode_dev(id: DeviceId) -> u32 {
+    let major = id.major().get() as u32;
+    let minor = id.minor().get();
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
+#[cfg(ktest)]
+mod tests {
+    use device_id::{MajorId, MinorId};
+    use ostd::prelude::*;
+
+    use super::*;
+
+    /// fold vectors (the design's §7 fold family). The all-zero
+    /// input actually takes the SF9 branch at runtime and never
+    /// reaches the fold — the row locks the pure formula itself.
+    /// Single-byte probes pin the byte order end to end: uuid[0]
+    /// is the lowest byte of the result, uuid[15] the top byte
+    /// (little-endian layout lock).
+    #[ktest]
+    fn fold_uuid_to_fsid_vectors() {
+        // all-zero -> 0 (formula lock; runtime goes the SF9 branch)
+        assert_eq!(fold_uuid_to_fsid(&[0u8; 16]), 0);
+        // lo = 1, hi = 0 -> 1
+        let mut uuid = [0u8; 16];
+        uuid[0] = 1;
+        assert_eq!(fold_uuid_to_fsid(&uuid), 1);
+        // lo = 0, hi = 1 -> 1 (uuid[8] is the high half's low byte)
+        let mut uuid = [0u8; 16];
+        uuid[8] = 1;
+        assert_eq!(fold_uuid_to_fsid(&uuid), 1);
+        // uuid[15] = 1 -> top byte (the LE byte-order lock)
+        let mut uuid = [0u8; 16];
+        uuid[15] = 1;
+        assert_eq!(fold_uuid_to_fsid(&uuid), 0x0100_0000_0000_0000);
+        // two equal halves -> 0 (all-0xFF form)
+        assert_eq!(fold_uuid_to_fsid(&[0xffu8; 16]), 0);
+        // the 1..=8 ladder against a zero half -> the le64 ladder
+        // (the design §7 "interleaved vector" row's expectation)
+        let mut uuid = [0u8; 16];
+        for i in 0..8 {
+            uuid[i] = i as u8 + 1;
+        }
+        assert_eq!(fold_uuid_to_fsid(&uuid), 0x0807_0605_0403_0201);
+        // the full 0..=15 ladder: staggered halves XOR to 0x08 per
+        // byte (genuine two-half coverage)
+        let ladder: [u8; 16] = core::array::from_fn(|i| i as u8);
+        assert_eq!(fold_uuid_to_fsid(&ladder), 0x0808_0808_0808_0808);
+    }
+
+    /// new_encode_dev vectors (the design's §7 encode family):
+    /// (0,0) -> 0; (8,0) -> 0x800 — the classic /dev/sda value;
+    /// (8,16) -> 0x810; (1,0xFFFFF) -> 0xFFF001FF — 20-bit minor
+    /// boundary; (0xFFF,0) -> 0xFFF00 — 12-bit major boundary.
+    #[ktest]
+    fn new_encode_dev_vectors() {
+        let dev = |major: u16, minor: u32| DeviceId::new(MajorId::new(major), MinorId::new(minor));
+        assert_eq!(new_encode_dev(dev(0, 0)), 0x0);
+        assert_eq!(new_encode_dev(dev(8, 0)), 0x800);
+        assert_eq!(new_encode_dev(dev(8, 16)), 0x810);
+        assert_eq!(new_encode_dev(dev(1, 0xFFFFF)), 0xFFF0_01FF);
+        assert_eq!(new_encode_dev(dev(0xFFF, 0)), 0xFFF00);
     }
 }

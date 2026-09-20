@@ -8,16 +8,11 @@
 //! reconfiguration keeps the framework default until the remount
 //! semantics land with T-023.
 
-use aster_block::BLOCK_SIZE;
-
 use super::super::Erofs;
 use crate::{
-    fs::{
-        utils::NAME_MAX,
-        vfs::{
-            file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
-            inode::Inode,
-        },
+    fs::vfs::{
+        file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
+        inode::Inode,
     },
     prelude::*,
 };
@@ -42,11 +37,12 @@ impl FileSystem for Erofs {
     }
 
     fn sb(&self) -> SuperBlock {
-        // Interim shape: the decoded geometry (magic included) lands
-        // with the statfs face of this task; `open` assembles fully
-        // now, so this method is reachable and reports placeholder
-        // values until then.
-        SuperBlock::new(0, BLOCK_SIZE, NAME_MAX, self.container_device_id())
+        // Dispatch-only layer (T-010 §1.4 rule 6): the statfs
+        // translation assembly lives in the family method
+        // (`Erofs::vfs_super_block`); this face never inlines it —
+        // the ext2 sample that assembles here is the negative
+        // example.
+        self.vfs_super_block()
     }
 
     fn flags(&self) -> FsFlags {

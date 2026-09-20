@@ -54,18 +54,21 @@ pub(super) const SUPER_OFFSET: usize = 1024;
 /// The erofs V1 magic number
 /// (`linux/include/uapi/linux/magic.h:23`; consumed at super.c:292).
 // Live since T-023 S03: the V2 magic door of `read_superblock`
-// (`fs.rs`) compares against it; the statfs `f_type` field joins with
-// the statfs face of this task. The bridging `expect` was removed
-// when the first consumer landed.
+// (`fs.rs`) compares against it; the statfs f_type face joined with
+// T-023 S06 (`Erofs::vfs_super_block`, SF1). The bridging `expect`
+// was removed when the first consumer landed.
 pub(super) const SUPER_MAGIC_V1: u32 = 0xE0F5E1E2;
 
 /// The maximum length of an erofs name (`EROFS_NAME_LEN`,
 /// erofs_fs.h:289) — the shared upper bound of dirent names and xattr
 /// names.
-// Hosted here (XA2) because the two consumers, `inode/dir.rs` and
-// `xattr.rs`, are mutually independent in the module DAG; the first
-// consumers land with the namei/xattr domains (T-024/T-026).
-#[expect(dead_code)]
+// Hosted here (XA2) because the consumers, `inode/dir.rs` and
+// `xattr.rs`, are mutually independent in the module DAG.
+// Live since T-023 S06: the statfs namelen face of
+// `Erofs::vfs_super_block` (`fs.rs`) reads it (SF7); the namei/xattr
+// consumers join with their domains (T-024/T-026) through the same
+// constant. The bridging `expect` was removed when the first
+// consumer landed.
 pub(super) const NAME_LEN: usize = 255;
 
 /// The size of one superblock extension slot in bytes
@@ -503,8 +506,12 @@ pub(super) struct SuperBlock {
     // was removed when the first consumer landed.
     pub(super) root_nid: u16,
     /// The total number of valid inodes (host order).
-    // First consumer: statfs `f_files` (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S06: the statfs ffree face of
+    // `Erofs::vfs_super_block` (`fs.rs`) consumes it
+    // (`u64::MAX - inos`, super.c:994). (The T-011/S02 field table
+    // named `f_files` — loose wording corrected by the S06 design:
+    // f_files is the constant ULLONG_MAX, inos feeds ffree.) The
+    // bridging `expect` was removed when the first consumer landed.
     pub(super) inos: u64,
     /// The compact-inode time derivation source, as a single
     /// `Duration` decoded through `utils::duration_from_parts` (ID1):
@@ -537,8 +544,11 @@ pub(super) struct SuperBlock {
     #[expect(dead_code)]
     pub(super) xattr_blkaddr: u32,
     /// The 128-bit volume UUID (byte array, read as-is).
-    // First consumer: the mount-time geometry consumption (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S06: the fsid branch discriminator of
+    // `Erofs::vfs_super_block` (`fs.rs`) reads it — the all-zero
+    // test picks the device-encoded branch (SF9), any other value
+    // the XOR fold (SF8). The bridging `expect` was removed when
+    // the first consumer landed.
     pub(super) uuid: [u8; 16],
     /// The volume name, as read off disk (byte array; not yet
     /// NUL-checked). The NIL door and the decoded view are the two
