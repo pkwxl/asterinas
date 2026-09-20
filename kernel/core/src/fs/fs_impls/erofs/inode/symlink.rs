@@ -25,8 +25,10 @@
 
 use ostd::mm::VmIo;
 
-use super::super::{fs::Erofs, prelude::*};
-use super::{DataLayout, InodeDesc};
+use super::{
+    super::{fs::Erofs, prelude::*},
+    DataLayout, InodeDesc,
+};
 
 /// L3 three-element fast/slow criterion in absolute byte-offset form
 /// (the terminal rewrite of the T-011 S07 §5.1 sketch anchor, S04-D1;

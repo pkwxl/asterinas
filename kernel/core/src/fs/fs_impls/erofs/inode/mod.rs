@@ -84,12 +84,23 @@ use align_ext::AlignExt;
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{const_assert, mm::VmIo};
 
-use self::data::{DataBackend, FlatLayout, InlineTail};
-use self::symlink::{is_fast_symlink, read_inline_target};
+// The erofs-level name of the data backend: `Inode::data_backend`
+// and the `DataBacked` payload field expose the type at `pub(super)`
+// (erofs) scope, so the declaration in `data.rs` carries
+// `pub(in crate::fs::fs_impls::erofs)` and this re-export provides
+// the short erofs-level path (the `private_interfaces` contract;
+// visibility-form precedent `virtiofs/inode/page_cache.rs:175`,
+// re-export precedent `ext2/inode/block_manager/mod.rs:13`).
+pub(super) use self::data::DataBackend;
+use self::{
+    data::{FlatLayout, InlineTail},
+    symlink::{is_fast_symlink, read_inline_target},
+};
 use super::{fs::Erofs, prelude::*, super_block::SuperBlock};
-use crate::fs::pipe::Pipe;
-use crate::fs::vfs::inode::Extension;
-use crate::vm::page_cache::{PageCache, PageCacheBackend};
+use crate::{
+    fs::{pipe::Pipe, vfs::inode::Extension},
+    vm::page_cache::{PageCache, PageCacheBackend},
+};
 
 /// An erofs inode number (`nid`): the linear on-disk inode identifier.
 pub(super) type ErofsNid = u64;
@@ -149,7 +160,7 @@ impl Inode {
         // (step 1, `inode_location` below) feeding the decode entry
         // (steps 2–5). Errors pass through unchanged (C2).
         let desc = read_inode_desc(
-            &*fs.block_device(),
+            &**fs.block_device(),
             fs.super_block(),
             inode_location(fs.super_block(), nid) as usize,
         )?;
@@ -379,23 +390,17 @@ pub(super) enum InodePayload {
     /// judgement is deferred to `read_link` (G-N02 error timing is
     /// an assertion face; S02-D2). Empty target (`i_size` = 0) =
     /// empty vec (readlink reports an empty string, L4).
-    FastSymlink {
-        target: Vec<u8>,
-    },
+    FastSymlink { target: Vec<u8> },
     /// CHR / BLK: the `new_decode_dev` decoding of `i_u`, done once
     /// through `desc.rdev()` at construction (S02-D3; X6's
     /// `self_dev_id` and the open arm consume it).
-    Device {
-        device_id: DeviceId,
-    },
+    Device { device_id: DeviceId },
     /// FIFO: no erofs on-disk payload for the type face, but the
     /// pipe is a live runtime facility — constructed eagerly here so
     /// the strong-Arc inode identity convergence carries the POSIX
     /// open-pairing semantics (C-5a/S07-D2: two openers of one FIFO
     /// rendezvous on the same `Pipe`).
-    Fifo {
-        pipe: Pipe,
-    },
+    Fifo { pipe: Pipe },
     /// SOCK: no payload at all (the `i_u` type face is not read;
     /// linux `init_special_inode` leaves `i_rdev` 0 — X6 → None).
     NoPayload,
@@ -534,7 +539,10 @@ impl InodePayload {
         // (F4/G-M21).
         let page_cache = PageCache::new_with_backend(page_cache_size, page_cache_backend)
             .expect("erofs inode page cache allocation failed");
-        InodePayload::DataBacked { page_cache, backend }
+        InodePayload::DataBacked {
+            page_cache,
+            backend,
+        }
     }
 }
 

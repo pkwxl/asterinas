@@ -62,12 +62,18 @@ use crate::vm::page_cache::BlockAsPageCacheBackend;
 /// payloads (decision 1, `docs/T-024/subtasks.md` S01; final shape
 /// lands with T-025 — see the module doc for the seam contract).
 ///
+/// Declared at erofs scope (`pub(in crate::fs::fs_impls::erofs)`)
+/// because erofs-visible signatures — `Inode::data_backend` and the
+/// `DataBacked` payload field — name the type (the
+/// `private_interfaces` contract; the `data` module itself stays
+/// private, and `inode/mod.rs` re-exports the short path).
+///
 /// One instance per inode, constructed inside the iget write-guard
 /// critical section and immutable afterwards: the geometry is
 /// collapsed once (L3) and never re-derived. The page cache it
 /// serves holds only a `Weak<dyn PageCacheBackend>` here; the
 /// strong owner is the `InodePayload::DataBacked` variant.
-pub(super) struct DataBackend {
+pub(in crate::fs::fs_impls::erofs) struct DataBackend {
     /// Weak back-reference to the owning filesystem — the
     /// constructor-seam parameter for the T-025 map_blocks face
     /// (mount geometry and device-table walks); the minimal face
