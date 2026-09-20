@@ -35,10 +35,15 @@
 //! uncached and replayed on every call) and the fast/slow symlink
 //! split (the judgement and the inline-target read live in
 //! `inode/symlink.rs`); the data backend is the minimal flat face in
-//! `inode/data.rs` (final mapping shape lands with T-025). The
-//! metadata face (statx assembly), the namei/dir faces, and the VFS
-//! dispatch rewrite are the follow-up subtasks of T-024; until they
-//! land, the VFS adapter keeps its transitional answers.
+//! `inode/data.rs` (final mapping shape lands with T-025). Since
+//! T-024 S02 the cross-seven-kind inherent faces are in place: the
+//! statx assembly (`metadata`), the open dispatch (`open`), and the
+//! SEEK_END anchor (`seek_end`) live on the handle below, the
+//! unified `read_link` exit in `inode/symlink.rs`, and the `read_at`
+//! guard positions in `inode/file.rs` (the data body itself is
+//! T-025). The namei/dir faces and the VFS dispatch rewrite are the
+//! remaining subtasks of T-024; until the rewrite lands, the VFS
+//! adapter keeps its transitional answers.
 //!
 //! # Submodules
 //!
@@ -46,9 +51,9 @@
 //! |-----------|------------------------------------------------------------------|
 //! | `mod`     | The inode handle, payload assembly, and decoding (T-022 + T-024) |
 //! | `data`    | Minimal flat page-cache backend; final mapping (T-025)           |
-//! | `file`    | Regular-file reads through the page cache (T-025)                |
+//! | `file`    | `read_at` guards; the data body lands with T-025                  |
 //! | `dir`     | Dirent decoding and name lookup (T-024)                          |
-//! | `symlink` | Fast/slow split and inline symlink target reads (T-024)          |
+//! | `symlink` | Fast/slow split, inline target reads, `read_link` (T-024)         |
 //!
 //! # Locking
 //!
@@ -98,7 +103,13 @@ use self::{
 };
 use super::{fs::Erofs, prelude::*, super_block::SuperBlock};
 use crate::{
-    fs::{pipe::Pipe, vfs::inode::Extension},
+    device,
+    fs::{
+        file::{AccessMode, PerOpenFileOps, StatusFlags},
+        pipe::Pipe,
+        vfs::inode::{Extension, Metadata},
+    },
+    process::{Gid, Uid},
     vm::page_cache::{PageCache, PageCacheBackend},
 };
 
@@ -233,6 +244,14 @@ impl Inode {
         &self.extension
     }
 
+    /// Returns a reference to the decoded descriptor — the single
+    /// decode-side data source every downstream face reads through
+    /// (`self.desc` stays the only copy; the seek/`read_link`
+    /// geometry consumers join through this view, S01-D1).
+    pub(super) fn desc(&self) -> &InodeDesc {
+        &self.desc
+    }
+
     // -------------------------------------------------------------------
     // Payload accessor face (S02-D5: the Option face — a missing
     // payload is an internal shape fact, never an errno; the trait
@@ -243,9 +262,10 @@ impl Inode {
     /// Data-backed page-cache view; `None` for every other payload
     /// (the Some/None mapping is locked by the S02 §2.6 table:
     /// DataBacked only).
-    // First consumers: the slow-symlink read arm (S02) and the
-    // directory walks (S03) — both T-024; the dispatch face joins
-    // with S05.
+    // First consumer: the directory walks (S03, T-024); the
+    // dispatch face joins with S05. (The slow-symlink read arm
+    // matches the payload field in place instead of going through
+    // this Option face — the S04 §4.1 terminal sample.)
     #[expect(dead_code)]
     pub(super) fn page_cache(&self) -> Option<&PageCache> {
         match &self.payload {
@@ -268,7 +288,11 @@ impl Inode {
     /// Fast-symlink inline copy, stored as raw bytes — the UTF-8
     /// judgement is deferred to `read_link` (G-N02 error timing is
     /// an assertion face; S02-D2). `FastSymlink` only.
-    // First consumer: the `read_link` unified exit (S02, T-024).
+    // No consumer as of T-024 S02: the `read_link` unified exit
+    // matches the payload field in place (the S04 §4.1 terminal
+    // sample), superseding this face's anticipated first consumer.
+    // Kept as the FastSymlink view of the locked C-5b five-accessor
+    // face; later consumers join through it.
     #[expect(dead_code)]
     pub(super) fn fast_symlink_target(&self) -> Option<&[u8]> {
         match &self.payload {
@@ -279,9 +303,9 @@ impl Inode {
 
     /// Decoded device number (CHR/BLK only; decoded once through
     /// `desc.rdev()` at construction, S02-D3 — open never re-decodes).
-    // First consumers: the metadata assembly and the open arm
-    // (S02, T-024).
-    #[expect(dead_code)]
+    // Live since T-024 S02: the metadata assembly (`self_dev_id`)
+    // and the open CHR/BLK arm read it. The bridging `expect` was
+    // removed when those consumers landed.
     pub(super) fn device_id(&self) -> Option<DeviceId> {
         match &self.payload {
             InodePayload::Device { device_id } => Some(*device_id),
@@ -292,11 +316,160 @@ impl Inode {
     /// FIFO pipe host (FIFO only; constructed eagerly at assembly —
     /// the strong-Arc identity convergence carries the POSIX
     /// open-pairing semantics, S07-D2/C-5a).
-    // First consumer: the FIFO open arm (S02, T-024).
-    #[expect(dead_code)]
+    // Live since T-024 S02: the FIFO open arm reads it. The
+    // bridging `expect` was removed when that consumer landed.
     pub(super) fn fifo_pipe(&self) -> Option<&Pipe> {
         match &self.payload {
             InodePayload::Fifo { pipe } => Some(pipe),
+            _ => None,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Cross-seven-kind inherent faces (T-024 S02; `docs/T-013/
+    // analysis.md` §2/§6). Hosted on the handle — not in the VFS
+    // adapter — because each face spans kinds and payloads across
+    // the submodule domains (S03-D1/S07-D1/S06-D6); the adapter
+    // forwards to them with one line each once the S05 dispatch
+    // rewrite lands. Until then these carry bridging expects.
+    // -------------------------------------------------------------------
+
+    /// Assembles the statx snapshot — the `erofs_getattr` homologue
+    /// (linux inode.c:316-346; the G-Z02 accounting itself is done
+    /// at decode time, T-011 §4.5). Infallible by construction
+    /// (X16, assembly half): the descriptor and payload are eagerly
+    /// decoded in `Inode::new`, so this reads in-memory state only —
+    /// no device I/O, no `?`, no error face.
+    ///
+    /// Field notes (`docs/T-013/S03/index.md` §1): the three times
+    /// are one `Duration` copied three times (D10, zero arithmetic —
+    /// the framework's `as i64` truncation at the statx exit is then
+    /// bit-level parity); `nr_sectors_allocated` takes
+    /// `desc.nr_sectors` verbatim — the decode-time dual caliber
+    /// with no per-kind branch here (G-Z02; the ext2 single
+    /// round_up caliber at `ext2/inode/attrs.rs:68` is the negative
+    /// sample — copying it would drift st_blocks on compressed
+    /// special files); `birth_at` is `None` (no on-disk source).
+    // Bridging expect: the VFS adapter still carries the
+    // transitional placeholder metadata until the S05 rewrite
+    // forwards `Ok(self.metadata())` — first consumer: S05.
+    #[expect(dead_code)]
+    pub(super) fn metadata(&self) -> Metadata {
+        let desc = &self.desc;
+        // The only fallible input: the weak-upgrade for the two
+        // fs-derived fields. Unreachable under the strong-Arc inode
+        // cache (the mount always outlives the inodes it handed
+        // out); degrades gracefully to a null identity (S03-D2;
+        // ext2 precedent `ext2/inode/attrs.rs:54-57`).
+        let (container_dev_id, optimal_block_size) = match self.fs() {
+            Ok(fs) => (
+                fs.block_device().id(), // X1: the mount block device
+                fs.super_block().block_size(), // X11: 1 << blkszbits (4096, G-M08)
+            ),
+            Err(_) => (DeviceId::null(), 0),
+        };
+        Metadata {
+            ino: self.nid, // X2: st_ino = nid, 64-bit identity
+            size: desc.size as usize, // X7: I7 caps at i64::MAX
+            optimal_block_size, // X11
+            // X10/G-Z02: the decode-time single source, used as-is.
+            nr_sectors_allocated: desc.nr_sectors,
+            // X8: three times, one source (D10) — zero arithmetic.
+            last_access_at: desc.time,
+            last_modify_at: desc.time,
+            last_meta_change_at: desc.time,
+            type_: desc.kind.into(), // X3 half: the S_IFMT segment
+            mode: desc.mode, // X3 half: the 12 permission bits
+            nr_hard_links: desc.nlink as usize, // X4: raw value incl. 0
+            uid: Uid::new(desc.uid), // X5: zero-extended at decode
+            gid: Gid::new(desc.gid),
+            container_dev_id, // X1
+            self_dev_id: self.device_id(), // X6: payload Option face
+            birth_at: None, // X9: no birth-time source
+        }
+    }
+
+    /// Opens this inode as a file, device, or pipe — the VFS
+    /// `Inode::open` dispatch target (G-N03). `None` = open through
+    /// the inode's own `FileOps` (REG/DIR); `Some(Err(ENODEV))` =
+    /// kinds with no Linux file_operations (LNK/SOCK).
+    ///
+    /// The LNK/SOCK arm is the only parity shape and stays even
+    /// though the regular open(2) channel never reaches it
+    /// (`Path::open` ELOOPs on O_NOFOLLOW and the resolver follows
+    /// the link otherwise; S07-D4 — dropping the arm would revive
+    /// the None semantics and drift). O_PATH bypasses this face
+    /// entirely. CHR/BLK go through `device::lookup` with the
+    /// payload's construction-time `device_id` (S02-D3 — the same
+    /// single consumption face as X6's `self_dev_id`; no ext2-style
+    /// decode-failure arm exists: `new_decode_dev` has no error
+    /// path); a missing device is ENODEV, a found one opens through
+    /// `Device::open`. FIFO opens the payload's eagerly constructed
+    /// `Pipe` (C-5a/S07-D2: the strong-Arc identity convergence
+    /// carries the POSIX open-pairing semantics).
+    // Bridging expect: the trait face still returns the framework
+    // default `None` until the S05 rewrite adds the forwarding
+    // override — first consumer: S05.
+    #[expect(dead_code)]
+    pub(super) fn open(
+        &self,
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+    ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
+        match self.kind() {
+            // REG/DIR: per-open stateless — opened through this
+            // inode's own `FileOps` (A2a/A2b: fops attached directly).
+            FileKind::Reg | FileKind::Dir => None,
+            // LNK/SOCK: no Linux file_operations exist for the kind
+            // (A2c/A3) — the inode's own open is ENODEV
+            // (linux/fs/open.c:933-937).
+            FileKind::Lnk | FileKind::Sock => Some(Err(Error::with_message(
+                Errno::ENODEV,
+                "opening a symlink or socket inode is not supported",
+            ))),
+            FileKind::Chr | FileKind::Blk => {
+                let device_id = self
+                    .device_id()
+                    .expect("chr/blk inode must carry a Device payload");
+                // device_type single source: the S03-D3 bijection
+                // (no second Chr→Char mapping, drift-proof).
+                let device_type = InodeType::from(self.kind())
+                    .device_type()
+                    .expect("chr/blk kind always maps to a device type");
+                match device::lookup(device_type, device_id) {
+                    None => Some(Err(Error::with_message(
+                        Errno::ENODEV,
+                        "the required device ID does not exist",
+                    ))),
+                    Some(device) => Some(device.open()),
+                }
+            }
+            FileKind::Fifo => {
+                let pipe = self
+                    .fifo_pipe()
+                    .expect("fifo inode must carry a Fifo payload");
+                Some(pipe.open_named(access_mode, status_flags))
+            }
+            // Unreachable: the I8 guard ("bogus i_mode", EUCLEAN)
+            // rejects the Other kind at the decode, so a runtime
+            // descriptor never carries it.
+            FileKind::Other(_) => unreachable!("I8 rejects the Other kind at decode"),
+        }
+    }
+
+    /// SEEK_END anchor: directories report `i_size` (G-N06,
+    /// candidate ①) — replicating the framework default's File arm
+    /// (`vfs/fs_apis/inode.rs:532-543`), which an override would
+    /// otherwise lose. usize is lossless for u64 sizes on 64-bit
+    /// targets (I7 caps size at i64::MAX). The remaining kinds keep
+    /// the default face (`None`).
+    // Bridging expect: the trait face still uses the framework
+    // default until the S05 rewrite adds the forwarding override —
+    // first consumer: S05.
+    #[expect(dead_code)]
+    pub(super) fn seek_end(&self) -> Option<usize> {
+        match self.kind() {
+            FileKind::Dir | FileKind::Reg => Some(self.desc().size as usize),
             _ => None,
         }
     }
@@ -1268,22 +1441,19 @@ pub(super) struct InodeDesc {
     pub(super) kind: FileKind,
     /// The 12 permission bits, carried losslessly (X3: no permission
     /// canonicalization at the decode).
-    // First reader: Metadata.mode (T-024).
-    #[expect(dead_code)]
+    // Live since T-024 S02: read by the metadata assembly
+    // (`Inode::metadata`, the Metadata.mode field).
     pub(super) mode: InodeMode,
     /// The owner id (zero-extended from le16 on the compact form).
-    // First reader: the Uid wrapper (T-024).
-    #[expect(dead_code)]
+    // Live since T-024 S02: the Uid wrapper in the metadata assembly.
     pub(super) uid: u32,
     /// The group id (zero-extended from le16 on the compact form).
-    // First reader: the Gid wrapper (T-024).
-    #[expect(dead_code)]
+    // Live since T-024 S02: the Gid wrapper in the metadata assembly.
     pub(super) gid: u32,
     /// The hard-link count, carried as-is including 0 — the ext2
     /// link-count ESTALE door is an ext2-specific defense and is
     /// deliberately not transcribed.
-    // First reader: Metadata.nr_hard_links (T-024, as usize).
-    #[expect(dead_code)]
+    // Live since T-024 S02: Metadata.nr_hard_links (as usize).
     pub(super) nlink: u32,
     /// The file size. Construction invariant: <= i64::MAX (the
     /// extended form via the I7 guard, the compact form by the le32
@@ -1314,8 +1484,8 @@ pub(super) struct InodeDesc {
     // granularity semantics are carried here: timestamps decode into
     // nanosecond-resolution Durations at inode-read time (compact inodes
     // derive ctime from the superblock build time).
-    // First reader: the three Metadata times (T-024, S02).
-    #[expect(dead_code)]
+    // Live since T-024 S02: the three Metadata times (one Duration,
+    // three copies) in the metadata assembly.
     pub(super) time: Duration,
     /// The C union `i_u` as the single host-order source (the
     /// conversion body's one `from_le`); every reading — the
@@ -1331,8 +1501,8 @@ pub(super) struct InodeDesc {
     /// The 512-byte-sector accounting — the D12 dual-caliber product
     /// (the formula's single source is the G-Z02 note inside the
     /// conversion bodies, T-022 S07).
-    // First reader: Metadata.nr_sectors_allocated (T-024).
-    #[expect(dead_code)]
+    // Live since T-024 S02: Metadata.nr_sectors_allocated reads it
+    // verbatim (the G-Z02 assembly-side zero-formula discipline).
     pub(super) nr_sectors: usize,
 }
 

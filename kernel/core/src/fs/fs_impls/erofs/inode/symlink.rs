@@ -2,7 +2,8 @@
 
 //! The erofs symlink faces: the fast/slow split judgement and the
 //! inline-target read, both consumed by the LNK arm of the payload
-//! assembly (`InodePayload::new`, `inode/mod.rs`).
+//! assembly (`InodePayload::new`, `inode/mod.rs`), plus the unified
+//! `read_link` exit that serves both payload forms (below).
 //!
 //! What "slow symlinks are cut" means (C-6g, `docs/T-013/analysis.md`
 //! §3.2 — the correct reading of the early skeleton note): the cut
@@ -27,7 +28,7 @@ use ostd::mm::VmIo;
 
 use super::{
     super::{fs::Erofs, prelude::*},
-    DataLayout, InodeDesc,
+    DataLayout, FileKind, Inode, InodeDesc, InodePayload,
 };
 
 /// L3 three-element fast/slow criterion in absolute byte-offset form
@@ -101,4 +102,59 @@ pub(super) fn read_inline_target(fs: &Erofs, nid: ErofsNid, desc: &InodeDesc) ->
     let mut buf = vec![0u8; desc.size as usize];
     fs.block_device().read_bytes(start as usize, &mut buf)?; // I2 passthrough
     Ok(buf)
+}
+
+impl Inode {
+    /// Reads the symlink target as a UTF-8 string — the unified exit
+    /// for both payload forms (the aster homologue of the erofs iops
+    /// split: fast = `simple_get_link` returning `i_link` directly,
+    /// slow = `page_get_link`; the two iops are absorbed by "payload
+    /// choice + one exit", T-003 §2.1 L5). EROFS always yields
+    /// `SymbolicLink::Plain` at the dispatch face (the Path variant
+    /// is procfs-only, `vfs/fs_apis/inode.rs:729-742`).
+    ///
+    /// Err face: EISDIR (non-LNK, below) / page-read passthrough
+    /// (slow arm) / EIO (non-UTF-8 target, G-N02 candidate ①).
+    // Bridging expect: the trait face still returns the framework
+    // default EISDIR until the S05 rewrite forwards
+    // `self.read_link().map(SymbolicLink::Plain)` — first consumer:
+    // S05.
+    #[expect(dead_code)]
+    pub(in crate::fs::fs_impls::erofs) fn read_link(&self) -> Result<String> {
+        // Kind guard first: non-LNK replicates the trait default
+        // face (EISDIR, `vfs/fs_apis/inode.rs:461-463`) — this IS
+        // the readlink(2)-on-non-LNK errno (SYM-08). A Rust trait
+        // impl is all-or-nothing for the single inode type, so
+        // "taking the default" for the non-LNK kinds means
+        // re-issuing it here (Linux's EINVAL there is a registered
+        // framework-default difference, analysis.md §9.1 — not
+        // simulated; the ext2 EINVAL form at
+        // `ext2/inode/symlink.rs:60-62` is not transcribed).
+        if self.kind() != FileKind::Lnk {
+            return_errno_with_message!(Errno::EISDIR, "inode is not a symbolic link");
+        }
+        let bytes: Vec<u8> = match &self.payload {
+            // Fast arm: the construction-time inline copy, raw
+            // bytes (the UTF-8 judgement is deferred to this exit,
+            // S02-D2).
+            InodePayload::FastSymlink { target } => target.clone(),
+            InodePayload::DataBacked { page_cache, .. } => {
+                let mut buf = vec![0u8; self.desc().size as usize];
+                // Slow arm: read errors pass through unchanged (L5)
+                // — no blanket-EIO mapping; the ext2 form at
+                // `ext2/inode/symlink.rs:136-138` would collapse
+                // the EUCLEAN/EINVAL family onto EIO (S04-D4).
+                page_cache.read_bytes(0, &mut buf)?;
+                buf
+            }
+            // LNK payload ∈ {FastSymlink, DataBacked} by
+            // construction (the LNK arm of `InodePayload::new`).
+            _ => unreachable!("LNK payload is either FastSymlink or DataBacked"),
+        };
+        // G-N02 candidate ①: non-UTF-8 target → EIO — the single
+        // conversion point shared by both arms (S04-D5; message
+        // precedent `ext2/inode/symlink.rs:131-132,140-141`).
+        String::from_utf8(bytes)
+            .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
+    }
 }
