@@ -37,14 +37,15 @@
 //! uncached and replayed on every call) and the fast/slow symlink
 //! split (the judgement and the inline-target read live in
 //! `inode/symlink.rs`); the data backend in `inode/data.rs` carries
-//! the final data geometry since T-025 S01 (the mapping faces land
-//! with the remaining slices). Since
+//! the final data geometry, the map faces, and the four-arm
+//! page-cache bridge (T-025 S01/S03–S05). Since
 //! T-024 S02 the cross-seven-kind inherent faces are in place: the
 //! statx assembly (`metadata`), the open dispatch (`open`), and the
 //! SEEK_END anchor (`seek_end`) live on the handle below, the
-//! unified `read_link` exit in `inode/symlink.rs`, and the `read_at`
-//! guard positions in `inode/file.rs` (the data body itself is
-//! T-025). Since T-024 S03 both dirent walks live in `inode/dir.rs`
+//! unified `read_link` exit in `inode/symlink.rs`, and both read
+//! entries — the buffered `read_at` body and the direct-I/O
+//! `read_direct_at` — in `inode/file.rs` (T-025 S07/S08). Since
+//! T-024 S03 both dirent walks live in `inode/dir.rs`
 //! — the namei binary search (lookup) and the getdents iteration
 //! (readdir), kept apart by the two-strictness-domains contract of
 //! that module — and since T-024 S05 the VFS adapter
@@ -56,8 +57,8 @@
 //! | Submodule | Responsibility                                                   |
 //! |-----------|------------------------------------------------------------------|
 //! | `mod`     | The inode handle, payload assembly, and decoding (T-022 + T-024) |
-//! | `data`    | Flat page-cache backend on the final geometry (T-025)           |
-//! | `file`    | `read_at` guards; the data body lands with T-025                  |
+//! | `data`    | The data backend: map faces + four-arm page-cache bridge (T-025) |
+//! | `file`    | Both read entries: buffered `read_at` + `read_direct_at` (T-025)  |
 //! | `dir`     | Both dirent walks: namei lookup + getdents (T-024 S03)           |
 //! | `symlink` | Fast/slow split, inline target reads, `read_link` (T-024)         |
 //!
@@ -282,7 +283,8 @@ impl Inode {
     /// DataBacked only).
     // Live since T-024 S03: both directory walks (the namei binary
     // search and the getdents iteration in `inode/dir.rs`) read
-    // through this face; the dispatch face joined with S05. (The
+    // through this face; the dispatch face joined with S05, and the
+    // buffered file read (`file.rs read_at`) with T-025 S08. (The
     // slow-symlink read arm matches the payload field in place
     // instead of going through this Option face — the S04 §4.1
     // terminal sample.)
@@ -295,8 +297,9 @@ impl Inode {
 
     /// Data-mapping backend handle (DataBacked only).
     // Live since T-025 S07: the DIO read path (file.rs
-    // `read_direct_at`) consumes the backend through this face; the
-    // buffered face joins with the S08 collection.
+    // `read_direct_at`) is the consumer — the buffered arm reads
+    // through the `page_cache()` face instead (the backend fills it
+    // indirectly, via the page-cache bridge).
     pub(super) fn data_backend(&self) -> Option<&Arc<DataBackend>> {
         match &self.payload {
             InodePayload::DataBacked { backend, .. } => Some(backend),

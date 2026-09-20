@@ -87,7 +87,7 @@ impl FileOps for ErofsInode {
             self.read_direct_at(offset, writer)
         } else {
             // file.rs read_at: EISDIR guard first, zero-length early
-            // exit, then the buffered body (the S08 collection).
+            // exit, then the DataBacked page-cache read.
             self.read_at(offset, writer)
         }
     }

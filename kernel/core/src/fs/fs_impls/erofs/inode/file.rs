@@ -23,13 +23,6 @@
 //! preallocation paths do not exist: the filesystem is read-only and
 //! every mutating entry point is rejected with `EROFS` at the VFS
 //! adapter.
-//!
-//! Bring-up state (T-025 S07): the direct-I/O arm below is final;
-//! the buffered body past its guards still answers the
-//! deferred-capability `EOPNOTSUPP` until the S08 slice lands the
-//! page-cache read (decision 1 of `docs/T-025/subtasks.md` — the
-//! buffered flip is the activation point of the DATA-guarded boot
-//! regressions, so the intermediate state stays red-window-free).
 
 #![short_vis_path::add(erofs)]
 
@@ -47,18 +40,28 @@ impl Inode {
     /// directory fd gets EISDIR before anything else — including the
     /// zero-length buffer (R2; sample `ext2/inode/file.rs:22-25`) —
     /// then a zero-length read is `Ok(0)` (ext2 same-order early
-    /// exit). The data body beyond the guards lands with the T-025
-    /// S08 slice.
+    /// exit). Past the guards, the three-segment collection (the C-7
+    /// position pin; ext2 `inode/file.rs:229-243` the form
+    /// reference): a post-EOF offset reads `Ok(0)`, a cross-EOF read
+    /// is pre-truncated to `size − offset` with the writer limited
+    /// to that bound (M3 — EOF truncation is the FS side's duty; the
+    /// page-cache layer's own clipping is never relied on), and the
+    /// page-cache read's fill errors propagate unfolded through `?`
+    /// (no blanket-EIO; the EUCLEAN-through-VmIo folding is the
+    /// registered S06 §3 known-diff).
     // Deliberately NO set_atime after reads — G-N07; the ext2
     // body's post-read `set_atime(utils::now())`
     // (`ext2/inode/file.rs:32`) is the negative sample, same family
     // as `ext2/inode/dir/mod.rs:61`.
     //
     // Live since T-024 S05: the VFS adapter's `FileOps::read_at`
-    // forwards to this body (the else arm of the dispatch).
+    // forwards to this body (the else arm of the dispatch); the data
+    // body since T-025 S08 — the buffered flip, the activation point
+    // of the DATA-guarded boot regressions (decision 1 of
+    // `docs/T-025/subtasks.md`).
     pub(in crate::fs::fs_impls::erofs) fn read_at(
         &self,
-        _offset: usize,
+        offset: usize,
         writer: &mut VmWriter,
     ) -> Result<usize> {
         // read(2) on a directory fd → EISDIR. Guard precedes
@@ -69,9 +72,24 @@ impl Inode {
         if writer.avail() == 0 {
             return Ok(0);
         }
-        // Data body: DataBacked page-cache read — lands with the S08
-        // slice (decision 1); the message keeps the transitional form.
-        return_errno_with_message!(Errno::EOPNOTSUPP, "erofs data path is not implemented yet");
+        // The three segments (C-7). `size` is the immutable decode
+        // snapshot (X7) — the i_size_read race of a writable
+        // filesystem does not exist here. The cache handle is
+        // structurally Some past the EISDIR guard (REG is always
+        // DataBacked; the FastSymlink corner is unreachable through
+        // open) — the EINVAL else arm is the same defensive errno as
+        // the direct arm's backend fetch below, never a panic.
+        let size = self.desc().size;
+        let Some(page_cache) = self.page_cache() else {
+            return_errno_with_message!(Errno::EINVAL, "inode has no data page cache");
+        };
+        if offset as u64 >= size {
+            return Ok(0);
+        }
+        let read_len = writer.avail().min((size - offset as u64) as usize);
+        writer.limit(read_len);
+        page_cache.read(offset, writer)?;
+        Ok(read_len)
     }
 
     /// Direct-I/O read path (T-025 S07; `docs/T-014/S07/index.md`
@@ -544,9 +562,9 @@ mod tests {
     /// would instead issue one whole-block 8-sector read at sector
     /// 8); the INLINE tail reads its payload straight out of the
     /// metadata area through the same data outlet. (The comparative
-    /// buffered half of the invariant — a fill observed > 0 — joins
-    /// with the S08 slice; until then the buffered arm has no body
-    /// to fill with.)
+    /// buffered half of the invariant — a fill observed > 0 — is
+    /// pinned by the S08 suite below,
+    /// `buffered_read_at_collects_through_page_cache`.)
     #[ktest]
     fn dio_no_page_cache_touch() {
         // A sub-page MAPPED window [512, 1024): one sector at 9.
@@ -609,6 +627,104 @@ mod tests {
                     start_sector: 28,
                     nr_sectors: 1,
                 },
+            ]
+        );
+    }
+
+    /// S08-IF (the flip): the buffered body collects through the
+    /// page cache — the comparative half of `dio_no_page_cache_touch`
+    /// above. Same flat fixture, same window [512, 1024): the
+    /// unflagged read FILLS page 0 (one whole-block 8-sector read at
+    /// sector 8 — the block channel), where the flagged walk bounced
+    /// 1 sector at 9 without filling anything. The three segments'
+    /// EOF faces are the second half: post-EOF offsets read `Ok(0)`
+    /// with the writer untouched, and a cross-EOF read pre-truncates
+    /// to `size − offset` — the tail page riding the byte channel
+    /// inside the fill, with the staged device residue past i_size
+    /// never reaching the buffer (G-P02's buffered face).
+    #[ktest]
+    fn buffered_read_at_collects_through_page_cache() {
+        let disk = Arc::new(ErofsMemoryDisk::new(4 * PAGE_SIZE));
+        stage_pattern(&disk, PAGE_SIZE, 2 * PAGE_SIZE);
+        let inode = ktest_flat_reg(
+            disk.clone(),
+            DataLayout::FlatPlain,
+            2 * PAGE_SIZE as u64,
+            0,
+            1,
+        );
+        // post-EOF: Ok(0) at the boundary and far beyond; the writer
+        // keeps its full window (no limit shrink) and the device log
+        // stays empty (no speculative fill).
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+        assert_eq!(inode.read_at(2 * PAGE_SIZE, &mut writer).unwrap(), 0);
+        assert_eq!(inode.read_at(1 << 20, &mut writer).unwrap(), 0);
+        assert_eq!(writer.avail(), PAGE_SIZE, "the writer is untouched");
+        assert!(disk.requests().is_empty());
+        // The window [512, 1024): content byte-exact, and the sole
+        // device touch is the whole-block page-cache fill — the
+        // channel discriminator against the DIO 1-sector bounce.
+        let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+        assert_eq!(inode.read_at(512, &mut writer).unwrap(), 512);
+        for (i, &byte) in buf.iter().enumerate().take(512) {
+            assert_eq!(byte, pattern(PAGE_SIZE + 512 + i), "byte {i}");
+        }
+        assert!(
+            buf[512..].iter().all(|&b| b == 0),
+            "only the requested window advanced"
+        );
+        assert_eq!(
+            disk.requests(),
+            vec![BioRequest {
+                type_: BioType::Read,
+                start_sector: 8,
+                nr_sectors: 8,
+            }]
+        );
+
+        // Cross-EOF truncation on a fresh disk: size = PAGE + 300,
+        // window [512, 512 + PAGE) → truncated to 3884. Page 0 fills
+        // whole (block channel, 8 sectors at 8); the tail page's
+        // [0, 300) prefix rides the byte channel (one sector at 16)
+        // — the two channels inside one buffered read, and the
+        // patterned residue past i_size stays on the device.
+        let disk = Arc::new(ErofsMemoryDisk::new(3 * PAGE_SIZE));
+        stage_pattern(&disk, PAGE_SIZE, 2 * PAGE_SIZE);
+        let inode = ktest_flat_reg(
+            disk.clone(),
+            DataLayout::FlatPlain,
+            PAGE_SIZE as u64 + 300,
+            0,
+            1,
+        );
+        let mut buf = vec![0u8; 2 * PAGE_SIZE];
+        let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+        assert_eq!(
+            inode.read_at(512, &mut writer).unwrap(),
+            3884,
+            "truncated to size − offset"
+        );
+        for (i, &byte) in buf.iter().enumerate().take(3884) {
+            assert_eq!(byte, pattern(PAGE_SIZE + 512 + i), "byte {i}");
+        }
+        assert!(
+            buf[3884..].iter().all(|&b| b == 0),
+            "no residue past i_size"
+        );
+        assert_eq!(
+            disk.requests(),
+            vec![
+                BioRequest {
+                    type_: BioType::Read,
+                    start_sector: 8,
+                    nr_sectors: 8,
+                }, // page 0 fill: whole block (block channel)
+                BioRequest {
+                    type_: BioType::Read,
+                    start_sector: 16,
+                    nr_sectors: 1,
+                }, // tail page [0, 300): byte-channel bounce
             ]
         );
     }

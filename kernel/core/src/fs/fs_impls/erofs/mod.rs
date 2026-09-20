@@ -63,16 +63,16 @@
 //! # Bring-up state
 //!
 //! The skeleton, the superblock/inode decoding, the mount assembly,
-//! and the namei family have landed (T-021..T-024). T-025 lands the
-//! non-compressed data path: the mapping layer and the page-cache
-//! bridge in `inode/data.rs` are final since its S05 slice — every
-//! DataBacked page fill (buffered reads, mmap faults, readdir, slow
-//! symlinks) goes through the four-arm backend — and the direct-I/O
-//! read path (the flag dispatch in `impl_for_vfs` plus
-//! `read_direct_at` in `inode/file.rs`) since S07: DIO reads walk
-//! the extents straight through the device byte channel and never
-//! touch the page cache. The buffered `read_at` collection is the
-//! remaining slice.
+//! and the namei family have landed (T-021..T-024). T-025 completes
+//! the non-compressed data path: the mapping layer and the page-cache
+//! bridge in `inode/data.rs` (final since its S05 slice — every
+//! DataBacked page fill, whether from buffered reads, mmap faults,
+//! readdir, or slow symlinks, goes through the four-arm backend), the
+//! buffered `read_at` collection through the page cache
+//! (`inode/file.rs`), and the direct-I/O read path (the flag dispatch
+//! in `impl_for_vfs` plus `read_direct_at` in `inode/file.rs`) — DIO
+//! reads walk the extents straight through the device byte channel
+//! and never touch the page cache.
 //!
 //! # References
 //!
