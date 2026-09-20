@@ -1960,12 +1960,47 @@ pub(super) fn read_inode_desc(
     }
 }
 
+/// A directly-constructed `Inode` over a literal descriptor (ktest-only,
+/// T-025 S06; the subtasks decision-2 fixture). The five-step device decode
+/// of `Inode::new` is replaced by the caller's `desc` literal — staging a
+/// full raw inode record on the disk is the image-builder fixture's
+/// business (T-027) — while the payload assembly stays the PRODUCTION
+/// `InodePayload::new`: the I12 arm-head gate, the fast/slow symlink
+/// criterion, and `new_data_backed` (page cache + `DataBackend`) all run
+/// for real, so a slow-LNK handle built here walks the exact production
+/// chain `read_link → page_cache → submit_read_bio` that the S06-IF
+/// assertion family pins. Private-field visibility keeps it in this
+/// module (decision 2); it stays OUTSIDE `mod tests` so later slices
+/// (S07's DIO suite hosts `inode/file.rs`) can consume it too.
+#[cfg(ktest)]
+fn ktest_inode_from_desc(fs: &Erofs, nid: ErofsNid, desc: InodeDesc) -> Arc<Inode> {
+    let payload = InodePayload::new(fs, nid, &desc)
+        .expect("ktest fixture: payload assembly of an uncompressed fixture cannot fail");
+    Arc::new(Inode {
+        nid,
+        desc,
+        payload,
+        self_ref: fs.self_ref().clone(),
+        extension: Extension::new(),
+    })
+}
+
 #[cfg(ktest)]
 mod tests {
-    use ostd::prelude::*;
+    use aster_block::{
+        SECTOR_SIZE,
+        bio::{BioRequest, BioSegment, BioStatus, BioType},
+    };
+    use ostd::{mm::VmIo, prelude::*};
 
     use super::*;
-    use crate::fs::fs_impls::erofs::test_utils::ktest_super_block;
+    use crate::{
+        fs::fs_impls::erofs::test_utils::{
+            ErofsMemoryDisk, ktest_bio_trio, ktest_flat_geometry, ktest_fs_on,
+            ktest_single_device_table, ktest_super_block,
+        },
+        vm::page_cache::BlockAsPageCacheBackend,
+    };
 
     /// A knob-complete `InodeDesc` literal for the geometry suites:
     /// the `ktest_lnk_desc` fixture is LNK-shaped with a fixed Flat
@@ -2242,5 +2277,353 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The INLINE assertion face (T-025 S06; `docs/T-014/S06/index.md`
+    // §9): the full-page META corner and the start-offset grid drive the
+    // bridge directly (the S05 fixture family over the memory disk);
+    // the slow-LNK three-region chain drives the REAL read_link path
+    // through the production payload assembly (`ktest_inode_from_desc`
+    // above). Host = this module per subtasks S06(b).
+    // ------------------------------------------------------------------
+
+    /// A flat-geometry backend over a fresh memory disk (the S06-IF-1/2
+    /// fixture form — the data.rs `ktest_bridge_backend` shape, re-spelled
+    /// here because that helper is private to data.rs's own test module).
+    fn ktest_data_backend_on(
+        disk: Arc<ErofsMemoryDisk>,
+        size: u64,
+        raw: u32,
+        tail_inline: bool,
+        inline_data_start: u64,
+    ) -> DataBackend {
+        let fs = ktest_fs_on(disk, ktest_super_block(12, 0), ktest_single_device_table());
+        let geom = ktest_flat_geometry(size, raw, tail_inline, inline_data_start);
+        let npages = size.div_ceil(PAGE_SIZE as u64) as usize;
+        DataBackend::new(
+            fs.self_ref().clone(),
+            fs.block_device().clone(),
+            geom,
+            npages,
+        )
+    }
+
+    /// Reads a one-page segment back into bytes (the data.rs
+    /// `ktest_segment_bytes` shape).
+    fn ktest_page_bytes(segment: &BioSegment) -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+        segment.read_bytes(0, &mut buf).unwrap();
+        buf
+    }
+
+    /// S06-IF-1 (anchor `docs/T-014/S06/index.md` §9): the META full-page
+    /// corner — a FLAT_INLINE geometry with `size % bs == 0` (size = 2·bs
+    /// exactly; the design sketch's "2.5bs" example is read through its
+    /// leading constraints `size%bs==0` + `valid=PAGE`, which jointly
+    /// require a whole-block tail): page 0 is MAPPED, page 1 is the tail
+    /// block whose `m_plen = PAGE` — `fill_zeros(0)` rewrites nothing.
+    /// `ids = 4096` gives blkoff(I) = 0, the boundary-exact-slot geometry
+    /// (§6.2) where a full-block payload is legal.
+    #[ktest]
+    fn inline_meta_full_page_corner() {
+        let disk = Arc::new(ErofsMemoryDisk::new(4 * PAGE_SIZE));
+        let pattern = |off: usize| ((off % 251) + 1) as u8; // never zero
+        let mut inline_page = vec![0u8; PAGE_SIZE];
+        let mut data_page = vec![0u8; PAGE_SIZE];
+        for (i, b) in inline_page.iter_mut().enumerate() {
+            *b = pattern(i);
+        }
+        for (i, b) in data_page.iter_mut().enumerate() {
+            *b = pattern(PAGE_SIZE + i);
+        }
+        disk.stage_bytes(PAGE_SIZE, &inline_page);
+        disk.stage_bytes(2 * PAGE_SIZE, &data_page);
+        // size = 2·bs; the flat data starts at device block 2; the inline
+        // area sits block-aligned at 4096.
+        let backend = ktest_data_backend_on(
+            disk.clone(),
+            (2 * PAGE_SIZE) as u64,
+            2,
+            true,
+            PAGE_SIZE as u64,
+        );
+
+        // Page 0: the flat MAPPED segment — one whole-block BIO.
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        backend
+            .submit_read_bio(0, segment.clone(), completions.complete_fn(), &mut io_batch)
+            .unwrap();
+        io_batch.wait_all().unwrap();
+        assert_eq!(completions.nr_completions(), 1);
+        assert_eq!(completions.statuses(), vec![BioStatus::Complete]);
+        assert_eq!(ktest_page_bytes(&segment)[..], data_page[..]);
+
+        // Page 1: the tail block is the META arm with valid = PAGE — the
+        // page holds EXACTLY the inline-area whole block (every byte
+        // non-zero: `fill_zeros(0)` rewrote nothing), completing once.
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        backend
+            .submit_read_bio(1, segment.clone(), completions.complete_fn(), &mut io_batch)
+            .unwrap();
+        io_batch.wait_all().unwrap();
+        assert_eq!(completions.nr_completions(), 1);
+        assert_eq!(completions.statuses(), vec![BioStatus::Complete]);
+        assert_eq!(ktest_page_bytes(&segment)[..], inline_page[..]);
+
+        // Channel discrimination: the MAPPED page took one whole-block
+        // BIO at device block 2; the META page took one byte-channel
+        // bounce covering the full block at 4096 — same 8-sector
+        // granularity, a different sector base (the origin pin).
+        let sectors_per_block = (PAGE_SIZE / SECTOR_SIZE) as u64;
+        assert_eq!(
+            disk.requests(),
+            vec![
+                BioRequest {
+                    type_: BioType::Read,
+                    start_sector: 2 * sectors_per_block,
+                    nr_sectors: sectors_per_block,
+                },
+                BioRequest {
+                    type_: BioType::Read,
+                    start_sector: sectors_per_block,
+                    nr_sectors: sectors_per_block,
+                },
+            ]
+        );
+    }
+
+    /// S06-IF-2 (anchor S06 §9): the inline-area start-offset grid —
+    /// blkoff(I) × plen over the legal cells {1, 100, bs−blkoff} (content
+    /// fidelity + tail zeros; the S05-IF-4 single form gridded), plus the
+    /// one-past-the-end cells → EUCLEAN with zero completions and zero
+    /// device requests (the guard precedes any fetch). blkoff = 0 has no
+    /// illegal cell in the non-wrapped domain: the whole block is legal
+    /// (plen ≤ bs), and the only blkoff-0 EUCLEAN route is the
+    /// u32-truncation wrap corner already pinned by S03-IF-7(a).
+    #[ktest]
+    fn inline_tail_start_offset_grid() {
+        const BS: usize = 4096;
+        let base = 2 * BS; // the inline area lives in device block 2
+        let pattern = |off: usize| ((off % 251) + 1) as u8; // never zero
+        let mut block = vec![0u8; BS];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = pattern(base + i);
+        }
+
+        for blkoff in [0usize, 1, 512, 3000] {
+            for plen in [1usize, 100, BS - blkoff] {
+                let disk = Arc::new(ErofsMemoryDisk::new(4 * PAGE_SIZE));
+                let ids = base + blkoff;
+                // The whole block is staged non-zero, so the [plen, PAGE)
+                // tail zeros can only come from the fill — never off the
+                // disk, where the residue sits on purpose.
+                disk.stage_bytes(base, &block);
+                let backend = ktest_data_backend_on(disk.clone(), plen as u64, 0, true, ids as u64);
+                let (segment, mut io_batch, completions) = ktest_bio_trio();
+                backend
+                    .submit_read_bio(0, segment, completions.complete_fn(), &mut io_batch)
+                    .unwrap();
+                io_batch.wait_all().unwrap();
+                assert_eq!(
+                    completions.nr_completions(),
+                    1,
+                    "blkoff={blkoff} plen={plen}"
+                );
+                assert_eq!(
+                    completions.statuses(),
+                    vec![BioStatus::Complete],
+                    "blkoff={blkoff} plen={plen}"
+                );
+                let page = ktest_page_bytes(&segment);
+                assert_eq!(
+                    page[..plen],
+                    block[blkoff..blkoff + plen],
+                    "prefix bytes, blkoff={blkoff} plen={plen}"
+                );
+                assert!(
+                    page[plen..].iter().all(|&b| b == 0),
+                    "zero tail, blkoff={blkoff} plen={plen}"
+                );
+                assert_eq!(
+                    disk.requests().len(),
+                    1,
+                    "one byte-channel bounce, blkoff={blkoff} plen={plen}"
+                );
+            }
+        }
+
+        // The one-past-the-end cells: blkoff + plen = bs + 1 → EUCLEAN.
+        for blkoff in [1usize, 512, 3000] {
+            let plen = BS - blkoff + 1;
+            let disk = Arc::new(ErofsMemoryDisk::new(4 * PAGE_SIZE));
+            disk.stage_bytes(base, &block);
+            let backend =
+                ktest_data_backend_on(disk.clone(), plen as u64, 0, true, (base + blkoff) as u64);
+            let (segment, mut io_batch, completions) = ktest_bio_trio();
+            let err = backend
+                .submit_read_bio(0, segment, completions.complete_fn(), &mut io_batch)
+                .unwrap_err();
+            assert_eq!(err.error(), Errno::EUCLEAN, "blkoff={blkoff} plen={plen}");
+            assert_eq!(
+                completions.nr_completions(),
+                0,
+                "blkoff={blkoff} plen={plen}"
+            );
+            assert!(
+                disk.requests().is_empty(),
+                "the guard precedes any fetch, blkoff={blkoff} plen={plen}"
+            );
+        }
+    }
+
+    /// S06-IF-3 (anchor S06 §9): the slow-LNK cross-block region — the
+    /// §5.1(a) form. nid = 64 compact: iloc = 2048, inode_end = 2080;
+    /// xattr_isize = 1952 → I = 4032; size = 100. The fast criterion ③
+    /// fails (I + s = 4132 > round_up(inode_end) = 4096) → the production
+    /// LNK arm assembles a DataBacked payload; and I + s > round_up(I) =
+    /// 4096 → the payload would cross its start block → the map-layer
+    /// EUCLEAN guard fires (blkoff 4032 + 100 > 4096) BEFORE any fetch.
+    ///
+    /// Exit errno: the guard produces EUCLEAN (single-sourced in
+    /// map_blocks; pinned at the backend exit by S05-IF-5), but the
+    /// page-cache VmIo boundary converts it lossily —
+    /// `From<Error> for ostd::Error` maps EUCLEAN onto `InvalidArgs`
+    /// (the `_` arm), and the return conversion reports EINVAL at the
+    /// read_link exit. NOT EIO: erofs itself folds nothing (the opposite
+    /// of the ext2 blanket-EIO negative example). The framework
+    /// known-diff is registered in `docs/T-025/S06/index.md`.
+    #[ktest]
+    fn slow_lnk_inline_cross_block_euclean_exit() {
+        let disk = Arc::new(ErofsMemoryDisk::new(2 * PAGE_SIZE));
+        // The would-be payload, staged but never fetched.
+        disk.stage_bytes(4032, &[0x41u8; 100]);
+        let fs = ktest_fs_on(
+            disk.clone(),
+            ktest_super_block(12, 0),
+            ktest_single_device_table(),
+        );
+        let desc = geometry_desc(
+            InodeVersion::Compact,
+            DataLayout::FlatInline,
+            FileKind::Lnk,
+            100,
+            1952,
+            AddrState::Flat,
+            0,
+        );
+        assert!(
+            !is_fast_symlink(&fs, 64, &desc),
+            "the (a)-form geometry must route to the slow chain"
+        );
+        let inode = ktest_inode_from_desc(&fs, 64, desc);
+        let err = inode.read_link().unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+        assert!(
+            disk.requests().is_empty(),
+            "the cross-block guard precedes any fetch (construction included)"
+        );
+    }
+
+    /// S06-IF-4 (anchor S06 §9): the slow-LNK xattr push-in region — the
+    /// §5.1(b) form. nid = 64 extended: iloc = 2048, inode_end = 2112,
+    /// round_up(inode_end) = 4096; xattr_isize = 2000 pushes I = 4112
+    /// into the block AFTER the inode's; size = 100: ③ fails (4212 >
+    /// 4096) → slow, but I + s = 4212 ≤ round_up(I) = 8192 → a LEGAL
+    /// META tail starting in the next block. read_link must return the
+    /// target staged at I byte-for-byte; the block-0 filler proves the
+    /// bytes cannot have come from the (vacuous) flat arm.
+    #[ktest]
+    fn slow_lnk_inline_xattr_pushin_legal_meta() {
+        let target: String = (0..100u8).map(|i| (b'a' + (i % 26)) as char).collect();
+        let disk = Arc::new(ErofsMemoryDisk::new(2 * PAGE_SIZE));
+        disk.stage_bytes(4112, target.as_bytes());
+        // i_u = 0 → raw_blkaddr 0: filler at the flat-arm data area,
+        // which a wrong fill would have read instead.
+        disk.stage_bytes(0, &[0x46u8; 512]);
+        let fs = ktest_fs_on(
+            disk.clone(),
+            ktest_super_block(12, 0),
+            ktest_single_device_table(),
+        );
+        let desc = geometry_desc(
+            InodeVersion::Extended,
+            DataLayout::FlatInline,
+            FileKind::Lnk,
+            100,
+            2000,
+            AddrState::Flat,
+            0,
+        );
+        assert!(
+            !is_fast_symlink(&fs, 64, &desc),
+            "the (b)-form geometry must route to the slow chain"
+        );
+        let inode = ktest_inode_from_desc(&fs, 64, desc);
+        assert_eq!(inode.read_link().unwrap(), target);
+        // One byte-channel bounce fetched [4112, 4212) — sector-rounded
+        // to the single sector 8 (blkoff(I) = 16).
+        assert_eq!(
+            disk.requests(),
+            vec![BioRequest {
+                type_: BioType::Read,
+                start_sector: (4112 / SECTOR_SIZE) as u64,
+                nr_sectors: 1,
+            }]
+        );
+    }
+
+    /// S06-IF-5 (anchor S06 §9): the empty-inline corner — FLAT_INLINE
+    /// with size = 0 in both forms. The slow-LNK form (xattr_isize = 2100
+    /// → I = 4180 > round_up(inode_end) = 4096, criterion ③ fails on the
+    /// empty sum) reads through the DataBacked page cache: an empty
+    /// window is a trivial success (`Vmo::read` returns early on
+    /// read_len == 0) — Ok("") with ZERO page commits. The REG form
+    /// (capacity 0) reads an empty buffer at offset 0 the same way.
+    /// Neither form touches the device.
+    #[ktest]
+    fn empty_inline_zero_page_touch() {
+        let disk = Arc::new(ErofsMemoryDisk::new(2 * PAGE_SIZE));
+        let fs = ktest_fs_on(
+            disk.clone(),
+            ktest_super_block(12, 0),
+            ktest_single_device_table(),
+        );
+        let lnk_desc = geometry_desc(
+            InodeVersion::Compact,
+            DataLayout::FlatInline,
+            FileKind::Lnk,
+            0,
+            2100,
+            AddrState::Flat,
+            0,
+        );
+        assert!(
+            !is_fast_symlink(&fs, 64, &lnk_desc),
+            "the empty slow-LNK corner must route to the slow chain"
+        );
+        let inode = ktest_inode_from_desc(&fs, 64, lnk_desc);
+        assert_eq!(inode.read_link().unwrap(), "");
+
+        let reg_desc = geometry_desc(
+            InodeVersion::Compact,
+            DataLayout::FlatInline,
+            FileKind::Reg,
+            0,
+            0,
+            AddrState::Flat,
+            0,
+        );
+        let reg = ktest_inode_from_desc(&fs, 64, reg_desc);
+        let mut empty = [0u8; 0];
+        reg.page_cache()
+            .expect("REG assembles a DataBacked payload")
+            .read_bytes(0, &mut empty)
+            .unwrap();
+
+        assert!(
+            disk.requests().is_empty(),
+            "both empty-inline forms touch zero pages (zero device requests)"
+        );
     }
 }
