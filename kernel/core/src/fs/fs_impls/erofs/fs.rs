@@ -23,26 +23,24 @@
 //!
 //! # Locking
 //!
-//! `Erofs` carries two rwlocks, never held simultaneously (no lock
-//! nesting). The superblock, device table, and geometry are immutable
-//! after `open` returns — erofs is read-only, nothing is ever written
-//! back — so they carry no locks; `flags` and
-//! `fs_event_subscriber_stats` use atomics. `mount_options` guards the
-//! option carrier for the remount whole-reset path: the write half
-//! lands with the remount face of this task (the field is installed in
-//! its final locked shape already), and readers copy out under a short
-//! guard, never holding it across other work. `inode_cache` is the
-//! nid-to-inode map with double-checked locking: the fast path probes
-//! under a read lock; on a miss, the slow path revalidates under the
-//! write lock, constructs the inode (which may read metadata blocks),
-//! and inserts it before releasing the guard. Nothing else may be
-//! locked while `inode_cache` is held. Strong reference cycles are
-//! forbidden: the handle keeps a weak self reference (`self_ref`) and
-//! hands out `Weak<Erofs>` clones to inodes.
-//!
-//! (Transitional wording: the final two-lock `# Locking` section —
-//! the verbatim piece of the remount design — lands together with the
-//! remount face of this task.)
+//! Filesystem-wide state in `Erofs` falls into three classes:
+//! immutable values, atomics, and two short-held `RwMutex`es. The
+//! superblock mirror, the device table, and the geometry derived
+//! from them are decoded once in `open` and never written back
+//! (erofs is read-only), so they carry no locks. `flags` and
+//! `fs_event_subscriber_stats` use atomics. `mount_options` is
+//! whole-replaced only by the remount path (`set_fs_flags`), and
+//! readers take a read guard just long enough to copy out the
+//! values they need. `inode_cache` is the nid-to-inode map, an
+//! `RwMutex` with double-checked locking: the fast path probes
+//! under a read lock; on a miss, the slow path revalidates under
+//! the write lock, constructs the inode (which may read metadata
+//! blocks), and inserts it before releasing the guard. The two
+//! locks never nest — neither may be held while acquiring the
+//! other — and neither may be taken in interrupt context. Strong
+//! reference cycles are forbidden: the handle keeps a weak self
+//! reference (`self_ref`) and hands out `Weak<Erofs>` clones to
+//! inodes.
 
 use core::sync::atomic::Ordering;
 
@@ -88,10 +86,11 @@ pub struct Erofs {
     device_table: DeviceTable,
     /// Parsed mount options, guarded for the remount whole-reset
     /// path (readers copy out under a short guard; see `# Locking`).
-    // First reader: the remount face of this task (the whole-reset
-    // swap) and the option getters of the xattr domain; installed
-    // here in the final locked shape, still unread at this wave.
-    #[expect(dead_code)]
+    // Live since T-023 S07: whole-replaced by `Erofs::reconfigure`
+    // (the remount face — the sole write site); the later readers
+    // are the option getters of the xattr domain (short-guard
+    // copy-out, T-015). The bridging `expect` was removed when the
+    // first consumer landed.
     mount_options: RwMutex<ErofsMountOptions>,
     /// Recorded VFS filesystem flags.
     flags: AtomicFsFlags,
@@ -159,6 +158,20 @@ impl ErofsMountOptions {
     // `expect` was removed when the first consumer landed.
     pub(super) fn extra_devices(&self) -> &[String] {
         &self.extra_devices
+    }
+
+    /// O3 helper for the remount whole-reset path: drops the
+    /// `device=` registrations parsed into this value and returns
+    /// it. Linux reconfigure never copies the dev context
+    /// (`sbi->opt = new_sbi->opt` copies the opt word only,
+    /// super.c:805), so registrations parsed on the remount face
+    /// live and die inside the caller's local value. Sole caller:
+    /// `Erofs::reconfigure` step 2 — the mount face keeps consuming
+    /// the registrations through the V10 device scan instead (two
+    /// strictness regimes by context, exactly as in linux).
+    pub(super) fn without_devices(mut self) -> Self {
+        self.extra_devices.clear();
+        self
     }
 
     /// Parses an erofs mount-option data string (`key[=value][,…]`).
@@ -414,6 +427,74 @@ impl Erofs {
         // F17 — success log (erofs_info "mounted with root inode @ nid",
         // super.c:755): optional info!, not part of the parity surface.
         Ok(erofs)
+    }
+
+    /// Reconfigures the fs for remount: the merged face of linux
+    /// `erofs_fc_reconfigure` (`super.c:789-809`).
+    ///
+    /// Order is the parity surface (mirrors the linux call chain
+    /// parse_monolithic_mount_data → reconfigure_super → fc op):
+    /// the mount-option parser runs FIRST and is the very same pure
+    /// function as the mount path (RM4, per-token errno family
+    /// identical); a parse failure leaves options and flags both
+    /// untouched (a failed remount changes nothing). On success the
+    /// whole option set is replaced, default-started (RM12; `None`
+    /// data ≡ "" ⇒ zero tokens ⇒ defaults), minus any `device=`
+    /// registrations which are silently dropped here (O3), and the
+    /// flags are stored with RDONLY forced (RM13) — erofs stays
+    /// read-only forever and the framework does not force the bit
+    /// (`Mount::remount` fact M18). Always `Ok` on the store path:
+    /// the syscall returns 0.
+    ///
+    /// No own errno arms anywhere: the sole failure source is the
+    /// Step 1 parse passthrough (`?` forwards it bare, no message
+    /// added). RM9's DBG_BUGON is omitted — every store site in
+    /// this file ORs RDONLY in, so the assertion is structurally
+    /// true. Remount never rescans devices, never re-reads the
+    /// superblock, and never touches the inode cache (RM12 replaces
+    /// the option word only, exactly `sbi->opt = new_sbi->opt`).
+    pub(super) fn reconfigure(&self, flags: FsFlags, data: Option<&str>) -> Result<()> {
+        // Step 1 — RM4: parse FIRST, with the very same pure parser as
+        // the mount path (S01). Linux parses the monolithic data string
+        // into a fresh fs_context (default-started, `erofs_init_fs_context`
+        // super.c:859-879) BEFORE `reconfigure_super` runs the fs op, so
+        // a bad token fails the whole remount with EINVAL regardless of
+        // the instance state — and a failure here changes nothing else:
+        // `Mount::remount` propagates the `?` before touching per-mount
+        // flags (mount.rs:659-661), matching "failed reconfigure changes
+        // nothing" on the linux side.
+        //
+        // No ENOMEM arm: parser allocations abort rather than yield an
+        // errno (G-M21 family; the mount-side marker at `open` covers
+        // the family, no second marker here).
+        let new_opt = ErofsMountOptions::parse(data)?;
+
+        // Step 2 — RM12 whole reset + O3 device= silent drop.
+        // `parse` always starts from defaults, so `None` (≡ "") yields
+        // the default option set: a bare remount resets user_xattr/acl
+        // back to on (matrix §2.5 row 1). The `device=` registrations
+        // parsed into `new_opt.extra_devices` are deliberately NOT
+        // installed: linux reconfigure never copies the dev context
+        // (`sbi->opt = new_sbi->opt` copies the opt word only), so the
+        // registrations live and die inside this local value. Bare
+        // `device` / empty `device=` already failed EINVAL in Step 1
+        // (generic parser layer, identical on both faces). Contrast
+        // with the mount face, where the same registrations are
+        // consumed by the V10 device scan (G-M12 count EINVAL /
+        // G-M13 EOPNOTSUPP) — two strictness regimes by context,
+        // exactly as in linux.
+        *self.mount_options.write() = new_opt.without_devices();
+
+        // Step 3 — RM13 forced read-only: store, then Ok (syscall 0).
+        // The framework does not force the bit (fact M18), so erofs
+        // must — every store site in the file ORs RDONLY in, which is
+        // what makes the omitted RM9 assertion structurally true.
+        // Live-snapshot consumers of this store: FileSystem::flags()
+        // (FsCache G6/G7 reuse checks), sb().flags → statfs ST_RDONLY
+        // (SF11, S06 D5), /proc/self/mountinfo fs flag field (M23),
+        // and the fs half of the write-path EROFS double check (M20).
+        self.flags.store(flags | FsFlags::RDONLY, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Returns the device ID of the underlying block device.

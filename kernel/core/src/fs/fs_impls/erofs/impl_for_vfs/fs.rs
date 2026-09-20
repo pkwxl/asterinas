@@ -5,8 +5,9 @@
 //! Translates VFS-level root-inode, statfs, sync, and flag requests
 //! into the erofs-internal surface. Erofs is read-only: `sync` is a
 //! constant `Ok(())` (nothing is ever dirty), and flag
-//! reconfiguration keeps the framework default until the remount
-//! semantics land with T-023.
+//! reconfiguration is the remount face — thin delegation to
+//! `Erofs::reconfigure`, which carries the linux
+//! `erofs_fc_reconfigure` semantics (RM4/RM12/O3/RM13).
 
 use super::super::Erofs;
 use crate::{
@@ -47,6 +48,32 @@ impl FileSystem for Erofs {
 
     fn flags(&self) -> FsFlags {
         self.fs_flags()
+    }
+
+    /// Sets the filesystem flags — the remount face (the framework
+    /// calls this from `Mount::remount`, mount.rs:659-661, under the
+    /// mount-topology write lock). Thin delegation to the family
+    /// method `Erofs::reconfigure`, the second orchestration point
+    /// besides `open`. Unlike the ext2 sample — which ignores the
+    /// data string (fact M19, the negative example) — erofs MUST
+    /// forward it: the RM4 parse errno family and the RM12 whole
+    /// reset both hang off the string. `_ctx` is unused: linux
+    /// reconfigure has no context consumer, same as the ext2 sample.
+    // AUTO-FIXME(W-M07): The flags arriving here were produced by
+    // `FsFlags::from(MountFlags)` via from_bits_truncate in the syscall
+    // layer, so sb_flags outside the FsFlags bit set are silently
+    // dropped where Linux's reconfigure_super rejects them with EINVAL
+    // (RM8). The truncation happens upstream of any filesystem code and
+    // cannot be closed inside erofs; accepted drift per the scope
+    // ledger. The initramfs assertion encodes the expected difference;
+    // the fix (a pre-check at the syscall layer) is a separate
+    // framework-track candidate.
+    fn set_fs_flags(&self, flags: FsFlags, data: Option<&str>, _ctx: &Context) -> Result<()> {
+        // Dispatch-only layer (T-010 §1.4 rule 6): the whole
+        // reconfigure semantics live in the family method; this face
+        // never inlines them (the ext2 override that stores flags and
+        // warns in place is the negative example of the family shape).
+        self.reconfigure(flags, data)
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
