@@ -1124,31 +1124,19 @@ mod tests {
     fn map_blocks_chunk_4b_block_map() {
         const BS: u64 = 4096;
         const CHUNK: u64 = 2 * BS; // chunkbits = 13
-        // inline_data_start = 4000 is 4-misaligned: extent_base(4) =
-        // 4004 (the IF-9 unaligned corner rides along).
+        // inline_data_start = 4002 is 4-misaligned: extent_base(4) =
+        // ALIGN(4002, 4) = 4004 (the IF-9 unaligned corner rides
+        // along). The round-159 form passed ids=4000 — 4-aligned, a
+        // no-op align_up leaving base 4000, so slot 0 read the
+        // unstaged zeros as MAPPED pa 0 (the fixture was wrong, not
+        // the ALIGN semantics — grid row 4002×4 = 4004 held).
         let (disk, _fs, backend) =
-            ktest_chunk_backend(ktest_single_device_table(), 5 * BS + 100, 4, 13, 4000);
+            ktest_chunk_backend(ktest_single_device_table(), 5 * BS + 100, 4, 13, 4002);
         // Table: chunk 0 → block 100, chunk 1 → hole, chunk 2 →
         // block 200.
         disk.stage_bytes(4004, &100u32.to_le_bytes());
         disk.stage_bytes(4008, &NULL_ADDR.to_le_bytes());
         disk.stage_bytes(4012, &200u32.to_le_bytes());
-
-        // TEMP S04 DIAGNOSTIC — remove once the fixture defect is
-        // located: the staged bytes, the channel read-back, and the
-        // request log, all in one panic message.
-        {
-            let mut raw = [0u8; 24];
-            disk.segment().read_bytes(3992, &mut raw).unwrap();
-            let dev: Arc<dyn BlockDevice> = disk.clone();
-            let mut ch = [0u8; 4];
-            dev.read_bytes(4004, &mut ch).unwrap();
-            let val = dev.read_val::<u32>(4004).unwrap();
-            panic!(
-                "DIAG raw[3992..4016]={raw:02x?} ch[4004..]={ch:02x?} val={val} reqs={:?}",
-                disk.requests()
-            );
-        }
 
         // MAPPED over chunk 0: la 0, a mid-chunk la, and the last
         // byte of the chunk all share chunknr 0 — the write-back
@@ -1173,7 +1161,7 @@ mod tests {
             assert_eq!(m.m_pa, 0, "la={la}");
             assert_eq!(m.m_deviceid, 0, "la={la}");
         }
-        // The last chunk: the remainder 4106 rounds up to exactly
+        // The last chunk: the remainder 4196 rounds up to exactly
         // one chunk — no clamp here.
         let m = backend
             .map_blocks(2 * CHUNK + 37, PAGE_SIZE as u64)
@@ -1186,7 +1174,7 @@ mod tests {
 
         // The last-chunk clamp (chunkbits = 14 → 4-block chunks,
         // extent_base at an aligned 4100): the final chunk of the
-        // same size carries only 4106 bytes → m_plen clamps to the
+        // same size carries only 4196 bytes → m_plen clamps to the
         // block-rounded remainder 8192 < 16384, while chunk 0 keeps
         // the full chunk length.
         let (disk, _fs, big) =
@@ -1199,7 +1187,7 @@ mod tests {
         assert_eq!(m.m_flags, MapFlags::MAPPED);
         assert_eq!(m.m_la, 4 * BS);
         assert_eq!(m.m_pa, 200 << 12);
-        assert_eq!(m.m_plen, 2 * BS, "the last chunk clamps to round_up(4106)");
+        assert_eq!(m.m_plen, 2 * BS, "the last chunk clamps to round_up(4196)");
         assert_eq!(m.m_llen, m.m_plen);
 
         // The same-slot 8B comparison: identical chunk slots through
