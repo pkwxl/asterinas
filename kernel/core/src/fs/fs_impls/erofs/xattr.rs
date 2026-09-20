@@ -7,9 +7,12 @@
 //! `list` public interfaces, the bloom-filter gate (`h_name_filter`,
 //! consuming `utils::xxh32` with the seed `0x25BBE08F + index`), and
 //! the ACL read channel. Set/remove operations do not exist: they are
-//! rejected with `EROFS` at the VFS adapter. The mount-time
-//! xattr-prefix assembly face is cut (G-M17) — namespace dispatch
-//! lives in the get/list entry points themselves.
+//! rejected with `EROFS` at the VFS adapter. The sb-level xattr
+//! handler-table face is cut (G-M17) — namespace dispatch lives in
+//! the get/list entry points themselves — while the mount-time
+//! long-prefix table load keeps a reserved call slot in
+//! `Erofs::open` (`load_xattr_prefixes` below, F15): the slot is
+//! final, the body lands with the xattr domain design (T-015).
 //!
 //! Bring-up state (T-022 S04): the two on-disk record headers are in
 //! place — `RawXattrIbodyHeader` (the fixed 12-byte head that every
@@ -32,7 +35,7 @@ use core::mem::offset_of;
 
 use ostd::const_assert;
 
-use super::prelude::*;
+use super::{fs::Erofs, prelude::*};
 
 /// The erofs on-disk xattr ibody header (`erofs_xattr_ibody_header`,
 /// linux/fs/erofs/erofs_fs.h:204-209; field semantics single-sourced
@@ -108,3 +111,24 @@ const_assert!(align_of::<RawXattrEntry>() == 2); // the le16 member pins the ali
 const_assert!(offset_of!(RawXattrEntry, e_name_len) == 0); // erofs_fs.h:232
 const_assert!(offset_of!(RawXattrEntry, e_name_index) == 1); // erofs_fs.h:233
 const_assert!(offset_of!(RawXattrEntry, e_value_size) == 2); // erofs_fs.h:234
+
+/// F15 — the mount-time long-xattr name-prefix table load
+/// (`erofs_xattr_prefixes_init`, `super.c:746-748`), called from
+/// step 6 of `Erofs::open` (`fs.rs`).
+///
+/// Slot-only transitional shape: the call site and its position in
+/// the assembly order are final (`open` is the single ordering
+/// authority — F12 before this call, success after it), while the
+/// body — gated by the on-disk prefix count, reading the prefix
+/// area through the mirror fields, with its EFSCORRUPTED → EUCLEAN
+/// error family — lands with the xattr domain design (T-015;
+/// markers G-X02/G-X03, anchored here and in `fs.rs`). Until then
+/// this accepts unconditionally: an image with a positive prefix
+/// count mounts without the table (no interim rejection the real
+/// body would have to walk back).
+// Transitional compatibility layer — remove when the xattr domain
+// implementation lands (T-026 executes the T-015 design); the call
+// site itself is final.
+pub(super) fn load_xattr_prefixes(_fs: &Erofs) -> Result<()> {
+    Ok(())
+}

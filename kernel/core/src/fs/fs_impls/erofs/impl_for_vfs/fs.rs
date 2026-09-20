@@ -43,8 +43,9 @@ impl FileSystem for Erofs {
 
     fn sb(&self) -> SuperBlock {
         // Interim shape: the decoded geometry (magic included) lands
-        // with the T-023 assembly sequence; until `open` succeeds this
-        // method is unreachable.
+        // with the statfs face of this task; `open` assembles fully
+        // now, so this method is reachable and reports placeholder
+        // values until then.
         SuperBlock::new(0, BLOCK_SIZE, NAME_MAX, self.container_device_id())
     }
 

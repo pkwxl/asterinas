@@ -138,6 +138,25 @@ impl Inode {
         }
     }
 
+    /// Whether this inode carries compressed data — the handle-side
+    /// forwarder of the rejection-chain layer-3 predicate (G-M15).
+    ///
+    /// Pure forwarding, no criteria here: the judgement lives on the
+    /// descriptor (`InodeDesc::is_data_compressed`, the single
+    /// source) and must not be rewritten at any forwarding face —
+    /// the mount-time site gates of `Erofs::open` (F10/F11) and the
+    /// runtime map_blocks half share it.
+    pub(super) fn is_data_compressed(&self) -> bool {
+        self.desc.is_data_compressed()
+    }
+
+    /// Whether this inode is a directory — the `desc.kind`
+    /// judgement (same data source as `type_`), consumed by the
+    /// F12 mount door.
+    pub(super) fn is_dir(&self) -> bool {
+        matches!(self.desc.kind, FileKind::Dir)
+    }
+
     /// Returns a reference to the owning `Erofs` filesystem.
     ///
     /// The weak-upgrade failure guard is defensive by design: with the
@@ -981,13 +1000,12 @@ impl InodeDesc {
     /// files (CHR/BLK/FIFO/SOCK) return early and stay exempt. The
     /// runtime half of this rejection is lazy (map_blocks, T-014);
     /// this predicate is the single judgement source for both.
-    // First consumers: the F10/F11 mount-time site gates of
-    // `Erofs::open` (T-023 S05, reached through the `Inode`
-    // forwarder that lands with them — the forwarding face must not
-    // rewrite the criteria, single-source contract); later the I12
-    // assembly arm-first gate (T-024) and the map_blocks defensive
-    // half (T-014).
-    #[expect(dead_code)]
+    // Live since T-023 S05: the F10/F11 mount-time site gates of
+    // `Erofs::open` reach it through the `Inode` forwarder above
+    // (which must not rewrite the criteria, single-source
+    // contract); later joiners: the I12 assembly arm-first gate
+    // (T-024) and the map_blocks defensive half (T-014). The
+    // bridging `expect` was removed when the first consumer landed.
     pub(super) fn is_data_compressed(&self) -> bool {
         self.datalayout.is_compressed() // T-011 ID2: ⟺ ∈ {1, 3}
             && matches!(self.kind, FileKind::Reg | FileKind::Dir | FileKind::Lnk)

@@ -596,10 +596,11 @@ pub(super) struct SuperBlock {
     #[expect(dead_code)]
     pub(super) xattr_prefix_start: u32,
     /// The nid of the special packed inode (fragments; host order).
-    /// Cut-domain field (SB5): the fragments assembly face stays
-    /// pruned under archive A, so nothing reads this nid until that
-    /// domain revives (FRAGMENTS, G-Z01 archive C).
-    #[expect(dead_code)]
+    // Live since T-023 S05: the F10 door of `Erofs::open` (`fs.rs`)
+    // pairs it with the FRAGMENTS bit and igets it; the resident
+    // counterpart linux keeps (sbi->packed_inode) deliberately does
+    // not exist — identity lives in the inode cache. The bridging
+    // `expect` was removed when the first consumer landed.
     pub(super) packed_nid: u64,
     /// The xattr name filter reservation byte; the bloom filter is
     /// effective only when this is zero (read directly, u8).

@@ -3,42 +3,46 @@
 //! Core `Erofs` filesystem state for a mounted erofs volume.
 //!
 //! This module owns `Erofs`, the top-level handle for a mounted erofs
-//! volume, together with the FS-level inode cache and the mount-option
-//! carrier. The mount-time assembly sequence (parse options -> read
-//! superblock -> validate magic/blkszbits/features/checksum -> read the
-//! root inode -> construct the handle via `Arc::new_cyclic`) is owned
-//! by `Erofs::open` and lands stepwise with T-023: option parsing (the
-//! first step) is in force and fails malformed data strings with the
-//! parser's `EINVAL` surface, the superblock half has landed below
-//! (`read_superblock`: the V1–V10 validation order whose tail step
-//! `scan_devices` produces the immutable `DeviceTable`), and the inode
-//! half has landed too (`iget`: the double-checked nid cache whose
-//! slow path runs the iloc formula and the decode entry, with
-//! `root_inode` in its final shape resolving through it) — all in
-//! wait of their only caller, the assembly step of `open`, while
-//! every mount that survives parsing is still rejected with
-//! `EOPNOTSUPP` (a clear error, no panic, no swallowing) until the
-//! remaining steps land.
+//! volume, together with the FS-level inode cache, the mount-option
+//! carrier, and the mount-time assembly sequence `Erofs::open` — the
+//! merged face of linux `erofs_fc_get_tree` + `erofs_fc_fill_super`:
+//! parse the mount-option data string, read and validate the
+//! superblock (the V1–V10 order, ending in the device scan), construct
+//! the read-only handle, then walk the F10 packed-inode and F11/F12
+//! root-inode doors. The code order of that sequence is the single
+//! ordering authority of the erofs mount path (first failure stops;
+//! the errno priority chain mirrors the linux fill_super order); the
+//! decoder layer supplies mirrors and predicates only.
 //!
 //! Erofs is strictly read-only: there is no write path, no dirty
 //! tracking, and no block allocation anywhere below this handle, so the
-//! superblock, mount options, and geometry are decoded once during
-//! `open` and stay immutable for the lifetime of the instance.
+//! superblock, device table, and geometry are decoded once during
+//! `open` and stay immutable for the lifetime of the instance (the
+//! mount options are the one guarded exception — remount swaps the
+//! whole carrier, see `# Locking`).
 //!
 //! # Locking
 //!
-//! All filesystem-wide state in `Erofs` is immutable after `open`
-//! returns: the superblock, mount options, and geometry are decoded
-//! once and never written back (erofs is read-only), so they carry no
-//! locks. `flags` and `fs_event_subscriber_stats` use atomics. The only
-//! lock is `inode_cache`, an nid-to-inode map guarded by an `RwMutex`
-//! with double-checked locking: the fast path probes under a read lock;
-//! on a miss, the slow path revalidates under the write lock,
-//! constructs the inode (which may read metadata blocks), and inserts
-//! it before releasing the guard. Nothing else may be locked while
-//! `inode_cache` is held. Strong reference cycles are forbidden: the
-//! handle keeps a weak self reference (`self_ref`) and hands out
-//! `Weak<Erofs>` clones to inodes.
+//! `Erofs` carries two rwlocks, never held simultaneously (no lock
+//! nesting). The superblock, device table, and geometry are immutable
+//! after `open` returns — erofs is read-only, nothing is ever written
+//! back — so they carry no locks; `flags` and
+//! `fs_event_subscriber_stats` use atomics. `mount_options` guards the
+//! option carrier for the remount whole-reset path: the write half
+//! lands with the remount face of this task (the field is installed in
+//! its final locked shape already), and readers copy out under a short
+//! guard, never holding it across other work. `inode_cache` is the
+//! nid-to-inode map with double-checked locking: the fast path probes
+//! under a read lock; on a miss, the slow path revalidates under the
+//! write lock, constructs the inode (which may read metadata blocks),
+//! and inserts it before releasing the guard. Nothing else may be
+//! locked while `inode_cache` is held. Strong reference cycles are
+//! forbidden: the handle keeps a weak self reference (`self_ref`) and
+//! hands out `Weak<Erofs>` clones to inodes.
+//!
+//! (Transitional wording: the final two-lock `# Locking` section —
+//! the verbatim piece of the remount design — lands together with the
+//! remount face of this task.)
 
 use core::sync::atomic::Ordering;
 
@@ -53,15 +57,16 @@ use super::{
         RawDeviceSlot, RawSuperBlock, SUPER_MAGIC_V1, SUPER_OFFSET, SUPER_REGION_MAX,
         SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
+    xattr::load_xattr_prefixes,
 };
 use crate::fs::vfs::file_system::{AtomicFsFlags, FsEventSubscriberStats, FsFlags};
 
 /// Top-level handle for a mounted erofs filesystem.
 ///
-/// Owns the decoded superblock, the parsed mount options, and the
-/// FS-level inode cache (keyed by nid: erofs has no block groups, so
-/// the per-group cache host of allocation-based filesystems is lifted
-/// to the filesystem handle).
+/// Owns the decoded superblock, the device table, the parsed mount
+/// options, and the FS-level inode cache (keyed by nid: erofs has no
+/// block groups, so the per-group cache host of allocation-based
+/// filesystems is lifted to the filesystem handle).
 pub struct Erofs {
     /// Backing block device.
     block_device: Arc<dyn BlockDevice>,
@@ -71,9 +76,21 @@ pub struct Erofs {
     // both live through the `FileSystem` trait face. The bridging
     // `expect` was removed when the first consumer landed.
     super_block: SuperBlock,
-    /// Parsed mount options (immutable after `open`).
+    /// Device table assembled by the V10 device scan (immutable
+    /// after `open`; remount never rescans).
+    // First consumer: the statfs face of this task (`total_blocks()`,
+    // the f_blocks single source); the data-path accessors (slots,
+    // mask) join with the data-path domain. The bridging `expect`
+    // will be removed when that consumer lands.
     #[expect(dead_code)]
-    mount_options: ErofsMountOptions,
+    device_table: DeviceTable,
+    /// Parsed mount options, guarded for the remount whole-reset
+    /// path (readers copy out under a short guard; see `# Locking`).
+    // First reader: the remount face of this task (the whole-reset
+    // swap) and the option getters of the xattr domain; installed
+    // here in the final locked shape, still unread at this wave.
+    #[expect(dead_code)]
+    mount_options: RwMutex<ErofsMountOptions>,
     /// Recorded VFS filesystem flags.
     flags: AtomicFsFlags,
     /// FS event stats for VFS.
@@ -274,22 +291,31 @@ impl ErofsMountOptions {
 }
 
 impl Erofs {
-    /// Opens and loads an erofs filesystem from a block device.
+    /// Opens and assembles an erofs filesystem from a block device.
     ///
-    /// Interim shape (T-023 in progress): step 1 of the assembly
-    /// sequence — parse the mount-option data string before any
-    /// on-disk structure is read — is in force, so a malformed data
-    /// string fails fast with the parser's `EINVAL` surface. The body
-    /// of step 2 — `read_superblock` below, the V1–V10 validation
-    /// order including the device scan — has landed, as has the
-    /// root-inode half (`iget` and the final `root_inode` below);
-    /// wiring them here, together with the handle construction via
-    /// `Arc::new_cyclic`, lands with the remaining steps of T-023;
-    /// until then every mount that survives parsing is rejected with
-    /// a clear `EOPNOTSUPP` ("capability deferred"), deliberately
-    /// distinct from the `EINVAL`/`EUCLEAN`/`EBADMSG` door that the
-    /// formal validation sequence reports, so no interim observation
-    /// can be confused with the formal error surface.
+    /// This is the merged face of linux `erofs_fc_get_tree` +
+    /// `erofs_fc_fill_super` (`super.c:625-757`): the assembly order
+    /// of the mount-path design (`docs/T-012/S04/index.md` §2, folded
+    /// into `docs/T-012/analysis.md` §5.1) is the single ordering
+    /// authority for the erofs mount path — the decoder layer
+    /// supplies mirrors and predicates only (T-010 layering rule 4).
+    ///
+    /// Seven straight-line steps, first failure stops (the errno
+    /// priority chain mirrors the linux fill_super order): (1) parse
+    /// the mount-option data string BEFORE any on-disk read; (2) read
+    /// and validate the superblock — the V1–V10 order ending in the
+    /// device scan; (3) construct the handle, forcibly read-only
+    /// (`flags | RDONLY`, F1 — the FsCache RO/RW reuse semantics
+    /// depend on it); (4) F10: when the FRAGMENTS bit pairs with a
+    /// non-zero packed_nid, iget the packed inode and run the
+    /// layer-3 compressed-data gate on it; (5) F11/F12: iget the root
+    /// inode, layer-3 gate BEFORE the directory type judgement, so a
+    /// compressed root (EOPNOTSUPP) stays errno-distinguishable from
+    /// a readable non-directory root (EINVAL); (6) the F15
+    /// xattr-prefix call slot; (7) success. Step 3 is pure-memory
+    /// construction — no errno path — and any later failure unwinds
+    /// the whole handle through Drop, leaving no half-assembled
+    /// instance and no FsCache entry (M1–M6 single-track rollback).
     // AUTO-FIXME(G-M21): Several Linux mount-path allocation sites can
     // return -ENOMEM (superblock-private data, device slots, inode-cache
     // nodes, xattr scratch). Under Rust global-allocation semantics a failed
@@ -297,6 +323,15 @@ impl Erofs {
     // failure in `open` unwinds through Drop, so this implementation has no
     // reachable ENOMEM errno path. Do not add ENOMEM error arms here;
     // revisit only if fallible allocation APIs are introduced.
+    // AUTO-TODO(G-M17/G-M19): The packed inode is iget-validated at
+    // mount time (F10) but is deliberately NOT kept as a resident
+    // sbi->packed_inode counterpart: linux's resident-ownership face and
+    // its put_super drop (U4) have no equivalent here — the inode cache
+    // holds the only strong reference, uniform with every other inode,
+    // and the xattr-prefix table below is the only post-root assembly
+    // step. Do not add a dedicated resident-assembly face (shrinker,
+    // module caches, per-mount sysfs dir) in this function; those cuts
+    // are registered in the skeleton ledger.
     pub(super) fn open(
         device: Arc<dyn BlockDevice>,
         flags: FsFlags,
@@ -307,18 +342,76 @@ impl Erofs {
         // token by token before get_tree/fill_super ever reads the
         // superblock, so unknown keys and malformed values fail with
         // EINVAL regardless of the image content.
-        let _mount_options = ErofsMountOptions::parse(data)?;
-        // Steps 2.. — `read_superblock` below (V1–V10 incl. the
-        // device scan) and the inode half (`iget`, final
-        // `root_inode`) have landed and are wired in by the assembly
-        // subtask of this task, together with the handle
-        // construction and the packed/root iget call sites;
-        // `device` and `flags` are only consumed by those steps.
-        let _ = (device, flags);
-        return_errno_with_message!(
-            Errno::EOPNOTSUPP,
-            "erofs mount assembly is not implemented yet"
-        );
+        let mount_options = ErofsMountOptions::parse(data)?;
+        // Step 2 — superblock read + validation order V1–V10
+        // (`read_superblock` above, incl. the V10 device scan).
+        // Read errors pass through; the option handle only feeds the
+        // V10 count check.
+        let (super_block, device_table) = read_superblock(&device, &mount_options)?;
+        // Step 3 — construct the handle (F1: erofs is forcibly
+        // read-only, `s_flags |= SB_RDONLY`, super.c:632; the FsCache
+        // RO/RW reuse semantics depend on it). Pure-memory
+        // construction: no errno path (allocation failure aborts,
+        // G-M21).
+        let erofs = Arc::new_cyclic(|weak_self| Erofs {
+            block_device: device,
+            super_block,
+            device_table,
+            mount_options: RwMutex::new(mount_options),
+            flags: AtomicFsFlags::new(flags | FsFlags::RDONLY),
+            fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            inode_cache: RwMutex::new(BTreeMap::new()),
+            self_ref: weak_self.clone(),
+        });
+
+        // Step 4 — F10 packed inode (super.c:724-729): FRAGMENTS bit AND
+        // packed_nid != 0 → iget through the inode cache; any I-family
+        // error fails the mount. Layer 3 (G-M15, rejection chain): a
+        // compressed payload on a REG/DIR/LNK inode fails here with
+        // EOPNOTSUPP, mirroring the a_ops assignment in erofs_fill_inode
+        // (special files return early there and stay exempt).
+        // G-Z05 (negative): this gate checks ONLY for compressed payloads —
+        // there is deliberately NO "packed inode must be compressed"
+        // cross-check; dual-malformed images (plain packed inode) keep
+        // mounting (matrix §5.1 row 6).
+        if erofs.super_block.feature_incompat().contains(FeatureIncompatSet::FRAGMENTS)
+            && erofs.super_block.packed_nid != 0
+        {
+            let packed = erofs.iget(erofs.super_block.packed_nid)?;
+            if packed.is_data_compressed() {
+                return_errno_with_message!(
+                    Errno::EOPNOTSUPP,
+                    "compressed inode data is not supported"
+                );
+            }
+        }
+
+        // Step 5 — F11 root inode + F12 type gate (super.c:731-740).
+        // The layer-3 gate runs BEFORE the F12 type judgement, so
+        // "compressed root" (EOPNOTSUPP) stays errno-distinguishable from
+        // "readable non-directory root" (F12 EINVAL) — the order IS the
+        // assertion surface (matrix §2.2 G-M15 row).
+        let root = erofs.iget(ErofsNid::from(erofs.super_block.root_nid))?;
+        if root.is_data_compressed() {
+            return_errno_with_message!(
+                Errno::EOPNOTSUPP,
+                "compressed inode data is not supported"
+            );
+        }
+        if !root.is_dir() {
+            return_errno_with_message!(Errno::EINVAL, "root inode is not a directory");
+        }
+
+        // Step 6 — F15 slot: xattr prefix table load (super.c:746-748),
+        // only when the on-disk prefix count > 0. Body owned by the
+        // xattr domain design (T-015, G-X02/G-X03); errors pass through
+        // and fail the mount (EFSCORRUPTED → EUCLEAN per the errno
+        // table). Slot-only until then: `load_xattr_prefixes`.
+        load_xattr_prefixes(&erofs)?;
+
+        // F17 — success log (erofs_info "mounted with root inode @ nid",
+        // super.c:755): optional info!, not part of the parity surface.
+        Ok(erofs)
     }
 
     /// Returns the device ID of the underlying block device.
@@ -448,10 +541,9 @@ impl Erofs {
 ///
 /// G-M21: no ENOMEM arm anywhere on this path (stack buffers only;
 /// allocation failure is an abort in this tree, not an errno).
-// First consumer: step 2 of `Erofs::open` (wired by the assembly
-// subtask of this task); ktest fixtures call it directly from the
-// same host (design §9).
-#[expect(dead_code)]
+// Live since T-023 S05: step 2 of `Erofs::open` above calls it;
+// ktest fixtures call it directly from the same host (design §9).
+// The bridging `expect` was removed when the first consumer landed.
 fn read_superblock(
     device: &Arc<dyn BlockDevice>,
     mount_options: &ErofsMountOptions,
