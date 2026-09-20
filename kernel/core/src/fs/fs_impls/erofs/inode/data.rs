@@ -54,7 +54,10 @@ use aster_block::{
     id::Bid,
 };
 use io_util::batch::IoBatch;
-use ostd::{const_assert, mm::{PAGE_SIZE, VmIo, io::util::HasVmReaderWriter}};
+use ostd::{
+    const_assert,
+    mm::{PAGE_SIZE, VmIo, io::util::HasVmReaderWriter},
+};
 
 use super::super::{fs::Erofs, prelude::*};
 use crate::vm::page_cache::BlockAsPageCacheBackend;
@@ -204,10 +207,7 @@ impl BlockAsPageCacheBackend for DataBackend {
         // posture as the F10/F11 mount-site gates, with the same
         // message string.
         if self.geom.compressed {
-            return_errno_with_message!(
-                Errno::EOPNOTSUPP,
-                "compressed inode data is not supported"
-            );
+            return_errno_with_message!(Errno::EOPNOTSUPP, "compressed inode data is not supported");
         }
         match self.geom.chunk {
             None => {
@@ -408,7 +408,12 @@ mod tests {
         for &size in SIZES {
             let capacity = (size as usize).align_up(PAGE_SIZE);
             let npages = size.div_ceil(PAGE_SIZE as u64);
-            assert_eq!(capacity as u64, npages * PAGE_SIZE as u64, "size = {}", size);
+            assert_eq!(
+                capacity as u64,
+                npages * PAGE_SIZE as u64,
+                "size = {}",
+                size
+            );
         }
     }
 

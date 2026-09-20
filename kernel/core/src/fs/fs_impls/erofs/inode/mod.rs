@@ -2012,15 +2012,75 @@ mod tests {
         // (version, datalayout, size, xattr_isize, addr_state, i_u,
         //  exp_tail_inline, exp_inline_data_start, exp_chunk)
         let cases: &[Case] = &[
-            (Compact, FlatPlain, 10_000, 0, AddrState::Flat, 7, false, 14_368, None),
-            (Compact, FlatInline, 5_000, 32, AddrState::Flat, 9, true, 14_400, None),
+            (
+                Compact,
+                FlatPlain,
+                10_000,
+                0,
+                AddrState::Flat,
+                7,
+                false,
+                14_368,
+                None,
+            ),
+            (
+                Compact,
+                FlatInline,
+                5_000,
+                32,
+                AddrState::Flat,
+                9,
+                true,
+                14_400,
+                None,
+            ),
             // The risk-2 corners: tail_inline is the LAYOUT BIT only —
             // size = 0 (empty tail) and the exact-block size keep the
             // bit set; existence is consumer arithmetic, not stored.
-            (Compact, FlatInline, 0, 0, AddrState::Flat, 0, true, 14_368, None),
-            (Compact, FlatInline, 4_096, 0, AddrState::Flat, 2, true, 14_368, None),
-            (Extended, FlatPlain, 200_000, 4, AddrState::Flat, 123, false, 14_404, None),
-            (Extended, FlatInline, 1, 0, AddrState::Flat, 5, true, 14_400, None),
+            (
+                Compact,
+                FlatInline,
+                0,
+                0,
+                AddrState::Flat,
+                0,
+                true,
+                14_368,
+                None,
+            ),
+            (
+                Compact,
+                FlatInline,
+                4_096,
+                0,
+                AddrState::Flat,
+                2,
+                true,
+                14_368,
+                None,
+            ),
+            (
+                Extended,
+                FlatPlain,
+                200_000,
+                4,
+                AddrState::Flat,
+                123,
+                false,
+                14_404,
+                None,
+            ),
+            (
+                Extended,
+                FlatInline,
+                1,
+                0,
+                AddrState::Flat,
+                5,
+                true,
+                14_400,
+                None,
+            ),
             // Chunked: unit 4 vs 8 by the INDEXES bit, chunkbits =
             // 12 + (format & 0x1F) as the decode would carry it.
             (
@@ -2028,7 +2088,10 @@ mod tests {
                 ChunkBased,
                 1 << 20,
                 0,
-                AddrState::Chunked { format: 0x00, bits: 12 },
+                AddrState::Chunked {
+                    format: 0x00,
+                    bits: 12,
+                },
                 0x0000,
                 false,
                 14_368,
@@ -2039,7 +2102,10 @@ mod tests {
                 ChunkBased,
                 1 << 20,
                 0,
-                AddrState::Chunked { format: 0x20, bits: 12 },
+                AddrState::Chunked {
+                    format: 0x20,
+                    bits: 12,
+                },
                 0x0020,
                 false,
                 14_368,
@@ -2050,7 +2116,10 @@ mod tests {
                 ChunkBased,
                 1 << 20,
                 0,
-                AddrState::Chunked { format: 0x25, bits: 17 },
+                AddrState::Chunked {
+                    format: 0x25,
+                    bits: 17,
+                },
                 0x0025,
                 false,
                 14_400,
@@ -2061,7 +2130,10 @@ mod tests {
                 ChunkBased,
                 1 << 20,
                 0,
-                AddrState::Chunked { format: 0x1F, bits: 43 },
+                AddrState::Chunked {
+                    format: 0x1F,
+                    bits: 43,
+                },
                 0x001F,
                 false,
                 14_400,
@@ -2103,7 +2175,10 @@ mod tests {
         let addr_state_for = |datalayout: DataLayout| match datalayout {
             DataLayout::FlatPlain | DataLayout::FlatInline => AddrState::Flat,
             DataLayout::CompressedFull | DataLayout::CompressedCompact => AddrState::Compressed,
-            DataLayout::ChunkBased => AddrState::Chunked { format: 0, bits: 12 },
+            DataLayout::ChunkBased => AddrState::Chunked {
+                format: 0,
+                bits: 12,
+            },
         };
         const KINDS: [FileKind; 7] = [
             FileKind::Reg,
@@ -2148,11 +2223,9 @@ mod tests {
                 if matches!(kind, FileKind::Reg | FileKind::Dir | FileKind::Lnk) {
                     let geom = data_geometry(&sb, 64, &desc);
                     assert_eq!(
-                        geom.compressed,
-                        expected,
+                        geom.compressed, expected,
                         "snapshot (kind = {:?}, dl = {:?})",
-                        kind,
-                        datalayout
+                        kind, datalayout
                     );
                 }
             }
