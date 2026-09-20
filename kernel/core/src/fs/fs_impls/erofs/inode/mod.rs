@@ -1989,14 +1989,14 @@ fn ktest_inode_from_desc(fs: &Erofs, nid: ErofsNid, desc: InodeDesc) -> Arc<Inod
 mod tests {
     use aster_block::{
         SECTOR_SIZE,
-        bio::{BioRequest, BioSegment, BioStatus, BioType},
+        bio::{BioSegment, BioStatus, BioType},
     };
     use ostd::{mm::VmIo, prelude::*};
 
     use super::*;
     use crate::{
         fs::fs_impls::erofs::test_utils::{
-            ErofsMemoryDisk, ktest_bio_trio, ktest_flat_geometry, ktest_fs_on,
+            BioRequest, ErofsMemoryDisk, ktest_bio_trio, ktest_flat_geometry, ktest_fs_on,
             ktest_single_device_table, ktest_super_block,
         },
         vm::page_cache::BlockAsPageCacheBackend,
@@ -2422,7 +2422,7 @@ mod tests {
                 let backend = ktest_data_backend_on(disk.clone(), plen as u64, 0, true, ids as u64);
                 let (segment, mut io_batch, completions) = ktest_bio_trio();
                 backend
-                    .submit_read_bio(0, segment, completions.complete_fn(), &mut io_batch)
+                    .submit_read_bio(0, segment.clone(), completions.complete_fn(), &mut io_batch)
                     .unwrap();
                 io_batch.wait_all().unwrap();
                 assert_eq!(
