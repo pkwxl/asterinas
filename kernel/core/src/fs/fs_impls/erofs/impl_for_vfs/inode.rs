@@ -3,50 +3,72 @@
 //! VFS inode trait implementations for the erofs
 //! [`Inode`](super::super::Inode).
 //!
-//! Wires the erofs `Inode` into the VFS layer by implementing the
-//! `FileOps` and `Inode` traits. Read-side surfaces whose domains are
-//! still pending (data path, namei, xattr) answer with `EOPNOTSUPP`
-//! ("capability deferred") until their tasks land; every mutating
-//! surface is explicitly rejected with `EROFS` — that rejection is
-//! the final, structural behavior of a read-only filesystem, not a
-//! placeholder.
+//! Dispatch-only surface — the terminal shape of T-024 S05
+//! (`docs/T-013/S08/index.md` §4, `docs/T-013/analysis.md` §7.4):
+//! every body below is one of the three sanctioned forms (S08-D3)
+//! — a one-line forward into an inherent method (possibly with a
+//! view conversion), a single-line descriptor-field getter, or a
+//! write-face minimal body. No logic lives here; the bodies are
+//! hosted by the `inode/` submodules and cited per member.
 //!
-//! The no-error-returning time setters (`set_atime`/`set_mtime`/
-//! `set_ctime`) are no-ops by design: erofs never records atime
-//! writes anywhere (zero atime writes, including directory reads), so
-//! there is no state they could mutate. The xattr read surfaces keep
-//! the trait defaults (`EOPNOTSUPP`), which is exactly the
-//! deferred-capability answer until the xattr domain lands.
-
-use aster_block::BLOCK_SIZE;
+//! Same-name pairs (`metadata`/`lookup`/`open`/`read_link`/
+//! `page_cache`/`fs`) resolve to the TYPED INHERENT faces through
+//! Rust's inherent-method precedence (the S08 §7.2 shadowing
+//! table): the framework only ever sees the trait face, while
+//! erofs-internal callers use the inherent faces directly.
+//!
+//! Write faces: `write_at`, `resize`, `set_mode`, `set_owner`, and
+//! `set_group` answer `EROFS` (the S07-D5 minimal bodies); the
+//! no-`Result` time setters are no-ops (G-N07 — erofs never
+//! records atime writes anywhere, including directory reads); and
+//! `set_xattr`/`remove_xattr` answer `EROFS` deliberately: unlike
+//! the directory-entry family, the xattr write path has no VFS
+//! mount-writable front gate (`Path::set_xattr` is an unguarded
+//! inherited method), so this override is the only `EROFS` source
+//! for setxattr(2)/removexattr(2) on erofs (kept per T-024/S04 §4
+//! warning 3; the xattr READ faces `get_xattr`/`list_xattr` keep
+//! the trait `EOPNOTSUPP` defaults until T-026).
+//!
+//! Everything else walks the trait defaults, by design: the
+//! directory-entry mutation family (`create`, `create_tmpfile`,
+//! `mknod`, `link`, `unlink`, `rmdir`, `rename`, `write_link`) is
+//! refused with `EROFS` by the VFS front gate
+//! (`check_dir_entry_mutation` — erofs keeps `FsFlags::RDONLY`
+//! permanently set, `fs.rs`) before any filesystem member is
+//! reached, so those trait defaults are structurally unreachable
+//! from syscalls and their errno differences stay REGISTERED
+//! (`docs/T-013/analysis.md` §9.1), never simulated here;
+//! `fallocate` keeps the `EOPNOTSUPP` default (Linux erofs has no
+//! fallocate file operation either); `sync_all`/`sync_data` keep
+//! the `Ok` defaults (no dirty pages on a read-only filesystem);
+//! `check_permission` uses the framework mode-bit face; and ioctl
+//! has no handler at all, so the observed `ENOTTY` comes from the
+//! framework (G-P03).
 
 use super::super::{Inode as ErofsInode, prelude::*};
 use crate::{
     fs::{
-        file::StatusFlags,
+        file::{AccessMode, PerOpenFileOps, StatusFlags},
         vfs::{
             file_system::FileSystem,
-            inode::{
-                Extension, FallocMode, FileOps, HardLinkability, Inode, Metadata, MknodType,
-                RenameMode,
-            },
+            inode::{Extension, FileOps, Inode, Metadata, SymbolicLink},
             xattr::{XattrName, XattrSetFlags},
         },
     },
     process::{Gid, Uid},
-    vm::page_cache::Vmo,
+    vm::page_cache::{PageCache, Vmo},
 };
 
 impl FileOps for ErofsInode {
     fn read_at(
         &self,
-        _offset: usize,
-        _writer: &mut VmWriter,
-        _status_flags: StatusFlags,
+        offset: usize,
+        writer: &mut VmWriter,
+        status_flags: StatusFlags,
     ) -> Result<usize> {
-        // The data path lands with T-025; until then reads report the
-        // deferred capability rather than fabricated data.
-        return_errno_with_message!(Errno::EOPNOTSUPP, "erofs data path is not implemented yet");
+        // file.rs: EISDIR guard first, zero-length early exit, then
+        // the T-025 data body.
+        self.read_at(offset, writer, status_flags)
     }
 
     fn write_at(
@@ -55,22 +77,22 @@ impl FileOps for ErofsInode {
         _reader: &mut VmReader,
         _status_flags: StatusFlags,
     ) -> Result<usize> {
+        // Write-face minimal body (S07-D5).
         return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
     }
 
-    fn readdir_at(&self, _offset: usize, _visitor: &mut dyn DirentVisitor) -> Result<usize> {
-        // Namei and dirent iteration land with T-024.
-        return_errno_with_message!(Errno::EOPNOTSUPP, "erofs readdir is not implemented yet");
+    fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
+        // dir.rs iteration half: cursor walk, seven-element cookie
+        // model (F18).
+        self.readdir_at(offset, visitor)
     }
 }
 
 impl Inode for ErofsInode {
     fn size(&self) -> usize {
-        // Interim shape: sizes stay zero until the metadata assembly
-        // lands (T-024); the transitional handle already carries the
-        // decoded descriptor, but this trait face does not read it
-        // yet.
-        0
+        // X7: I7 caps the decoded size at i64::MAX — the cast is
+        // lossless on 64-bit targets.
+        self.desc().size as usize
     }
 
     fn resize(&self, _new_size: usize) -> Result<()> {
@@ -78,53 +100,22 @@ impl Inode for ErofsInode {
     }
 
     fn metadata(&self) -> Result<Metadata> {
-        // Interim shape: the metadata assembly reads the descriptor
-        // with T-024; until then this reports an empty read-only
-        // directory owned by root (ino/type_ are already real — they
-        // derive from the handle through `kind()` and the
-        // `From<FileKind>` bijection). Erofs records no birth time
-        // on disk, so `birth_at: None` is final.
-        let fs = self.fs()?;
-        let nr_hard_links = if InodeType::from(self.kind()) == InodeType::Dir {
-            2
-        } else {
-            1
-        };
-        Ok(Metadata {
-            ino: self.ino(),
-            size: 0,
-            optimal_block_size: BLOCK_SIZE,
-            nr_sectors_allocated: 0,
-            last_access_at: Duration::ZERO,
-            last_modify_at: Duration::ZERO,
-            last_meta_change_at: Duration::ZERO,
-            type_: InodeType::from(self.kind()),
-            mode: InodeMode::from_bits_truncate(0o555),
-            nr_hard_links,
-            uid: Uid::new_root(),
-            gid: Gid::new_root(),
-            container_dev_id: fs.container_device_id(),
-            self_dev_id: None,
-            birth_at: None,
-        })
+        // Infallible by construction (X16): the statx assembly
+        // reads in-memory state only.
+        Ok(self.metadata())
     }
 
     fn ino(&self) -> u64 {
-        self.ino()
+        self.ino() // X2: st_ino = nid
     }
 
     fn type_(&self) -> InodeType {
-        // The typed kind face: single source = the handle's
-        // `kind()` plus the `From<FileKind> for InodeType`
-        // bijection (S03-D3; the S05 dispatch rewrite forwards
-        // through the metadata assembly instead).
-        InodeType::from(self.kind())
+        // `From<FileKind>` single source (S03-D3).
+        self.kind().into()
     }
 
     fn mode(&self) -> Result<InodeMode> {
-        // Interim shape: 0555 — a read-only directory — until the
-        // metadata assembly lands (T-024).
-        Ok(InodeMode::from_bits_truncate(0o555))
+        Ok(self.desc().mode)
     }
 
     fn set_mode(&self, _mode: InodeMode) -> Result<()> {
@@ -132,9 +123,8 @@ impl Inode for ErofsInode {
     }
 
     fn owner(&self) -> Result<Uid> {
-        // Interim shape: root-owned until the metadata assembly
-        // lands (T-024).
-        Ok(Uid::new_root())
+        // X5: zero-extended at decode.
+        Ok(Uid::new(self.desc().uid))
     }
 
     fn set_owner(&self, _uid: Uid) -> Result<()> {
@@ -142,25 +132,24 @@ impl Inode for ErofsInode {
     }
 
     fn group(&self) -> Result<Gid> {
-        Ok(Gid::new_root())
+        Ok(Gid::new(self.desc().gid))
     }
 
     fn set_group(&self, _gid: Gid) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
     }
 
+    // X8: one decoded `Duration`, three copies (D10).
     fn atime(&self) -> Duration {
-        // Interim shape: the decoded timestamps land with the
-        // metadata assembly (T-024).
-        Duration::ZERO
+        self.desc().time
     }
 
     fn set_atime(&self, _time: Duration) {
-        // No-op by design: erofs never records atime writes.
+        // No-op by design (G-N07): erofs records no atime writes.
     }
 
     fn mtime(&self) -> Duration {
-        Duration::ZERO
+        self.desc().time
     }
 
     fn set_mtime(&self, _time: Duration) {
@@ -168,7 +157,7 @@ impl Inode for ErofsInode {
     }
 
     fn ctime(&self) -> Duration {
-        Duration::ZERO
+        self.desc().time
     }
 
     fn set_ctime(&self, _time: Duration) {
@@ -176,67 +165,44 @@ impl Inode for ErofsInode {
     }
 
     fn page_cache(&self) -> Option<Arc<Vmo>> {
-        // No page cache until the data path lands (T-025).
-        None
+        // Internal `Option<&PageCache>` → trait `Option<Arc<Vmo>>`:
+        // one view of the single DataBacked payload (S02 §2.6).
+        self.page_cache().map(PageCache::as_vmo).cloned()
     }
 
-    fn create(&self, _name: &str, _type_: InodeType, _mode: InodeMode) -> Result<Arc<dyn Inode>> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
-    }
-
-    fn create_tmpfile(
+    fn open(
         &self,
-        _mode: InodeMode,
-        _hard_linkability: HardLinkability,
-    ) -> Result<Arc<dyn Inode>> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+    ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
+        // G-N03: the seven-kind arm table lives in the inherent
+        // body (inode/mod.rs).
+        self.open(access_mode, status_flags)
     }
 
-    fn mknod(&self, _name: &str, _mode: InodeMode, _type_: MknodType) -> Result<Arc<dyn Inode>> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
+        // Inherent precedence plus the `Arc` upcast; the framework
+        // caches the hit/ENOENT face (N14).
+        Ok(self.lookup(name)?)
     }
 
-    fn link(&self, _old: &Arc<dyn Inode>, _name: &str) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
-    }
-
-    fn unlink(&self, _name: &str) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
-    }
-
-    fn rmdir(&self, _name: &str) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
-    }
-
-    fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>> {
-        // Namei lands with T-024.
-        return_errno_with_message!(Errno::EOPNOTSUPP, "erofs lookup is not implemented yet");
-    }
-
-    fn rename(
-        &self,
-        _old_name: &str,
-        _target: &Arc<dyn Inode>,
-        _new_name: &str,
-        _mode: RenameMode,
-    ) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
-    }
-
-    fn write_link(&self, _target: &str) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
-    }
-
-    fn fallocate(&self, _mode: FallocMode, _offset: usize, _len: usize) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
+    fn read_link(&self) -> Result<SymbolicLink> {
+        // EROFS always yields `Plain` (the `Path` variant is
+        // procfs-only).
+        self.read_link().map(SymbolicLink::Plain)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {
-        // Invariant: a live `Inode` always belongs to a live `Erofs`
-        // instance — the mount holds a strong reference for as long as
-        // any inode it handed out is reachable, so the guarded
-        // upgrade in the internal `fs()` cannot fail here.
+        // Unreachable-failure upgrade: with the strong inode cache
+        // the mount always outlives the inodes it handed out
+        // (S01 §2.4).
         self.fs().unwrap()
+    }
+
+    fn seek_end(&self) -> Option<usize> {
+        // G-N06: Dir|Reg → Some(i_size); the remaining kinds keep
+        // the default `None` face.
+        self.seek_end()
     }
 
     fn extension(&self) -> &Extension {
@@ -249,6 +215,10 @@ impl Inode for ErofsInode {
         _value_reader: &mut VmReader,
         _flags: XattrSetFlags,
     ) -> Result<()> {
+        // Write-face minimal body, deliberately kept (T-024/S04
+        // §4 warning 3): the xattr write path has no VFS
+        // mount-writable front gate, so this member is the only
+        // EROFS source for setxattr(2)/removexattr(2).
         return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
     }
 

@@ -10,10 +10,13 @@
 //! * `inode` — `FileOps` and `Inode` for `Inode` (I/O, metadata,
 //!   lookup, extension slot, xattr glue).
 //!
-//! The adapter only dispatches; it holds no logic of its own. Every
-//! mutating entry point is explicitly rejected with `EROFS` (the
-//! filesystem is read-only by construction), ordered after
-//! parameter-level errors once those exist.
+//! The adapter only dispatches; it holds no logic of its own. The
+//! mutating members it implements answer `EROFS` (the filesystem is
+//! read-only by construction); the directory-entry family needs no
+//! member at all — the VFS mount-writable front gate refuses those
+//! with `EROFS` before any filesystem code runs (erofs keeps
+//! `FsFlags::RDONLY` permanently set; the shape landed with
+//! T-024 S05).
 
 mod fs;
 mod inode;

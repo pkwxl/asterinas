@@ -38,10 +38,8 @@ impl Inode {
     // (`ext2/inode/file.rs:32`) is the negative sample, same family
     // as `ext2/inode/dir/mod.rs:61`.
     //
-    // Bridging expect: the trait face still answers EOPNOTSUPP
-    // itself until the S05 rewrite forwards here — first consumer:
-    // S05.
-    #[expect(dead_code)]
+    // Live since T-024 S05: the VFS adapter's `FileOps::read_at`
+    // forwards to this body.
     pub(in crate::fs::fs_impls::erofs) fn read_at(
         &self,
         _offset: usize,

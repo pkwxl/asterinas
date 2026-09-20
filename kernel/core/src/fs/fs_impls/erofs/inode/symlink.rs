@@ -115,11 +115,9 @@ impl Inode {
     ///
     /// Err face: EISDIR (non-LNK, below) / page-read passthrough
     /// (slow arm) / EIO (non-UTF-8 target, G-N02 candidate ①).
-    // Bridging expect: the trait face still returns the framework
-    // default EISDIR until the S05 rewrite forwards
-    // `self.read_link().map(SymbolicLink::Plain)` — first consumer:
-    // S05.
-    #[expect(dead_code)]
+    // Live since T-024 S05: the VFS adapter forwards
+    // `self.read_link().map(SymbolicLink::Plain)` through its
+    // `read_link` override.
     pub(in crate::fs::fs_impls::erofs) fn read_link(&self) -> Result<String> {
         // Kind guard first: non-LNK replicates the trait default
         // face (EISDIR, `vfs/fs_apis/inode.rs:461-463`) — this IS

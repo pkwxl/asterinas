@@ -44,9 +44,9 @@
 //! T-025). Since T-024 S03 both dirent walks live in `inode/dir.rs`
 //! — the namei binary search (lookup) and the getdents iteration
 //! (readdir), kept apart by the two-strictness-domains contract of
-//! that module. The VFS dispatch rewrite is the remaining subtask of
-//! T-024; until it lands, the VFS adapter keeps its transitional
-//! answers.
+//! that module — and since T-024 S05 the VFS adapter
+//! (`impl_for_vfs/inode.rs`) forwards to every inherent face above
+//! as a dispatch-only surface.
 //!
 //! # Submodules
 //!
@@ -267,7 +267,7 @@ impl Inode {
     /// DataBacked only).
     // Live since T-024 S03: both directory walks (the namei binary
     // search and the getdents iteration in `inode/dir.rs`) read
-    // through this face; the dispatch face joins with S05. (The
+    // through this face; the dispatch face joined with S05. (The
     // slow-symlink read arm matches the payload field in place
     // instead of going through this Option face — the S04 §4.1
     // terminal sample.)
@@ -333,9 +333,9 @@ impl Inode {
     // Cross-seven-kind inherent faces (T-024 S02; `docs/T-013/
     // analysis.md` §2/§6). Hosted on the handle — not in the VFS
     // adapter — because each face spans kinds and payloads across
-    // the submodule domains (S03-D1/S07-D1/S06-D6); the adapter
-    // forwards to them with one line each once the S05 dispatch
-    // rewrite lands. Until then these carry bridging expects.
+    // the submodule domains (S03-D1/S07-D1/S06-D6); the VFS adapter
+    // (impl_for_vfs/inode.rs, since T-024 S05) forwards to each of
+    // them with one line.
     // -------------------------------------------------------------------
 
     /// Assembles the statx snapshot — the `erofs_getattr` homologue
@@ -354,10 +354,8 @@ impl Inode {
     /// round_up caliber at `ext2/inode/attrs.rs:68` is the negative
     /// sample — copying it would drift st_blocks on compressed
     /// special files); `birth_at` is `None` (no on-disk source).
-    // Bridging expect: the VFS adapter still carries the
-    // transitional placeholder metadata until the S05 rewrite
-    // forwards `Ok(self.metadata())` — first consumer: S05.
-    #[expect(dead_code)]
+    // Live since T-024 S05: the VFS adapter forwards
+    // `Ok(self.metadata())` through its same-name trait face.
     pub(super) fn metadata(&self) -> Metadata {
         let desc = &self.desc;
         // The only fallible input: the weak-upgrade for the two
@@ -411,10 +409,8 @@ impl Inode {
     /// `Device::open`. FIFO opens the payload's eagerly constructed
     /// `Pipe` (C-5a/S07-D2: the strong-Arc identity convergence
     /// carries the POSIX open-pairing semantics).
-    // Bridging expect: the trait face still returns the framework
-    // default `None` until the S05 rewrite adds the forwarding
-    // override — first consumer: S05.
-    #[expect(dead_code)]
+    // Live since T-024 S05: the VFS adapter forwards to this
+    // inherent body through its `open` override.
     pub(super) fn open(
         &self,
         access_mode: AccessMode,
@@ -467,10 +463,8 @@ impl Inode {
     /// otherwise lose. usize is lossless for u64 sizes on 64-bit
     /// targets (I7 caps size at i64::MAX). The remaining kinds keep
     /// the default face (`None`).
-    // Bridging expect: the trait face still uses the framework
-    // default until the S05 rewrite adds the forwarding override —
-    // first consumer: S05.
-    #[expect(dead_code)]
+    // Live since T-024 S05: the VFS adapter forwards to this
+    // inherent body through its `seek_end` override.
     pub(super) fn seek_end(&self) -> Option<usize> {
         match self.kind() {
             FileKind::Dir | FileKind::Reg => Some(self.desc().size as usize),

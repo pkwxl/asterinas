@@ -372,10 +372,8 @@ impl Inode {
     /// replay on every call, N14). `./..` carry no special-casing —
     /// a dot name reaching here is compared byte-wise like any other
     /// (the VFS consumes path dots before the FS lookup).
-    // Bridging expect: the trait face still returns the transitional
-    // EOPNOTSUPP until the S05 rewrite forwards `Ok(self.lookup(name)?)`
-    // — first consumer: S05.
-    #[expect(dead_code)]
+    // Live since T-024 S05: the VFS adapter forwards
+    // `Ok(self.lookup(name)?)` through its `lookup` override.
     pub(in crate::fs::fs_impls::erofs) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
         let nid = self.lookup_nid(name)?; // erofs_namei
         self.fs()?.iget(nid) // erofs_iget (N14; I-family incl. I12)
@@ -410,10 +408,8 @@ impl Inode {
     /// (G-N04 non-UTF-8 name, G-N05 slash name) / read passthrough
     /// (R4). Zero atime writes (G-N07); no iget, no I-family errors
     /// (the walk emits whatever the slots say, nid = 0 included).
-    // Bridging expect: the trait face still returns the transitional
-    // EOPNOTSUPP until the S05 rewrite forwards to this inherent
-    // method — first consumer: S05.
-    #[expect(dead_code)]
+    // Live since T-024 S05: the VFS adapter's `FileOps::readdir_at`
+    // forwards to this inherent method.
     pub(in crate::fs::fs_impls::erofs) fn readdir_at(
         &self,
         offset: usize,
