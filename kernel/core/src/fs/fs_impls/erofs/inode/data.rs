@@ -11,11 +11,12 @@
 //! `inode/mod.rs::data_geometry`) replaced the transitional
 //! `FlatLayout`/`InlineTail` pair in place, per the §1.1 seam — the
 //! constructor parameter set never churned. The remaining T-025
-//! slices evolve this file in place: the map_blocks/map_dev walk
-//! lands with S03, the chunk mapping (M4–M7) with S04, and the
-//! four-arm submit_read_bio rewrite — including the crafted-edge
-//! validation (e.g. the "inline data across blocks" EFSCORRUPTED
-//! arm of data.c:103-108) — with S05.
+//! slices evolve this file in place: the map layer landed with S03
+//! (`map_blocks` flat branches M1/M2 + the three-arm `map_dev` walk,
+//! neither consumed by the minimal backend yet), the chunk mapping
+//! (M4–M7) lands with S04, and the four-arm submit_read_bio rewrite
+//! — including the crafted-edge validation (e.g. the "inline data
+//! across blocks" EFSCORRUPTED arm of data.c:103-108) — with S05.
 //!
 //! Seam contract carried from T-024 into T-025 (§1.1):
 //! - the constructor parameter set is final (`Weak<Erofs>` +
@@ -127,6 +128,47 @@ pub(in crate::fs::fs_impls::erofs) struct ChunkGeometry {
     pub chunkbits: u32,
 }
 
+bitflags! {
+    /// Outcome flags — the aster analog of `EROFS_MAP_*`
+    /// (linux/fs/erofs/internal.h:315-328). The value bits mirror
+    /// linux exactly for parity review. Only the two non-compressed
+    /// bits exist under archive A; the compressed family (ENCODED
+    /// 0x4 / FULL_MAPPED 0x8 / __FRAGMENT 0x10 / PARTIAL_REF 0x20)
+    /// is revived together with the G-Z01 compressed branch.
+    pub(super) struct MapFlags: u32 {
+        /// Has a disk mapping (EROFS_MAP_MAPPED = 0x0001).
+        const MAPPED = 0x0001;
+        /// The payload lives in the inode metadata area
+        /// (EROFS_MAP_META = 0x0002).
+        const META = 0x0002;
+    }
+}
+
+/// One non-compressed extent mapping — the aster analog of linux
+/// `struct erofs_map_blocks` (internal.h:330-339). Not carried:
+/// `buf`/`mpage` (no cross-call metabuf, S02-D1/D2) and
+/// `m_algorithmformat` (set only by zmap, archive A).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MapBlocks {
+    /// Logical start. Input echo, except the CHUNK_BASED branch
+    /// which aligns it down to the chunk boundary (data.c:150).
+    pub m_la: u64,
+    /// Extent logical length; on success always == m_plen (M8, the
+    /// dual-role contract of `map_blocks`).
+    pub m_llen: u64,
+    /// Physical byte offset on the (pre-map_dev) device byte stream:
+    /// MAPPED — data start; META — inline payload start; meaningless
+    /// (deterministic 0) while MAPPED is unset.
+    pub m_pa: u64,
+    /// Mapped length (MAPPED/META) or hole length (post-EOF only).
+    pub m_plen: u64,
+    /// Device id (CHUNK 8B-index branch only; 0 elsewhere). Resolve
+    /// via `map_dev` — never a raw device handle.
+    pub m_deviceid: u16,
+    /// Outcome trichotomy: MAPPED|META / MAPPED / empty.
+    pub m_flags: MapFlags,
+}
+
 /// Read-only page-cache backend for erofs DataBacked payloads
 /// (decision 1, `docs/T-024/subtasks.md` S01; the geometry is final
 /// since T-025 S01 — see the module doc for the seam contract).
@@ -147,8 +189,8 @@ pub(in crate::fs::fs_impls::erofs) struct DataBackend {
     /// constructor-seam parameter for the map_blocks/map_dev faces
     /// (mount geometry and device-table walks, T-025 S03/S04); the
     /// minimal face reads the device it already holds instead.
-    // First consumer: map_dev / upgrade_fs (T-025 S03).
-    #[expect(dead_code)]
+    // Live since T-025 S03: `upgrade_fs` reads it on every nonzero-id
+    // map_dev walk (the chunk-8B mask fetch joins with S04).
     fs: Weak<Erofs>,
     /// The backing device: flat-region BIOs and inline-tail byte
     /// reads both go through it.
@@ -189,6 +231,250 @@ impl DataBackend {
             npages,
         }
     }
+
+    // -------------------------------------------------------------------
+    // The map layer (T-025 S03): map_blocks flat branches + map_dev.
+    // Pure submit-context code — no completion-context entry, no
+    // blocking locks (`&self` is immutable post-construction).
+    // -------------------------------------------------------------------
+
+    /// Map one non-compressed extent covering logical offset `m_la`.
+    ///
+    /// # The `m_llen` dual-role contract (M8/I1)
+    ///
+    /// `m_llen` is both an input and part of the output:
+    ///
+    /// 1. *Input*: the caller's remaining window length. Only the
+    ///    post-EOF branch consumes it (`m_plen = m_llen`,
+    ///    data.c:124-129), so a query past EOF still reports how far
+    ///    the unmapped hole extends.
+    /// 2. *Output*: on success the returned `m_llen` is always set to
+    ///    `m_plen` (data.c:182-183) — the extent covers
+    ///    `[m_la, m_la + m_llen)`.
+    /// 3. *No rollback on error*: an `Err` carries no partial mapping
+    ///    (the linux "partial update, no rollback" note is satisfied
+    ///    by value semantics; data.c error paths).
+    /// 4. `m_la` is also an output: the CHUNK_BASED branch aligns it
+    ///    down to the chunk boundary (data.c:150); the flat branches
+    ///    echo the input.
+    ///
+    /// Passing `m_llen == 0` is legal but degenerate: the post-EOF
+    /// branch then reports `m_plen == 0` (linux iomap patches this up
+    /// at its own layer, data.c:318-319 — aster callers never pass
+    /// 0).
+    pub(super) fn map_blocks(&self, m_la: u64, m_llen: u64) -> Result<MapBlocks> {
+        // (a) Layer-3 defensive half (I12; S01-D3 bool snapshot) —
+        //     the SINGLE carrying point of the compressed rejection:
+        //     submit_read_bio does not repeat this gate (S03 §2.3).
+        //     Structurally unreachable behind the assembly gate; kept
+        //     as defense-in-depth (the F10/F11 family posture).
+        if self.geom.compressed {
+            // AUTO-TODO(G-Z01): The compressed mapping path (z_erofs_map_blocks_iter,
+            // zmap.c) is deferred as a whole under archive A. Reviving it means
+            // replacing this defensive rejection with the real compressed branch
+            // here; until then the F10/F11 mount gates and the I12 assembly gate
+            // keep this arm structurally unreachable.
+            return_errno_with_message!(Errno::EOPNOTSUPP, "compressed inode data is not supported");
+        }
+        // (b) post-EOF: leave out-of-bound access unmapped
+        //     (data.c:124-129). Structurally unreachable behind both
+        //     current callers (they clamp below size) but kept for
+        //     function-level parity and the fiemap/zmap revival
+        //     consumers. m_plen consumes the dual-role input; m_pa
+        //     and m_deviceid take the deterministic zeros (linux
+        //     leaves stack residue there — unobservable, consumers
+        //     never read m_pa while !MAPPED).
+        if m_la >= self.geom.size {
+            return Ok(MapBlocks {
+                m_la,
+                m_llen, // the echo equals m_plen (dual-role output)
+                m_pa: 0,
+                m_plen: m_llen,
+                m_deviceid: 0, // the data.c:123 entry clear
+                m_flags: MapFlags::empty(),
+            });
+        }
+        // (c) layout dispatch (data.c:131-134): chunk.is_none()
+        //     doubles as the flat discriminator. The debug assert is
+        //     the DataGeometry field-validity domain (S01 §1.3): a
+        //     CHUNK_BASED geometry never carries the flat tail bit —
+        //     an API-misuse face, not an on-disk check.
+        debug_assert!(self.geom.chunk.is_none() || !self.geom.tail_inline);
+        match self.geom.chunk {
+            None => self.map_blocks_flatmode(m_la),
+            // TRANSITIONAL ARM (T-025 decomposition decision 4):
+            // purpose — keep every chunk-based mapping query failing
+            // EOPNOTSUPP until the chunk walk (M4–M7) lands; removal
+            // — S04 replaces the arm through the `chunked` helper.
+            // The main-column image family carries no chunk-based
+            // inode, so behavior is unchanged meanwhile.
+            Some(_) => {
+                return_errno_with_message!(
+                    Errno::EOPNOTSUPP,
+                    "chunk-based mapping lands with the data-path task"
+                );
+            }
+        }
+    }
+
+    /// data.c:81-108 (`erofs_map_blocks_flatmode`) — the two flat
+    /// states: FLAT_PLAIN (all-MAPPED) and FLAT_INLINE (the tail
+    /// segment carries MAP_META). Pure geometry: no I/O and no
+    /// chunk-table reads (S03-D4 — the helper split mirrors the
+    /// linux function so the parity table anchors line up).
+    fn map_blocks_flatmode(&self, m_la: u64) -> Result<MapBlocks> {
+        // lastblk (data.c:87) with the erofs_blk_t = u32 domain
+        // mirrored (S03-D5): erofs_iblks = ceil(size / bs) truncated
+        // to u32, then the wrapping subtraction of the tail block —
+        // crafted giant i_size (extended ≥ 2^44) traces linux
+        // point-for-point (errno and branch both).
+        let bs = 1u64 << self.geom.block_bits;
+        let nblks = self.geom.size.div_ceil(bs);
+        let lastblk = (nblks as u32).wrapping_sub(u64::from(self.geom.tail_inline) as u32);
+        let lastblk_pos = (lastblk as u64) << self.geom.block_bits; // erofs_pos
+        if m_la < lastblk_pos {
+            // MAPPED segment (data.c:90-92): identity over
+            // raw_blkaddr; plen reaches the block-rounded end and is
+            // NOT clamped to i_size (the last-page tail zerofill duty
+            // belongs to the backend consumers, G-P02). No hole
+            // check either — flat inodes have none ("no hole in flat
+            // inodes", data.c:89), and a crafted NULL_ADDR
+            // raw_blkaddr reads through to the device error exactly
+            // as in linux (no tightening, G-Z05 family discipline).
+            let plen = lastblk_pos - m_la;
+            Ok(MapBlocks {
+                m_la,
+                m_llen: plen,
+                m_pa: (u64::from(self.geom.raw_blkaddr) << self.geom.block_bits) + m_la,
+                m_plen: plen,
+                m_deviceid: 0,
+                m_flags: MapFlags::MAPPED,
+            })
+        } else {
+            // Inline tail (data.c:93-105): the payload lives in the
+            // inode's metadata area at inline_data_start +
+            // blkoff(m_la) (the iloc + inode_isize + xattr_isize
+            // prefix is collapsed into inline_data_start, T-013 §3.1
+            // single source); the copy length clamps to i_size
+            // naturally.
+            debug_assert!(self.geom.tail_inline); // DBG_BUGON, data.c:94
+            let m_pa = self.geom.inline_data_start + (m_la & (bs - 1));
+            let m_plen = self.geom.size - m_la;
+            // "inline data should be located in the same meta block"
+            // (data.c:99-104): the cross-block defense — judgement,
+            // errno, and timing (before any INLINE fetch) are
+            // single-sourced HERE; the consumers (the S05 fill arm
+            // and the S07 DIO copy) do not re-check.
+            if (m_pa & (bs - 1)) + m_plen > bs {
+                return_errno_with_message!(Errno::EUCLEAN, "inline data across blocks");
+            }
+            Ok(MapBlocks {
+                m_la,
+                m_llen: m_plen,
+                m_pa,
+                m_plen,
+                m_deviceid: 0,
+                // META always accompanies MAPPED (the data.c:105 |=).
+                m_flags: MapFlags::MAPPED | MapFlags::META,
+            })
+        }
+    }
+
+    /// Resolve a mapped extent onto the primary device byte stream.
+    ///
+    /// Takes the `(m_pa, m_deviceid)` pair produced by `map_blocks`
+    /// and returns the physical byte offset to read on the primary
+    /// device (`self.device`) — the aster analog of linux
+    /// `erofs_map_dev` (data.c:188-237), projected onto the two
+    /// reachable device-table forms:
+    ///
+    /// - `m_deviceid == 0`: primary device — identity (linux sets
+    ///   `m_bdev = sb->s_bdev` at entry and skips the table).
+    /// - `m_deviceid != 0` (flatdev images only: a nonzero id
+    ///   requires `device_id_mask != 0`): 1-based slot lookup;
+    ///   `None` → `ENODEV` (the linux idr_find miss, data.c:209-213).
+    ///   A hit translates `m_pa += mapped_blkaddr << block_bits` and
+    ///   STILL reads the primary device — the flatdev deployment
+    ///   contract assumes the slot content physically follows the
+    ///   primary image (MD13 trust semantics: no capacity
+    ///   cross-check, no per-slot bounds check).
+    ///
+    /// The returned offset may lie past the primary device end on
+    /// crafted images; the error then comes from the device stack of
+    /// whichever channel the consumer uses and passes through
+    /// unchanged (never re-mapped here).
+    ///
+    /// # Composition contract (I2)
+    ///
+    /// Every consumer of `MapBlocks.m_pa` calls this exactly once
+    /// after `map_blocks` and before dispatching on `m_flags` — the
+    /// linux `erofs_iomap_begin` shape (data.c:298-302). This
+    /// includes the META state (linux reads its metabuf at the
+    /// resolved pa, data.c:328) and, vacuously, the empty state
+    /// (holes keep `m_deviceid == 0`, so the call is the identity
+    /// and the pa is unused).
+    pub(super) fn map_dev(&self, m_pa: u64, m_deviceid: u16) -> Result<u64> {
+        // AUTO-TODO(G-M16): Linux sets the backing device's logical block size
+        // at mount and switches to a larger one when the superblock demands it
+        // (F3/F5). The aster block layer has no logical-block-size concept
+        // (`BlockDeviceMeta` carries no such field), so both steps are statically
+        // cut and this mapping is the identity onto the single backing device.
+        // If a framework logical block size is ever added (candidate W-P05,
+        // gated on a G-P01 upgrade), re-evaluate this row in the same batch —
+        // including the 4k-only gate (AR-S01-1), under which no switch step has
+        // semantics.
+        // Multi-device revival note (U3; W-O02 / G-M13 mount half): the
+        // non-flatdev arms of linux erofs_map_dev — selecting a per-device
+        // bdev for a nonzero device id, and the mapped_blkaddr interval
+        // fallback for id-less mappings — are structurally unreachable here:
+        // any mounted device table with extra devices is flatdev (a
+        // count-matching `device=` mount is rejected at scan time, G-M13).
+        // Reviving true multi-device means returning a per-slot device handle
+        // from this function and adding the interval arm; re-evaluate in the
+        // same batch as the mount-side rejection.
+        //
+        // (a) Primary device: identity. data.c:206-207 — m_bdev is
+        //     s_bdev (primary) at entry and `if (map->m_deviceid)` is
+        //     the only dispatch key; id 0 never consults the table
+        //     and never upgrades the fs handle (data.c:207 before
+        //     :208) — the single-volume hot path touches neither the
+        //     Weak nor the DeviceTable.
+        if m_deviceid == 0 {
+            return Ok(m_pa);
+        }
+        // (b) Nonzero id — flatdev images only (data.c:208-213): the
+        //     1-based slot lookup (idr_find(tree, id − 1)); a miss is
+        //     ENODEV, reachable only through the crafted over-supply
+        //     mask corner (extra=2, mask=3, id=3) — parity, not drift
+        //     (linux idr_find returns NULL on the same input).
+        let fs = self.upgrade_fs()?;
+        let Some((_blocks, mapped_blkaddr)) = fs.device_table().slot(u32::from(m_deviceid)) else {
+            return_errno_with_message!(Errno::ENODEV, "device id not found in the device table");
+        };
+        // (c) flatdev translation (data.c:214-218): still reads the
+        //     PRIMARY device — the linux branch returns before any
+        //     per-device fill, and aster returns the pure offset
+        //     while consumers structurally read `self.device`. The
+        //     slot `blocks` value is not consumed here (its only
+        //     consumers are the statfs accumulation and the
+        //     unreachable MD12 interval scan).
+        debug_assert!(fs.device_table().flatdev()); // slots hit ⇒ flatdev
+        // erofs_pos(sb, blk) = blk << blkszbits (internal.h:221).
+        Ok(m_pa + (u64::from(mapped_blkaddr) << self.geom.block_bits))
+    }
+
+    /// Upgrade the weak fs handle to the live `Erofs` instance.
+    ///
+    /// Defensive-only: inode-cache strong references outlive every
+    /// DataBackend consumer (S01 §1.5), so failure is unreachable;
+    /// the EIO guard follows the family form (the ext2 block-manager
+    /// and Inode::fs precedents). Shared by `map_dev` and (from S04)
+    /// the chunk-8B mask fetch (S04-D5).
+    fn upgrade_fs(&self) -> Result<Arc<Erofs>> {
+        self.fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
+    }
 }
 
 impl BlockAsPageCacheBackend for DataBackend {
@@ -212,6 +498,13 @@ impl BlockAsPageCacheBackend for DataBackend {
         // bypasses of that gate, the same unreachable-but-defensive
         // posture as the F10/F11 mount-site gates, with the same
         // message string.
+        //
+        // TRANSITIONAL DUPLICATION (T-025 S03): the single carrying
+        // point of this rejection is `map_blocks` (a) since S03;
+        // this minimal face does not call the map layer yet, so the
+        // gate stays duplicated here until the S05 four-arm rewrite
+        // routes submit_read_bio through map_blocks and removes this
+        // copy (S03 §2.3's single-point declaration).
         if self.geom.compressed {
             return_errno_with_message!(Errno::EOPNOTSUPP, "compressed inode data is not supported");
         }
@@ -399,7 +692,350 @@ mod tests {
     use ostd::prelude::*;
 
     use super::*;
-    use crate::fs::fs_impls::erofs::{Erofs, test_utils::ktest_super_block};
+    use crate::fs::fs_impls::erofs::{
+        Erofs,
+        test_utils::{
+            ErofsMemoryDisk, ktest_data_geometry, ktest_flat_geometry, ktest_flatdev_table,
+            ktest_fs_on, ktest_single_device_table, ktest_super_block,
+        },
+    };
+
+    /// A flat-geometry backend over a device-less handle (S03-D4: the
+    /// flat arm is pure geometry, so the null device makes any
+    /// accidental I/O fail loudly here).
+    fn ktest_null_backend(geom: DataGeometry) -> DataBackend {
+        let fs = Erofs::ktest_new(ktest_super_block(12, 0));
+        let npages = geom.size.div_ceil(PAGE_SIZE as u64) as usize;
+        DataBackend::new(
+            fs.self_ref().clone(),
+            fs.block_device().clone(),
+            geom,
+            npages,
+        )
+    }
+
+    /// S03-IF-1/S03-IF-10 (anchor `docs/T-014/S03/index.md` §10): the
+    /// MAPPED-formula grid over size × la — non-block-aligned sizes,
+    /// sub-block sizes, the exact block, multi-block, and the
+    /// FLAT_INLINE flat region — plus the M8 exit invariant
+    /// (`m_llen == m_plen` on every success) and the no-i_size-clamp
+    /// pin (plen reaches the block-rounded end).
+    #[ktest]
+    fn map_blocks_flat_mapped_grid() {
+        const BS: u64 = 4096;
+        // (size, tail_inline, raw_blkaddr)
+        let cases: &[(u64, bool, u32)] = &[
+            (1, false, 16), // size < bs
+            (100, false, 16),
+            (4095, false, 7),         // one byte short of the block
+            (4096, false, 7),         // the exact block
+            (4097, false, 7),         // one byte past → two blocks
+            (3 * BS + 100, true, 16), // FLAT_INLINE: 3 flat blocks + tail
+            (16 * BS, false, 32),     // multi-block exact
+        ];
+        let las = |size: u64, lastblk_pos: u64| {
+            vec![0, 1, BS - 1, BS, lastblk_pos - 1]
+                .into_iter()
+                .filter(|&la| la < lastblk_pos && la < size)
+                .chain(
+                    [lastblk_pos / 2]
+                        .into_iter()
+                        .filter(|&la| la < lastblk_pos && la < size),
+                )
+        };
+        for &(size, tail_inline, raw) in cases {
+            let geom = ktest_data_geometry(size, 12, raw, tail_inline, 0, None, false);
+            let backend = ktest_null_backend(geom);
+            let lastblk_pos = size.div_ceil(BS).wrapping_sub(u64::from(tail_inline)) << 12;
+            for la in las(size, lastblk_pos) {
+                let m = backend.map_blocks(la, PAGE_SIZE as u64).unwrap();
+                assert_eq!(m.m_flags, MapFlags::MAPPED, "size={size} la={la}");
+                assert_eq!(m.m_la, la, "la echo, size={size} la={la}");
+                assert_eq!(
+                    m.m_pa,
+                    ((raw as u64) << 12) + la,
+                    "pa formula, size={size} la={la}"
+                );
+                assert_eq!(
+                    m.m_plen,
+                    lastblk_pos - la,
+                    "plen formula, size={size} la={la}"
+                );
+                assert_eq!(m.m_llen, m.m_plen, "M8, size={size} la={la}");
+                assert_eq!(m.m_deviceid, 0, "size={size} la={la}");
+            }
+            // The no-clamp pin: the last MAPPED extent of a partial
+            // final block reaches past i_size to the block end.
+            if size % BS != 0 {
+                let m = backend.map_blocks(0, PAGE_SIZE as u64).unwrap();
+                assert!(
+                    m.m_plen > size,
+                    "plen must not clamp to i_size (size={size})"
+                );
+            }
+        }
+    }
+
+    /// S03-IF-2 (anchor S03 §10): the FLAT_INLINE tail in its normal
+    /// state — `blkoff(m_pa) + m_plen ≤ bs` — pointwise over the tail
+    /// region: flags MAPPED|META, pa = inline_data_start +
+    /// blkoff(la), plen = llen = size − la (the i_size clamp).
+    #[ktest]
+    fn map_blocks_flat_inline_tail() {
+        const BS: u64 = 4096;
+        // 3 flat blocks + a 100-byte tail; the inline area starts
+        // 2000 bytes into its metadata block.
+        let geom = ktest_data_geometry(3 * BS + 100, 12, 16, true, BS + 2000, None, false);
+        let backend = ktest_null_backend(geom);
+        for la in [3 * BS, 3 * BS + 1, 3 * BS + 37, 3 * BS + 99] {
+            let m = backend.map_blocks(la, PAGE_SIZE as u64).unwrap();
+            assert_eq!(m.m_flags, MapFlags::MAPPED | MapFlags::META, "la={la}");
+            assert_eq!(m.m_pa, (BS + 2000) + (la - 3 * BS), "pa formula, la={la}");
+            assert_eq!(
+                m.m_plen,
+                3 * BS + 100 - la,
+                "plen clamps to i_size, la={la}"
+            );
+            assert_eq!(m.m_llen, m.m_plen, "M8, la={la}");
+            assert_eq!(m.m_deviceid, 0, "la={la}");
+        }
+    }
+
+    /// S03-IF-3: the cross-block EUCLEAN defense — crafted
+    /// geometries whose inline tail would straddle a block boundary
+    /// are rejected before any fetch; the exact boundary
+    /// (`blkoff(m_pa) + m_plen == bs`) still maps.
+    #[ktest]
+    fn map_blocks_inline_cross_block_euclean() {
+        const BS: u64 = 4096;
+        // Tail spans [8192, 8292); inline area at blkoff 4000.
+        let geom = ktest_data_geometry(2 * BS + 100, 12, 16, true, BS + 4000, None, false);
+        let backend = ktest_null_backend(geom);
+        // la=8192: pa blkoff 4000 + plen 100 > 4096.
+        let err = backend.map_blocks(2 * BS, PAGE_SIZE as u64).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+        // la=8282 (blkoff 90): plen 10; 4000 + 90 + 10 > 4096.
+        let err = backend
+            .map_blocks(2 * BS + 90, PAGE_SIZE as u64)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+
+        // The exact boundary maps: inline area at blkoff 3996 —
+        // la=8192 gives 3996 + 100 == 4096.
+        let geom = ktest_data_geometry(2 * BS + 100, 12, 16, true, BS + 3996, None, false);
+        let backend = ktest_null_backend(geom);
+        let m = backend.map_blocks(2 * BS, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_flags, MapFlags::MAPPED | MapFlags::META);
+        assert_eq!(m.m_plen, 100);
+        // And the deepest legal query still fits: la=8288 (blkoff 96),
+        // plen 4 → 3996 + 96 + 4 == 4096.
+        let m = backend.map_blocks(2 * BS + 96, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_plen, 4);
+    }
+
+    /// S03-IF-4: post-EOF queries stay unmapped — flags empty,
+    /// `m_plen` consumes the dual-role input, la/llen echo, and
+    /// m_pa/m_deviceid take the deterministic zeros — over three
+    /// llen magnitudes.
+    #[ktest]
+    fn map_blocks_post_eof_unmapped() {
+        let geom = ktest_flat_geometry(4096, 16, false, 0);
+        let backend = ktest_null_backend(geom);
+        for la in [4096u64, 5000, 1 << 40] {
+            for llen in [1u64, 4096, 1 << 40] {
+                let m = backend.map_blocks(la, llen).unwrap();
+                assert_eq!(m.m_flags, MapFlags::empty(), "la={la} llen={llen}");
+                assert_eq!(m.m_la, la, "la echo, la={la} llen={llen}");
+                assert_eq!(m.m_llen, llen, "llen echo, la={la} llen={llen}");
+                assert_eq!(
+                    m.m_plen, llen,
+                    "plen consumes the input, la={la} llen={llen}"
+                );
+                assert_eq!(m.m_pa, 0, "la={la} llen={llen}");
+                assert_eq!(m.m_deviceid, 0, "la={la} llen={llen}");
+            }
+        }
+    }
+
+    /// S03-IF-7: the lastblk u32-truncation mirror (erofs_blk_t =
+    /// u32; the S03-D5 family of T-013 S05-D4). Live pins:
+    /// (a) FLAT_INLINE size = 2^44 + 100, la = 100 — the truncated
+    ///     lastblk_pos collapses to 0, so the query falls into the
+    ///     inline-tail else branch and the giant m_plen (2^44)
+    ///     trips the cross-block guard: EUCLEAN, exactly the linux
+    ///     production trace (a u64 general form would instead
+    ///     return MAPPED here — this is the distinguishing case);
+    /// (b) the design's second corner: la = size − 10 maps META with
+    ///     plen = 10 through the same truncated walk;
+    /// (c) the FLAT_PLAIN size = 2^44 corner: the arithmetic
+    ///     precondition (lastblk truncates to 0, so la = 0 selects
+    ///     the else branch). Driving it live would hit the B3
+    ///     `debug_assert!(tail_inline)` mirror first — the same
+    ///     trace as a CONFIG_EROFS_FS_DEBUG Linux (DBG_BUGON,
+    ///     internal.h:35-36); the production (release) route to
+    ///     EUCLEAN through the same guard is live-pinned by (a).
+    #[ktest]
+    fn map_blocks_lastblk_u32_truncation_mirror() {
+        const BS: u64 = 4096;
+        let size = (1u64 << 44) + 100;
+        let geom = ktest_data_geometry(size, 12, 16, true, BS, None, false);
+        let backend = ktest_null_backend(geom);
+        // (a) nblks = 2^32 + 1 → (u32) = 1 → lastblk = 1 − 1 = 0 →
+        // else branch with m_plen = 2^44 → EUCLEAN.
+        let err = backend.map_blocks(100, PAGE_SIZE as u64).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+        // (b) la = size − 10: blkoff(la) = 90, plen = 10 → META.
+        let m = backend.map_blocks(size - 10, PAGE_SIZE as u64).unwrap();
+        assert_eq!(m.m_flags, MapFlags::MAPPED | MapFlags::META);
+        assert_eq!(m.m_pa, BS + 90);
+        assert_eq!(m.m_plen, 10);
+        assert_eq!(m.m_llen, m.m_plen);
+        // (c) FLAT_PLAIN size = 2^44: nblks = 2^32 → (u32) = 0 →
+        // lastblk_pos = 0, so la = 0 would select the else branch
+        // (the branch-selection precondition, asserted arithmetically
+        // here since the debug-build B3 mirror fires first in that
+        // corner).
+        let nblks = (1u64 << 44).div_ceil(BS);
+        let lastblk = (nblks as u32).wrapping_sub(0);
+        assert_eq!(lastblk, 0);
+        assert!(!(0u64 < (lastblk as u64) << 12));
+    }
+
+    /// S03-IF-8: the compressed defense on the bypass form — a
+    /// geometry with the snapshot still true (past the I12 assembly
+    /// gate) is rejected EOPNOTSUPP, and the guard precedes the
+    /// post-EOF branch (a compressed query at la ≥ size still gets
+    /// EOPNOTSUPP — aster's own guard order).
+    #[ktest]
+    fn map_blocks_compressed_defense() {
+        let geom = ktest_data_geometry(4096, 12, 16, false, 0, None, true);
+        let backend = ktest_null_backend(geom);
+        let err = backend.map_blocks(0, PAGE_SIZE as u64).unwrap_err();
+        assert_eq!(err.error(), Errno::EOPNOTSUPP);
+        // Guard order: even a post-EOF la sees the compressed arm.
+        let err = backend.map_blocks(1 << 40, PAGE_SIZE as u64).unwrap_err();
+        assert_eq!(err.error(), Errno::EOPNOTSUPP);
+    }
+
+    /// S04-IF-1 (anchor `docs/T-014/S04/index.md` §9): the identity
+    /// arm — id 0 over both table forms (single-device and flatdev
+    /// extra=1) and the pa grid returns pa unchanged with zero
+    /// device I/O (the S04-IF-4 half: the log stays empty).
+    #[ktest]
+    fn map_dev_identity_arm() {
+        let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
+        let single = ktest_fs_on(
+            disk.clone(),
+            ktest_super_block(12, 0),
+            ktest_single_device_table(),
+        );
+        let flat = ktest_fs_on(
+            disk.clone(),
+            ktest_super_block(12, 0),
+            ktest_flatdev_table(&[(12, 12)], 1),
+        );
+        for fs in [&single, &flat] {
+            let backend = DataBackend::new(
+                fs.self_ref().clone(),
+                fs.block_device().clone(),
+                ktest_flat_geometry(4096, 0, false, 0),
+                1,
+            );
+            for pa in [0u64, 512, 1 << 40] {
+                assert_eq!(backend.map_dev(pa, 0).unwrap(), pa);
+            }
+        }
+        assert!(
+            disk.requests().is_empty(),
+            "map_dev must not touch the device"
+        );
+    }
+
+    /// S04-IF-2: the translation arm in its general form — the
+    /// slot's mapped_blkaddr over {0, 1, 2^32−1} × block_bits over
+    /// {9..12} (the sub-12 corners use a directly-constructed
+    /// backend: the constructor pins the 4k-only premise): always
+    /// `pa + (mapped << bits)` (internal.h:221, erofs_pos).
+    #[ktest]
+    fn map_dev_translation_general_form() {
+        let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
+        for bits in [9u32, 10, 11, 12] {
+            for mapped in [0u32, 1, u32::MAX] {
+                let fs = ktest_fs_on(
+                    disk.clone(),
+                    ktest_super_block(12, 0),
+                    ktest_flatdev_table(&[(10, mapped)], 1),
+                );
+                let backend = DataBackend {
+                    fs: fs.self_ref().clone(),
+                    device: fs.block_device().clone(),
+                    geom: ktest_data_geometry(4096, bits, 0, false, 0, None, false),
+                    npages: 1,
+                };
+                for pa in [0u64, 511, 4095, 1 << 40] {
+                    assert_eq!(
+                        backend.map_dev(pa, 1).unwrap(),
+                        pa + ((mapped as u64) << bits),
+                        "bits={bits} mapped={mapped} pa={pa}"
+                    );
+                }
+            }
+        }
+        assert!(disk.requests().is_empty());
+    }
+
+    /// S04-IF-3 + S04-IF-4: the MD10 example mirror over the
+    /// over-supply mask corner — extra=2, mask=3, two slots: id 0
+    /// identity, ids 1..2 translate, id 3 (masked-valid but past the
+    /// array, linux idr_find miss) is ENODEV; and the whole walk is
+    /// pure — the request log stays empty through every arm (no
+    /// channel I/O, no nr_sectors consultation).
+    #[ktest]
+    fn map_dev_enodev_over_supply_mask() {
+        let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
+        let fs = ktest_fs_on(
+            disk.clone(),
+            ktest_super_block(12, 0),
+            ktest_flatdev_table(&[(10, 100), (20, 200)], 3),
+        );
+        let backend = DataBackend::new(
+            fs.self_ref().clone(),
+            fs.block_device().clone(),
+            ktest_flat_geometry(4096, 0, false, 0),
+            1,
+        );
+        assert_eq!(backend.map_dev(4096, 0).unwrap(), 4096);
+        assert_eq!(backend.map_dev(4096, 1).unwrap(), 4096 + (100u64 << 12));
+        assert_eq!(backend.map_dev(4096, 2).unwrap(), 4096 + (200u64 << 12));
+        let err = backend.map_dev(4096, 3).unwrap_err();
+        assert_eq!(err.error(), Errno::ENODEV);
+        assert!(
+            disk.requests().is_empty(),
+            "map_dev must stay pure across all arms"
+        );
+    }
+
+    /// S04-IF-5: the upgrade guard — a dead Weak plus a nonzero id
+    /// fails EIO (the defensive family form; unreachable behind the
+    /// strong inode cache in production).
+    #[ktest]
+    fn map_dev_dead_weak_eio() {
+        let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
+        let fs = ktest_fs_on(
+            disk,
+            ktest_super_block(12, 0),
+            ktest_flatdev_table(&[(10, 100)], 1),
+        );
+        let backend = DataBackend::new(
+            fs.self_ref().clone(),
+            fs.block_device().clone(),
+            ktest_flat_geometry(4096, 0, false, 0),
+            1,
+        );
+        drop(fs);
+        let err = backend.map_dev(4096, 1).unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+    }
 
     /// S01-IF-1 (anchor `docs/T-014/S01/index.md` §9): the capacity
     /// relation — the mod.rs capacity formula (`align_up(PAGE_SIZE)`)

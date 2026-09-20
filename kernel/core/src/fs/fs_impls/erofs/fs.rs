@@ -623,6 +623,17 @@ impl Erofs {
         &self.self_ref
     }
 
+    /// Returns the assembled device table (immutable after `open`;
+    /// remount never rescans — O3 drops `device=` silently).
+    ///
+    /// Read-side accessor for the data-path map walk
+    /// (`inode/data.rs`): the flatdev translation and the slot
+    /// lookup of `map_dev`, plus the chunk device-id mask (S03-D8 —
+    /// the DeviceTable stays the single source of those values).
+    pub(super) fn device_table(&self) -> &DeviceTable {
+        &self.device_table
+    }
+
     /// Assembles a device-less handle for the pure-geometry ktest
     /// suites (T-024/S04): the null device below is never read — the
     /// fast/slow symlink criterion and the base-point family consume
@@ -1096,9 +1107,9 @@ impl DeviceTable {
         }
     }
 
-    // First consumer: the data path's chunk translation branch (the
+    // Live since T-025 S03: `DataBackend::map_dev` reads the flag as
+    // the construction-face invariant of the translation arm (the
     // flatdev discrimination of the map-dev walk, design G-O06).
-    #[expect(dead_code)]
     pub(super) fn flatdev(&self) -> bool {
         self.flatdev
     }
@@ -1114,8 +1125,9 @@ impl DeviceTable {
 
     /// Valid-bit mask for chunk device ids (super.c:242; data-path
     /// consumption, G-O06 → T-014).
-    // First consumer: the data-path device-id resolution (design
-    // G-O06 → T-014).
+    // First consumer: the chunk-8B device-id masking of the map walk
+    // (T-025 S04 — the flat half landed in S03 consumes only
+    // flatdev/slot).
     #[expect(dead_code)]
     pub(super) fn device_id_mask(&self) -> u32 {
         self.device_id_mask
@@ -1128,9 +1140,8 @@ impl DeviceTable {
     // Contract (design §3.3): `id == 0` (the primary device) is not
     // served by this table — the caller checks for zero first and
     // reads `Erofs.block_device` directly.
-    // First consumer: the data-path chunk translation (design G-O06 →
-    // T-014).
-    #[expect(dead_code)]
+    // Live since T-025 S03: `DataBackend::map_dev` consumes the slot
+    // pair on every nonzero-id walk (the ENODEV arm on a miss).
     pub(super) fn slot(&self, id: u32) -> Option<(u32, u32)> {
         self.slots
             .get(id as usize - 1)
