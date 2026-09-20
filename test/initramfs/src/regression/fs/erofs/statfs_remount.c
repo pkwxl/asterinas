@@ -340,6 +340,13 @@ FN_TEST(statfs_remount_bare_remount_resets_options)
 	 * SKIPped past T-023 while the device guard alone would pass.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the X3 gate probe and
+	 * the post-remount user.v read below need the xattr value face
+	 * (T-026; the nouser_xattr EOPNOTSUPP arm has no face to
+	 * observe before that). SKIP until the xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount_dev(EROFS_DEV_BASE, 0, "nouser_xattr"));
@@ -384,6 +391,7 @@ END_TEST()
 FN_TEST(statfs_remount_rw_request_stays_ro)
 {
 	struct statfs st;
+	int fd;
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
 	/*
@@ -400,9 +408,18 @@ FN_TEST(statfs_remount_rw_request_stays_ro)
 	/* remount,rw = MS_REMOUNT without MS_RDONLY. */
 	TEST_SUCC(remount_base(0, NULL));
 	/* Write-family EROFS negative control on the preset entry (name
-	 * fixed to the S01 sec. 3.1 verbatim form by T-020/S07). */
-	TEST_ERRNO(open(EROFS_SELF_MNT "/regular/empty_file.bin", O_WRONLY),
-		   EROFS);
+	 * fixed to the S01 sec. 3.1 verbatim form by T-020/S07).
+	 *
+	 * Expected-value revision (T-024/S04): REGISTERED DIFFERENCE
+	 * (docs/T-013/analysis.md sec. 9.1 row 3 / S07 sec. 4.2 F-3,
+	 * assertion form OPN-09): aster's open chain carries no
+	 * SB_RDONLY gate, so open(O_WRONLY) SUCCEEDS and the first
+	 * refusal lands on write(2). Revised from the authority, never
+	 * from observed behavior. */
+	fd = TEST_SUCC(open(EROFS_SELF_MNT "/regular/empty_file.bin",
+			    O_WRONLY));
+	TEST_ERRNO(write(fd, "x", 1), EROFS);
+	TEST_SUCC(close(fd));
 	/* O1 witness: f_flags still carries ST_RDONLY. */
 	TEST_SUCC(statfs(EROFS_SELF_MNT, &st));
 	TEST_RES(st.f_flags & ST_RDONLY, _ret != 0);

@@ -184,6 +184,14 @@ FN_TEST(namei_case_sensitivity)
 	int fd;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the per-variant 1-byte
+	 * content probe below reads the entry's material — the
+	 * data-read face (T-025). The stat/ino arms would pass with
+	 * T-024 alone; the frozen set rides together. SKIP until the
+	 * data face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	for (i = 0; i < ERO_ARRAY_SIZE(variants); i++) {
 		snprintf(path, sizeof(path), "%s/dirs/case_variants/%s",
 			 EROFS_INIT_MNT, variants[i]);

@@ -100,13 +100,31 @@
  * write opens, fs/namei.c:3613-3627 for the O_CREAT path, and
  * do_tmpfile fs/namei.c:3954 mnt_want_write); erofs must answer
  * EROFS for all five forms.
+ *
+ * Expected-value revision (T-024/S04) on the two PLAIN write opens:
+ * REGISTERED DIFFERENCE (docs/T-013/analysis.md sec. 9.1 row 3 /
+ * S07 sec. 4.2 F-3): aster's open chain carries no SB_RDONLY gate,
+ * so open(O_WRONLY/O_RDWR) on an erofs regular file SUCCEEDS and
+ * the first refusal lands on write(2) -- the OPN-09 judgement form
+ * ("open-time success is a mere prerequisite; assert write(2) ->
+ * EROFS"). Revised from the authority, never from observed
+ * behavior. The negative-control essence (no writable channel
+ * exists) is carried by the write refusals; the creat forms below
+ * still refuse AT open (their O_TRUNC/O_CREAT legs route through
+ * resize/create, which the FS members gate with EROFS).
  */
 FN_TEST(write_ero_fs_open_for_write)
 {
+	int fd;
+
 	EROFS_SKIP_IF_NO_INIT_MNT();
 
-	TEST_ERRNO(open(WEF_FILE_4K, O_WRONLY), EROFS);
-	TEST_ERRNO(open(WEF_FILE_INLINE, O_RDWR), EROFS);
+	fd = TEST_SUCC(open(WEF_FILE_4K, O_WRONLY));
+	TEST_ERRNO(write(fd, "x", 1), EROFS);
+	TEST_SUCC(close(fd));
+	fd = TEST_SUCC(open(WEF_FILE_INLINE, O_RDWR));
+	TEST_ERRNO(write(fd, "x", 1), EROFS);
+	TEST_SUCC(close(fd));
 	TEST_ERRNO(creat(WEF_FILE_1B, 0644), EROFS);
 	TEST_ERRNO(creat(WEF_NEW_CREAT, 0644), EROFS);
 	/*
@@ -181,6 +199,14 @@ END_TEST()
  * keep for the degenerate forms (aster chown.rs:19-21 for the
  * both-(-1) chown, utimens.rs:40-42 for the both-UTIME_OMIT
  * utimensat).
+ *
+ * Expected-value revision (T-024/S04) on the utimensat arm:
+ * REGISTERED DIFFERENCE (docs/T-013/analysis.md sec. 9.1 row 2 /
+ * S07 sec. 4.1, assertion form OPN-11): the set_atime/set_mtime/
+ * set_ctime trait signatures carry no Result, so utimensat on this
+ * read-only filesystem SUCCEEDS silently and the three times stay
+ * identical -- vs the Linux -EROFS baseline. Revised from the
+ * authority, never from observed behavior.
  */
 FN_TEST(write_ero_fs_attr_change_family)
 {
@@ -188,6 +214,7 @@ FN_TEST(write_ero_fs_attr_change_family)
 		{ .tv_sec = 1600000000, .tv_nsec = 0 },
 		{ .tv_sec = 1600000001, .tv_nsec = 0 },
 	};
+	struct stat before, after;
 	int fd;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
@@ -197,7 +224,19 @@ FN_TEST(write_ero_fs_attr_change_family)
 	TEST_ERRNO(fchown(fd, 1000, 1000), EROFS);
 	TEST_SUCC(close(fd));
 
-	TEST_ERRNO(utimensat(AT_FDCWD, WEF_ANCHOR, times, 0), EROFS);
+	/* OPN-11: silent success + the three-time identity. */
+	TEST_SUCC(stat(WEF_ANCHOR, &before));
+	TEST_RES(utimensat(AT_FDCWD, WEF_ANCHOR, times, 0), _ret == 0);
+	TEST_SUCC(stat(WEF_ANCHOR, &after));
+	TEST_RES(before.st_atim.tv_sec == after.st_atim.tv_sec &&
+			 before.st_atim.tv_nsec == after.st_atim.tv_nsec,
+		 _ret);
+	TEST_RES(before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+			 before.st_mtim.tv_nsec == after.st_mtim.tv_nsec,
+		 _ret);
+	TEST_RES(before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+			 before.st_ctim.tv_nsec == after.st_ctim.tv_nsec,
+		 _ret);
 }
 END_TEST()
 

@@ -628,6 +628,33 @@ impl Erofs {
         &self.self_ref
     }
 
+    /// Assembles a device-less handle for the pure-geometry ktest
+    /// suites (T-024/S04): the null device below is never read — the
+    /// fast/slow symlink criterion and the base-point family consume
+    /// only the superblock geometry and descriptor fields. The mount
+    /// options, flags, and cache all take their defaults; the
+    /// self-reference is wired through `new_cyclic` exactly like
+    /// `open` does, so handle-derived paths behave identically.
+    ///
+    /// Lives here (not in `test_utils`) because the private fields of
+    /// `Erofs`/`DeviceTable` are only visible inside this module.
+    /// The real image-builder fixture (staged disk bytes + `open`)
+    /// lands with T-027; until then no ktest may assume readable
+    /// device content.
+    #[cfg(ktest)]
+    pub(super) fn ktest_new(super_block: SuperBlock) -> Arc<Self> {
+        Arc::new_cyclic(|weak_self| Self {
+            block_device: Arc::new(super::test_utils::ErofsNullDevice),
+            super_block,
+            device_table: DeviceTable::single_device(0),
+            mount_options: RwMutex::new(ErofsMountOptions::default()),
+            flags: AtomicFsFlags::new(FsFlags::RDONLY),
+            fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            inode_cache: RwMutex::new(BTreeMap::new()),
+            self_ref: weak_self.clone(),
+        })
+    }
+
     /// Looks up an inode by nid through the FS-level inode cache,
     /// constructing it on a miss — the iget parity (`erofs_iget`),
     /// with the cache contract of the inode-domain design

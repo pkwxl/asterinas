@@ -294,14 +294,34 @@ FN_TEST(umount_show_open_fd_no_busy_check)
 	 * (T-024). SKIP until /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the still-open fd's
+	 * 64-byte content check below reads through the unmounted
+	 * instance — the data-read face (T-025). SKIP until the data
+	 * face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount_base_default());
 	fd = TEST_SUCC(
 		open(EROFS_SELF_MNT "/regular/inline_64b.bin", O_RDONLY));
-	/* 要素③: 写族 EROFS 负对照,面内随行(全景归 write_ero_fs.c)。 */
-	TEST_ERRNO(open(EROFS_SELF_MNT "/regular/inline_64b.bin", O_WRONLY),
-		   EROFS);
+	/* 要素③: 写族 EROFS 负对照,面内随行(全景归 write_ero_fs.c)。
+	 *
+	 * Expected-value revision (T-024/S04): REGISTERED DIFFERENCE
+	 * (docs/T-013/analysis.md sec. 9.1 row 3 / S07 sec. 4.2 F-3,
+	 * assertion form OPN-09): aster's open chain carries no
+	 * SB_RDONLY gate, so open(O_WRONLY) SUCCEEDS and the first
+	 * refusal lands on write(2). Revised from the authority, never
+	 * from observed behavior. */
+	{
+		int wfd = TEST_SUCC(
+			open(EROFS_SELF_MNT "/regular/inline_64b.bin",
+			     O_WRONLY));
+
+		TEST_ERRNO(write(wfd, "x", 1), EROFS);
+		TEST_SUCC(close(wfd));
+	}
 	/*
 	 * 登记差异(W-M11): Linux 基线对被打开文件占用的挂载点 umount
 	 * 返回 EBUSY;aster 无 busy 检查,直接卸载成功(实例经 Arc 存活

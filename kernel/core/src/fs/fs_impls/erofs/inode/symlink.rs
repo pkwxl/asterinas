@@ -158,3 +158,201 @@ impl Inode {
             .map_err(|_| Error::with_message(Errno::EIO, "symlink target is not valid UTF-8"))
     }
 }
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+
+    use super::*;
+    use crate::fs::fs_impls::erofs::{
+        Erofs,
+        inode::{DataLayout, InodeVersion},
+        test_utils::{ktest_lnk_desc, ktest_super_block},
+    };
+
+    /// Three-element criterion vectors (SYM-06/SYM-07, `docs/T-013/
+    /// S04/index.md` §9). The expectation single source is the
+    /// three-case table of S04 §1.3 — middle slot, cross-block slot
+    /// nid≡127 (extended), boundary-exact slot nid≡126 (extended) —
+    /// 4k-specialized with meta_blkaddr = 0, so inode_end(nid) =
+    /// nid·32 + inode_isize. Element-② `checked_add` overflow (None →
+    /// slow) is deliberately NOT probed: it is unreachable at this
+    /// layer for every constructible descriptor (inline_start is
+    /// device-bounded, size ≤ i64::MAX — the S04 §1.4 accounting);
+    /// a u64-boundary xattr_isize would only exercise the wrap-free
+    /// premise, not the criterion.
+    #[ktest]
+    fn is_fast_symlink_three_case_vectors() {
+        // (nid, version, datalayout, xattr_isize, size, expected)
+        const CASES: &[(u64, InodeVersion, DataLayout, usize, u64, bool)] = &[
+            // --- Middle slot: nid = 64 compact → inode_end = 2080,
+            //     boundary anchor = round_up(2080) = 4096. ---
+            // fast ⟺ 2080 + xattr + size ≤ 4096.
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::FlatInline,
+                0,
+                2016,
+                true,
+            ), // exact boundary
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::FlatInline,
+                0,
+                2017,
+                false,
+            ), // one past
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::FlatInline,
+                32,
+                1984,
+                true,
+            ), // xattr + data fills to the boundary
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::FlatInline,
+                32,
+                1985,
+                false,
+            ),
+            // SYM-06 giant-xattr corner (§1.2 tail example):
+            // inline_start = 2080 + 262148 ≫ 4096 → slow.
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::FlatInline,
+                262_148,
+                0,
+                false,
+            ),
+            // Element ① — every other datalayout is slow, including
+            // the compressed pair the I12 gate would have rejected
+            // earlier in the real assembly (pure function here).
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::FlatPlain,
+                0,
+                1,
+                false,
+            ),
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::ChunkBased,
+                0,
+                1,
+                false,
+            ),
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::CompressedFull,
+                0,
+                1,
+                false,
+            ),
+            (
+                64,
+                InodeVersion::Compact,
+                DataLayout::CompressedCompact,
+                0,
+                1,
+                false,
+            ),
+            // --- Cross-block slot (SYM-07): nid = 127 extended →
+            //     inode_end = 4064 + 64 = 4128 (next block + 32),
+            //     boundary anchor = 8192 (the NEXT block's end). ---
+            (
+                127,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                0,
+                4064,
+                true,
+            ), // ends exactly at 8192
+            (
+                127,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                0,
+                4065,
+                false,
+            ),
+            (
+                127,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                32,
+                4032,
+                true,
+            ),
+            (
+                127,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                32,
+                4033,
+                false,
+            ),
+            // --- Boundary-exact slot (SYM-07): nid = 126 extended →
+            //     inode_end = 4032 + 64 = 4096 (exactly the block
+            //     boundary), anchor = 4096 — the `≤` allows data to
+            //     end exactly at the boundary, so fast ⟺ xattr = 0
+            //     ∧ size = 0 (the empty-symlink-zero-xattr face, the
+            //     ONLY fast possibility at this slot). ---
+            (
+                126,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                0,
+                0,
+                true,
+            ),
+            (
+                126,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                0,
+                1,
+                false,
+            ),
+            (
+                126,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                1,
+                0,
+                false,
+            ),
+            (
+                126,
+                InodeVersion::Extended,
+                DataLayout::FlatInline,
+                1,
+                1,
+                false,
+            ),
+        ];
+
+        // blkszbits = 12 (bs = 4096, the G-M08 pin), meta_blkaddr = 0.
+        let fs = Erofs::ktest_new(ktest_super_block(12, 0));
+        for &(nid, version, datalayout, xattr_isize, size, expected) in CASES {
+            let desc = ktest_lnk_desc(version, datalayout, xattr_isize, size);
+            assert_eq!(
+                is_fast_symlink(&fs, nid, &desc),
+                expected,
+                "nid = {}, dl = {:?}, xattr = {}, size = {}",
+                nid,
+                datalayout,
+                xattr_isize,
+                size,
+            );
+        }
+    }
+}

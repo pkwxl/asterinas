@@ -35,6 +35,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -203,6 +204,78 @@ static inline int ero_init_mnt_mounted(void)
 #define EROFS_SYSFS_FEATURES "/sys/fs/erofs/features"
 #define EROFS_SKIP_IF_NO_SYSFS() \
 	SKIP_TEST_IF(access(EROFS_SYSFS_FEATURES, F_OK) < 0)
+
+/*
+ * Capability-probe branches (T-024/S04 activation-boundary refinement,
+ * docs/T-024/subtasks.md decision 3: "assertion-face requirement ↛
+ * activation boundary"). Once the T-024 namei/dispatch rewrite lands,
+ * the INIT_MNT guard above is satisfied and the frozen cases whose
+ * assertions need MORE than lookup/stat/getdents/readlink/open would
+ * turn red-not-SKIP. Each helper below probes exactly the capability
+ * its cases assert, so they stay SKIPped until that domain lands
+ * (data read face → T-025; xattr value face and the ACL channel →
+ * T-026) and activate with it. Expected values are never touched.
+ *
+ * AUTO-DECISION: the probes are file+syscall-shaped (open+read /
+ * getxattr on fixed preset hosts under the init mount), reusing the
+ * existing guard-family style rather than inventing a new mechanism —
+ * a failed probe is always a SKIP, never a FAIL.
+ */
+
+/* Data face: one byte of regular/content_anchor.txt reads back. */
+#define EROFS_DATA_PROBE_PATH EROFS_INIT_MNT "/regular/content_anchor.txt"
+
+static inline int ero_data_face_ready(void)
+{
+	char byte;
+	ssize_t n;
+	int fd;
+
+	fd = open(EROFS_DATA_PROBE_PATH, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	n = read(fd, &byte, 1);
+	close(fd);
+	return n == 1;
+}
+
+#define EROFS_SKIP_IF_NO_DATA_FACE() SKIP_TEST_IF(!ero_data_face_ready())
+
+/*
+ * Xattr face: the user.v entry of the preset host reads back (>= 0).
+ * Before T-026 the framework get_xattr default answers EOPNOTSUPP
+ * (probe fails); after it, hits return >= 0 and misses ENODATA — both
+ * prove the query reached a real xattr layer.
+ */
+#define EROFS_XATTR_PROBE_PATH \
+	EROFS_INIT_MNT "/xattr_host/xattr_user_short.bin"
+
+static inline int ero_xattr_face_ready(void)
+{
+	char buf[4];
+
+	return getxattr(EROFS_XATTR_PROBE_PATH, "user.v", buf, sizeof(buf)) >= 0;
+}
+
+#define EROFS_SKIP_IF_NO_XATTR_FACE() SKIP_TEST_IF(!ero_xattr_face_ready())
+
+/*
+ * ACL face: the system.posix_acl_access channel of the preset ACL
+ * host answers (>= 0). The precise name rides the same getxattr
+ * syscall, but the probe pins the ACL channel itself — the acl.c
+ * cases assert ACL-name semantics, not plain user.* values.
+ */
+#define EROFS_ACL_PROBE_PATH EROFS_INIT_MNT "/xattr_host/acl_file.bin"
+
+static inline int ero_acl_face_ready(void)
+{
+	char buf[64];
+
+	return getxattr(EROFS_ACL_PROBE_PATH, "system.posix_acl_access", buf,
+			sizeof(buf)) >= 0;
+}
+
+#define EROFS_SKIP_IF_NO_ACL_FACE() SKIP_TEST_IF(!ero_acl_face_ready())
 
 /*
  * Content formulas (S01 §3.0, the single source). Expected contents are

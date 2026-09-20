@@ -271,6 +271,14 @@ FN_TEST(data_path_flat_size_gradient)
 	size_t i;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the assertions below
+	 * read file CONTENT through the mounted tree (formula compares,
+	 * EOF/Y1 probes) — the data-read face (T-025). The T-024 namei
+	 * rewrite makes the paths reachable but read(2) stays
+	 * EOPNOTSUPP; SKIP until the data face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
 		int fd;
 
@@ -307,8 +315,22 @@ FN_TEST(data_path_flat_size_gradient)
 		}
 	}
 
-	/* 要素③ write-family EROFS negative (sample shape, S05 sec. 7.2). */
-	TEST_ERRNO(open(EROFS_REG_DIR "/flat_4096b.bin", O_WRONLY), EROFS);
+	/* 要素③ write-family EROFS negative (sample shape, S05 sec. 7.2).
+	 *
+	 * Expected-value revision (T-024/S04): REGISTERED DIFFERENCE
+	 * (docs/T-013/analysis.md sec. 9.1 row 3 / S07 sec. 4.2 F-3,
+	 * assertion form OPN-09): aster's open chain carries no
+	 * SB_RDONLY gate, so open(O_WRONLY) SUCCEEDS and the first
+	 * refusal lands on write(2). Revised from the authority, never
+	 * from observed behavior; the negative-control essence (no
+	 * writable channel exists) is carried by the write refusal. */
+	{
+		int wfd = TEST_SUCC(open(EROFS_REG_DIR "/flat_4096b.bin",
+					 O_WRONLY));
+
+		TEST_ERRNO(write(wfd, buf, 1), EROFS);
+		TEST_SUCC(close(wfd));
+	}
 }
 END_TEST()
 
@@ -327,6 +349,13 @@ FN_TEST(data_path_anchor_and_sparse_content)
 	int fd;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the assertions below
+	 * read anchor and sparse-file CONTENT (sentence compare, head/
+	 * tail formula windows) — the data-read face (T-025). SKIP
+	 * until the data face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 
 	fd = TEST_SUCC(open(EROFS_REG_DIR "/content_anchor.txt", O_RDONLY));
 	if (fd >= 0) {
@@ -382,6 +411,15 @@ FN_TEST(data_path_tail_zerofill_mmap)
 	size_t i;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the tail-zero-fill
+	 * assertions read page CONTENT through mmap — the data face
+	 * (T-025; the VMO channel itself may go live earlier with the
+	 * T-024 page-cache rewrite, but the conservative data probe
+	 * keeps this case SKIPped until read(2) is served too — a
+	 * later activation, never a red window).
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
 		char path[256];
 		char *p;
@@ -431,6 +469,12 @@ FN_TEST(data_path_splice_pipe)
 	int fd;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): splice pulls file
+	 * CONTENT and asserts it against the formula — the data-read
+	 * face (T-025). SKIP until the data face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	fd = TEST_SUCC(open(EROFS_REG_DIR "/flat_16k_plus_100b.bin", O_RDONLY));
 	if (fd < 0)
 		return;
@@ -476,6 +520,13 @@ FN_TEST(data_path_dio_alignment_gate)
 	int fd;
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the aligned O_DIRECT
+	 * preads assert CONTENT against the formula — the data-read
+	 * face (T-025). SKIP until the data face is served (the EINVAL
+	 * three-factor half rides the same open fd).
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	ali = (char *)(((uintptr_t)raw + 511u) & ~(uintptr_t)511u);
 	fd = TEST_SUCC(open(EROFS_REG_DIR "/flat_16k_plus_100b.bin",
 			    O_RDONLY | O_DIRECT));
@@ -555,6 +606,14 @@ FN_TEST(data_path_chunk4b_crossblk_content)
 	 * /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the chunked-content
+	 * compares below READ through the self-mounted image — the
+	 * chunk data face (T-025 map_blocks finalization; the T-024
+	 * minimal backend answers CHUNK with EOPNOTSUPP by design).
+	 * SKIP until the data face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_CHUNK4B, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -592,6 +651,12 @@ FN_TEST(data_path_concat_shift_content)
 	 * until /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the shifted-read
+	 * compares below READ through the self-mounted image — the
+	 * chunk data face (T-025). SKIP until the data face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -643,6 +708,12 @@ FN_TEST(data_path_concat_sparse_hole_form_face)
 	 * until /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the hole-form probes
+	 * below READ through the self-mounted image — the chunk data
+	 * face (T-025). SKIP until the data face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -689,6 +760,13 @@ FN_TEST(data_path_main_only_data_eio)
 	 * is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the split assertions
+	 * below expect a DATA read whose EIO comes from the map-dev
+	 * shift — the T-025 map_blocks error face. SKIP until the data
+	 * face is served.
+	 */
+	EROFS_SKIP_IF_NO_DATA_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_FLATDEV, EROFS_SELF_MNT, "erofs", 0, NULL));

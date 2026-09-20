@@ -601,3 +601,148 @@ fn file_type_to_dtype(file_type: u8) -> InodeType {
         _ => InodeType::Unknown,     // 0 & >= 8     → DT_UNKNOWN
     }
 }
+
+#[cfg(ktest)]
+mod tests {
+    use core::{cmp::Ordering, mem::size_of};
+
+    use ostd::prelude::*;
+
+    use super::*;
+    use crate::fs::file::InodeType;
+
+    /// Pointwise comparison-semantics table (LKP-11, `docs/T-013/S05/
+    /// index.md` §9): NUL truncation, inverted/empty regions, query
+    /// exhaustion, unsigned byte order, case sensitivity, and the
+    /// prefix-carry in/out index.
+    #[ktest]
+    fn dirnamecmp_pointwise_vectors() {
+        let cmp = |qn: &[u8], qd: &[u8], matched: usize| {
+            let mut m = matched;
+            let ord = dirnamecmp(qn, qd, &mut m);
+            (ord, m)
+        };
+
+        // Exact hit: both sides exhausted at the same position.
+        assert_eq!(cmp(b"ab", b"ab", 0), (Ordering::Equal, 2));
+        // On-disk NUL truncates: "ab\0c" compares as "ab".
+        assert_eq!(cmp(b"ab", b"ab\0c", 0), (Ordering::Equal, 2));
+        // ... against the longer query: qn[2] = 'c' > '\0' → Greater.
+        assert_eq!(cmp(b"abc", b"ab\0c", 0), (Ordering::Greater, 2));
+        // Query past-the-end reads as '\0' (the C NUL-terminated
+        // buffer, namei.c:33-35).
+        assert_eq!(cmp(b"a", b"ab", 0), (Ordering::Less, 1));
+        // Empty region: compares as an empty name (the namei.c:22-27
+        // drift — no error).
+        assert_eq!(cmp(b"", b"", 0), (Ordering::Equal, 0));
+        assert_eq!(cmp(b"a", b"", 0), (Ordering::Greater, 0));
+        // Case-sensitive, unsigned byte order: 'A' (0x41) < 'a' (0x61).
+        assert_eq!(cmp(b"A", b"a", 0), (Ordering::Less, 0));
+        // High-bit bytes compare UNSIGNED: 0xFF > 0x80.
+        assert_eq!(cmp(b"\xff", b"\x80", 0), (Ordering::Greater, 0));
+        // The carry skips the matched prefix (entry point i = matched).
+        assert_eq!(cmp(b"ab", b"abz", 1), (Ordering::Less, 2));
+
+        // --- The three-probe counterexample of S05 §2.2 (q = "ab") ---
+        // probe 1, block head "aa", matched = min(0, 0) = 0:
+        //   i=1: 'b' > 'a' → Greater, carry 1 (startprfx = 1).
+        assert_eq!(cmp(b"ab", b"aa", 0), (Ordering::Greater, 1));
+        // probe 2, block head "abz", matched = min(1, 0) = 1:
+        //   i=1: 'b' = 'b'; i=2: '\0' < 'z' → Less, carry 2
+        //   (endprfx = 2).
+        assert_eq!(cmp(b"ab", b"abz", 1), (Ordering::Less, 2));
+        // probe 3, block head "bb", matched = min(1, 2) = 1 — the
+        // index-0 mismatch ('b' vs 'a') is NEVER compared: the loop
+        // validates [1, 2) only and runs off the region end → Equal,
+        // the prefix-carry FALSE HIT (a naive from-zero comparison
+        // would answer Less and end the walk in ENOENT — the S05-R1
+        // parity point on out-of-order images).
+        assert_eq!(cmp(b"ab", b"bb", 1), (Ordering::Equal, 2));
+    }
+
+    /// The two-strictness-domains pin (LKP-04 + LKR-03/06 shape, hard
+    /// constraint 2 / analysis.md §4.4 means 3): ONE raw nameoff
+    /// input, TWO pinned behaviors. The lookup-domain columns are
+    /// EXECUTED against `lookup_nameoff` (the mask fold, and the N8
+    /// door it feeds: ndirents = fold/12, zero → "corrupted dir
+    /// block"); the iteration-domain column pins the R5 expectation
+    /// table (RAW le16, NO mask: nameoff0 ∈ {0, ≥ bs, non-multiple-
+    /// of-12} → EUCLEAN). Executing the R5 column needs a malformed-
+    /// dirent fixture (T-027, IMG-CRAFT-DIRENT / LKR-06); the
+    /// predicate transcription inside only keeps the TABLE
+    /// self-consistent — the visible-divergence row (lookup ACCEPTS
+    /// while iteration REJECTS the same bytes) is asserted now, as
+    /// the mechanical carrier of the two-domains contract.
+    #[ktest]
+    fn lookup_nameoff_fold_and_two_domain_pin() {
+        let bs = 4096usize;
+        // (raw le16, lookup fold, lookup accepts (N8 off), iteration R5 rejects)
+        const TWO_DOMAINS: &[(u16, usize, bool, bool)] = &[
+            (12, 12, true, false),       // healthy in both domains (ndirents 1)
+            (24, 24, true, false),       // healthy both (ndirents 2)
+            (4096 + 24, 24, true, true), // VISIBLE DIVERGENCE: high
+            // bits fold to 24 — lookup takes ndirents = 2 and reads
+            // on; the RAW value ≥ bs → iteration EUCLEAN.
+            (8192 + 12, 12, true, true), // same shape, one block up
+            (13, 13, true, true),        // LKP-06: non-multiple of 12 —
+            // lookup takes it (ndirents = 1) while iteration rejects
+            (25, 25, true, true),       // non-multiple below bs, same split
+            (4096 + 8, 8, false, true), // LKP-04 verbatim fold: 8 →
+            // ndirents = 0 → lookup N8 EUCLEAN (SAME errno as the
+            // iteration side's ≥ bs — different mechanism row, the
+            // matrix §3.4 same-errno-different-row family)
+            (0, 0, false, true),    // lookup: fold 0 → N8; iteration: == 0
+            (4096, 0, false, true), // folds to 0 (N8); raw == bs → R5
+        ];
+
+        let mut visible_divergence = 0;
+        for &(raw, fold, lookup_accepts, iter_rejects) in TWO_DOMAINS {
+            let folded = lookup_nameoff(raw, bs);
+            assert_eq!(folded, fold, "fold of raw = {}", raw);
+            // The lookup-domain acceptance derives from the fold
+            // alone (N8 fires iff ndirents == 0) — executed behavior.
+            assert_eq!(
+                folded / size_of::<RawDirent>() >= 1,
+                lookup_accepts,
+                "lookup acceptance of raw = {}",
+                raw
+            );
+            // Table self-consistency against the R5 predicate
+            // transcription (implementation-side execution = T-027).
+            let r5 = raw as usize == 0
+                || raw as usize >= bs
+                || raw as usize % size_of::<RawDirent>() != 0;
+            assert_eq!(r5, iter_rejects, "R5 expectation of raw = {}", raw);
+            if lookup_accepts && iter_rejects {
+                visible_divergence += 1;
+            }
+        }
+        // The two-domains contract is ALIVE: at least one same-input
+        // row where the two walks disagree visibly (silent fold vs
+        // EUCLEAN) — r1-baseline-matrix §3.4.
+        assert!(visible_divergence >= 1);
+    }
+
+    /// Full-domain d_type table (LKR-03): 0 → Unknown, 1..=7 → the
+    /// seven one-to-one mappings, ≥ 8 → Unknown (silent degradation,
+    /// R8 — no cross-check against the inode, no error).
+    #[ktest]
+    fn file_type_to_dtype_full_domain() {
+        assert_eq!(file_type_to_dtype(0), InodeType::Unknown);
+        let seven: [(u8, InodeType); 7] = [
+            (1, InodeType::File),
+            (2, InodeType::Dir),
+            (3, InodeType::CharDevice),
+            (4, InodeType::BlockDevice),
+            (5, InodeType::NamedPipe),
+            (6, InodeType::Socket),
+            (7, InodeType::SymLink),
+        ];
+        for &(ft, want) in &seven {
+            assert_eq!(file_type_to_dtype(ft), want, "ft = {}", ft);
+        }
+        for ft in 8u8..=255 {
+            assert_eq!(file_type_to_dtype(ft), InodeType::Unknown, "ft = {}", ft);
+        }
+    }
+}

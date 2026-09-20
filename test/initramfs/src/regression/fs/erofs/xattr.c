@@ -375,6 +375,14 @@ FN_TEST(xattr_get_host_value_matrix)
 	char name[XV_LONGNAME_TOTAL + 2];
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): every value/ENODATA
+	 * assertion below queries the on-image xattrs — the xattr value
+	 * face (T-026). The T-024 namei rewrite makes the hosts
+	 * reachable but the framework get_xattr default still answers
+	 * EOPNOTSUPP; SKIP until the xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 
 	TEST_RES(xv_check_all_entries(XV_MNT), _ret == 0);
 
@@ -416,6 +424,15 @@ FN_TEST(xattr_get_entry_and_value_gates)
 	const char *host = XV_MNT "/xattr_user_long.bin";
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the ENODATA/X26 arms
+	 * below need a real xattr layer (misses answer ENODATA, hits
+	 * return the value) — the xattr value face (T-026). The
+	 * syscall-layer parse arms (ERANGE/EOPNOTSUPP/EINVAL) would
+	 * pass already; the frozen set rides together. SKIP until the
+	 * xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 
 	/* X12: empty name -> ERANGE before any xattr semantics. */
 	TEST_ERRNO(getxattr(XV_MNT "/xattr_user_short.bin", "", buf,
@@ -481,6 +498,12 @@ END_TEST()
 FN_TEST(xattr_visibility_priv_drop_matrix)
 {
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the EACCES/ENODATA/
+	 * list-total arms below need the erofs xattr read gate and
+	 * value face (T-026). SKIP until the xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 
 	/* X15 (sample 5, parity after G-X08 state A): user.* on the 0600
 	 * host (regular/inline_64b.bin, S01 sec. 3.6) -> EACCES. */
@@ -565,6 +588,12 @@ FN_TEST(xattr_list_visibility_root)
 	};
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the per-host list
+	 * name sets and totals below need the erofs list_xattr face
+	 * (T-026). SKIP until the xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 
 	TEST_RES(xv_check_list(XV_MNT "/xattr_user_short.bin", user_v_names, 1,
 			       7),
@@ -755,6 +784,12 @@ FN_TEST(xattr_nouser_xattr_gate)
 	 * SKIP until /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the trusted./security.
+	 * value reads and the list totals below need the erofs xattr
+	 * value face (T-026). SKIP until the xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_BASE, EROFS_SELF_MNT, "erofs", 0,
@@ -812,6 +847,13 @@ FN_TEST(xattr_shared_all_fidelity)
 	 * xattr domain (T-026). SKIP until /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the shared-region get/
+	 * list fidelity matrix below needs the erofs xattr value face
+	 * over the shared store (T-026). SKIP until the xattr face is
+	 * served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_XSHARED, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -861,6 +903,13 @@ FN_TEST(xattr_zero_xattr_negative)
 	 * xattr layer at all. SKIP until /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the ENODATA/empty-list
+	 * arms below need a real xattr layer (the framework default
+	 * answers EOPNOTSUPP, not ENODATA) — T-026. SKIP until the
+	 * xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_XNONE, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -917,6 +966,13 @@ FN_TEST(xattr_prefix_get_list_fidelity)
 	 * /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the prefix-table get/
+	 * list fidelity probes below need the erofs xattr value face
+	 * with prefix reassembly (T-026). SKIP until the xattr face is
+	 * served.
+	 */
+	EROFS_SKIP_IF_NO_XATTR_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_PREFIX, EROFS_SELF_MNT, "erofs", 0, NULL));

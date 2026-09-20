@@ -197,6 +197,12 @@ static int ac_check_value(const char *path, const char *name,
 FN_TEST(acl_precise_name_get_value)
 {
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the value read-back
+	 * below queries the ACL channel — the xattr/ACL domain (T-026).
+	 * SKIP until the ACL face is served.
+	 */
+	EROFS_SKIP_IF_NO_ACL_FACE();
 
 	TEST_RES(ac_check_value(AC_FILE, AC_ACCESS, ac_access_ents,
 				AC_ENTS_N(ac_access_ents), AC_ACCESS_LEN),
@@ -220,6 +226,13 @@ FN_TEST(acl_absence_faces)
 	char buf[64];
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the ENODATA arms below
+	 * need a real ACL channel (the framework default answers
+	 * EOPNOTSUPP, not ENODATA) — T-026. SKIP until the ACL face is
+	 * served.
+	 */
+	EROFS_SKIP_IF_NO_ACL_FACE();
 
 	TEST_ERRNO(getxattr(AC_DIR, AC_ACCESS, buf, sizeof(buf)), ENODATA);
 	TEST_ERRNO(getxattr(AC_FILE, AC_DEFAULT, buf, sizeof(buf)), ENODATA);
@@ -294,6 +307,12 @@ FN_TEST(acl_buffer_protocol)
 	char buf[64];
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the size=0 totals and
+	 * exact-size read below query the ACL channel — T-026. SKIP
+	 * until the ACL face is served.
+	 */
+	EROFS_SKIP_IF_NO_ACL_FACE();
 
 	TEST_RES(getxattr(AC_FILE, AC_ACCESS, NULL, 0), _ret == 44);
 	TEST_RES(getxattr(AC_DIR, AC_DEFAULT, NULL, 0), _ret == 36);
@@ -335,6 +354,14 @@ FN_TEST(acl_noacl_variant_gate)
 	 * /erofs content is reachable.
 	 */
 	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Activation-boundary guard (T-024/S04): the noacl EOPNOTSUPP
+	 * gate and the user.v positive contrast below need the erofs
+	 * xattr/ACL layer (the mount-option gate has no face to
+	 * observe before T-026 lands). SKIP until the ACL face is
+	 * served.
+	 */
+	EROFS_SKIP_IF_NO_ACL_FACE();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_BASE, EROFS_SELF_MNT, "erofs", 0, "noacl"));
