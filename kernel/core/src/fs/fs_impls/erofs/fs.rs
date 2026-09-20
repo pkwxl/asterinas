@@ -392,7 +392,7 @@ impl Erofs {
         // EOVERFLOW; the F10 passthrough contract).
         let iloc = ((u64::from(self.super_block.meta_blkaddr)
             << u32::from(self.super_block.blkszbits))
-            .wrapping_add(nid << ISLOT_BITS)) as usize;
+        .wrapping_add(nid << ISLOT_BITS)) as usize;
         // Steps 2–5: the decode entry (I2 passthrough; I3/I4/I10
         // EOPNOTSUPP; I7/I8 EUCLEAN — `?` forwards them all).
         //
@@ -401,7 +401,7 @@ impl Erofs {
         // device stack where Linux fails the metabuf read with EIO —
         // the same registered-drift family as the V5 read; see the
         // G-M10 note at the checksum arm in read_superblock.)
-        let desc = read_inode_desc(&self.block_device, &self.super_block, iloc)?;
+        let desc = read_inode_desc(&*self.block_device, &self.super_block, iloc)?;
         // The transitional handle (T-023): nid + descriptor + weak
         // back-pointer; the payload face lands with T-024. Only the
         // successful construction above reaches the insert — every
