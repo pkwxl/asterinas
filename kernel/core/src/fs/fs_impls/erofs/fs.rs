@@ -1038,8 +1038,8 @@ mod tests {
         // the 1..=8 ladder against a zero half -> the le64 ladder
         // (the design §7 "interleaved vector" row's expectation)
         let mut uuid = [0u8; 16];
-        for i in 0..8 {
-            uuid[i] = i as u8 + 1;
+        for (i, slot) in uuid.iter_mut().enumerate().take(8) {
+            *slot = i as u8 + 1;
         }
         assert_eq!(fold_uuid_to_fsid(&uuid), 0x0807_0605_0403_0201);
         // the full 0..=15 ladder: staggered halves XOR to 0x08 per
