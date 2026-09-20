@@ -363,29 +363,29 @@ impl Inode {
         // ext2 precedent `ext2/inode/attrs.rs:54-57`).
         let (container_dev_id, optimal_block_size) = match self.fs() {
             Ok(fs) => (
-                fs.block_device().id(), // X1: the mount block device
+                fs.block_device().id(),        // X1: the mount block device
                 fs.super_block().block_size(), // X11: 1 << blkszbits (4096, G-M08)
             ),
             Err(_) => (DeviceId::null(), 0),
         };
         Metadata {
-            ino: self.nid, // X2: st_ino = nid, 64-bit identity
+            ino: self.nid,            // X2: st_ino = nid, 64-bit identity
             size: desc.size as usize, // X7: I7 caps at i64::MAX
-            optimal_block_size, // X11
+            optimal_block_size,       // X11
             // X10/G-Z02: the decode-time single source, used as-is.
             nr_sectors_allocated: desc.nr_sectors,
             // X8: three times, one source (D10) — zero arithmetic.
             last_access_at: desc.time,
             last_modify_at: desc.time,
             last_meta_change_at: desc.time,
-            type_: desc.kind.into(), // X3 half: the S_IFMT segment
-            mode: desc.mode, // X3 half: the 12 permission bits
+            type_: desc.kind.into(),            // X3 half: the S_IFMT segment
+            mode: desc.mode,                    // X3 half: the 12 permission bits
             nr_hard_links: desc.nlink as usize, // X4: raw value incl. 0
-            uid: Uid::new(desc.uid), // X5: zero-extended at decode
+            uid: Uid::new(desc.uid),            // X5: zero-extended at decode
             gid: Gid::new(desc.gid),
-            container_dev_id, // X1
+            container_dev_id,              // X1
             self_dev_id: self.device_id(), // X6: payload Option face
-            birth_at: None, // X9: no birth-time source
+            birth_at: None,                // X9: no birth-time source
         }
     }
 

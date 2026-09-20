@@ -21,8 +21,6 @@
 
 #![short_vis_path::add(erofs)]
 
-use ostd::mm::io::util::HasVmReaderWriter;
-
 use super::{super::prelude::*, FileKind, Inode};
 use crate::fs::file::StatusFlags;
 
