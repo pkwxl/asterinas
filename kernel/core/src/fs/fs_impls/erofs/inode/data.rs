@@ -2,50 +2,49 @@
 
 //! Block mapping and physical read primitives for erofs inodes.
 //!
-//! Current face: the minimal read-only flat page-cache backend
-//! (`DataBackend`) assembled into every DataBacked payload by
-//! `inode/mod.rs::new_data_backed` — the decision-1 scope of
-//! `docs/T-024/subtasks.md` S01. Since T-025 S01 the backend reads
-//! the FINAL geometry: the desc-derived plain-value bundle
-//! `DataGeometry` below (collapsed once by the pure function
-//! `inode/mod.rs::data_geometry`) replaced the transitional
-//! `FlatLayout`/`InlineTail` pair in place, per the §1.1 seam — the
-//! constructor parameter set never churned. The remaining T-025
-//! slices evolve this file in place: the map layer landed with S03
-//! (`map_blocks` flat branches M1/M2 + the three-arm `map_dev` walk)
-//! and grew its chunk branches with S04 (M4–M7) — neither consumed
-//! by the minimal backend yet — and the four-arm submit_read_bio
-//! rewrite — including the crafted-edge validation (e.g. the
-//! "inline data across blocks" EFSCORRUPTED arm of data.c:103-108) —
-//! lands with S05.
+//! This module is the data path of every `DataBacked` payload:
 //!
-//! Seam contract carried from T-024 into T-025 (§1.1):
-//! - the constructor parameter set is final (`Weak<Erofs>` +
-//!   `Arc<dyn BlockDevice>` + collapsed geometry + npages) so the
-//!   evolution stays in place;
-//! - the backend serves reads at ARBITRARY file offsets — page
-//!   granularity naturally satisfies that, and no block-alignment
-//!   assumption is built in here;
-//! - device errors travel unfolded: every arm returns the device
-//!   stack's errno as-is to the page-cache exit (the G-M10 family's
-//!   known-diff posture — no EIO folding in either direction);
-//! - the page-cache capacity stays `desc.size.align_up(PAGE_SIZE)`
-//!   (ext2 precedent `ext2/inode/mod.rs:614-627`), kept in sync by
-//!   the constructor caller.
+//! * the extent-mapping layer — `map_blocks` (the flat and chunked
+//!   walks mirroring linux `fs/erofs/data.c`, three-state `MapFlags`
+//!   output) and `map_dev` (the device-table resolution walk);
+//! * the page-cache bridge — `BlockAsPageCacheBackend for
+//!   DataBackend`: `submit_read_bio` is the single dispatch point
+//!   that turns one cached page into exactly one of four arms — a
+//!   whole mapped page takes one forwarded block BIO, a whole-page
+//!   hole answers a synchronous `BioStatus::Zeros`, and every
+//!   sub-page object (the last-page tail beyond `i_size` and the
+//!   inline payload) is filled through `fill_page_prefix`, the
+//!   single-sourced G-P02 zero-fill that keeps device residue out
+//!   of the bytes past `i_size` for buffered reads and mmap faults
+//!   alike.
 //!
 //! Public functions take decoded layout parameters, geometry, and
 //! the device handle — never `&Inode` and never `&InodeDesc` — so
-//! the L2/L3 dependency edge stays acyclic (the geometry collapse
-//! happens once in `inode/mod.rs`, L3: `data_geometry`).
+//! the L2/L3 dependency edge stays acyclic: the desc-derived
+//! geometry is collapsed once by `inode/mod.rs::data_geometry` (L3)
+//! into the plain-value `DataGeometry`, and the page-cache capacity
+//! (`desc.size.align_up(PAGE_SIZE)`) with the backend's `npages`
+//! (`size.div_ceil(PAGE_SIZE)`) express the same canonical relation
+//! at the construction site.
+//!
+//! Device errors travel unfolded: every arm returns the device
+//! stack's errno as-is to the page-cache exit (the G-M10 family's
+//! known-diff posture — no EIO folding in either direction).
 //!
 //! # Interrupt context
 //!
-//! Completion callbacks of the page-cache backend run in interrupt
-//! context: they must not take blocking locks (including
-//! `inode_cache`), must not allocate memory, and must not call into
-//! the VFS. The inline-tail fill below runs synchronously in the
-//! caller's (page-cache read path's) context instead — it touches
-//! none of the three prohibited surfaces.
+//! Completion callbacks of the page-cache backend (`complete_fn` handed to
+//! `BlockAsPageCacheBackend::submit_read_bio`) may run in interrupt
+//! context — the completion context depends on the driver distribution
+//! (virtio-blk completes from IRQ handlers), so the conservative upper
+//! bound is assumed: code on the completion path must not allocate memory,
+//! must not take blocking locks (including `inode_cache` or
+//! `mount_options`), must not hold a lock that a waiter on the page wait
+//! queue may already hold, and must not call into the VFS. Submission-path
+//! code (task context) may block on device I/O and may perform the
+//! metadata reads needed to fill a page (the INLINE form does its
+//! synchronous metadata read in submit context, never inside
+//! `complete_fn`).
 
 #![short_vis_path::add(erofs)]
 
@@ -53,6 +52,7 @@ use core::mem::offset_of;
 
 use align_ext::AlignExt;
 use aster_block::{
+    BLOCK_SIZE,
     bio::{BioCompleteFn, BioSegment, BioStatus},
     id::Bid,
 };
@@ -150,17 +150,6 @@ bitflags! {
 /// `struct erofs_map_blocks` (internal.h:330-339). Not carried:
 /// `buf`/`mpage` (no cross-call metabuf, S02-D1/D2) and
 /// `m_algorithmformat` (set only by zmap, archive A).
-// Dead-code ledger (staged landing): the S03 map layer constructs
-// this record but only writes it — the field readers land with the
-// S05 submit_read_bio dispatch (m_flags/m_pa/m_plen) and the S07
-// DIO copy; until then the ktest assertions are the only readers
-// and they are compiled out of regular builds. Struct-level rather
-// than the per-field super_block.rs form because all six fields
-// flip live at the same S05 milestone; the `cfg_attr` form keeps
-// the ktest cfg clean of an unfulfilled `expect` (utils.rs
-// precedent). The expect half fires `unfulfilled` once the first
-// regular-build reader lands — the removal prompt.
-#[cfg_attr(not(ktest), expect(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MapBlocks {
     /// Logical start. Input echo, except the CHUNK_BASED branch
@@ -168,6 +157,15 @@ pub(super) struct MapBlocks {
     pub m_la: u64,
     /// Extent logical length; on success always == m_plen (M8, the
     /// dual-role contract of `map_blocks`).
+    // No regular-build reader under archive A: the production
+    // consumers spell their arithmetic on m_plen (the M8 identity
+    // makes the two interchangeable), so the ktest M8 assertions
+    // are the only readers — hence a cfg-gated per-field bridge
+    // (the InodeDesc field form) instead of the struct-level
+    // staging root removed when the four-arm dispatch landed. The
+    // revival consumers (the fiemap/zmap family, G-Z01 batch)
+    // remove it.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub m_llen: u64,
     /// Physical byte offset on the (pre-map_dev) device byte stream:
     /// MAPPED — data start; META — inline payload start; meaningless
@@ -182,9 +180,9 @@ pub(super) struct MapBlocks {
     pub m_flags: MapFlags,
 }
 
-/// Read-only page-cache backend for erofs DataBacked payloads
-/// (decision 1, `docs/T-024/subtasks.md` S01; the geometry is final
-/// since T-025 S01 — see the module doc for the seam contract).
+/// Read-only page-cache backend for erofs DataBacked payloads —
+/// the final four-arm bridge (T-025 S05; the geometry bundle is
+/// final since T-025 S01).
 ///
 /// Declared at erofs scope (`pub(in crate::fs::fs_impls::erofs)`)
 /// because erofs-visible signatures — `Inode::data_backend` and the
@@ -198,15 +196,15 @@ pub(super) struct MapBlocks {
 /// serves holds only a `Weak<dyn PageCacheBackend>` here; the
 /// strong owner is the `InodePayload::DataBacked` variant.
 pub(in crate::fs::fs_impls::erofs) struct DataBackend {
-    /// Weak back-reference to the owning filesystem — the
-    /// constructor-seam parameter for the map_blocks/map_dev faces
-    /// (mount geometry and device-table walks, T-025 S03/S04); the
-    /// minimal face reads the device it already holds instead.
+    /// Weak back-reference to the owning filesystem — consumed by
+    /// the `map_dev` device-table walk and the chunk-8B id-mask
+    /// fetch through `upgrade_fs` (the third weak back-reference of
+    /// the family; a strong one would close an Arc cycle).
     // Live since T-025 S03: `upgrade_fs` reads it on every nonzero-id
     // map_dev walk, and since S04 on every chunk-8B mask fetch too.
     fs: Weak<Erofs>,
-    /// The backing device: flat-region BIOs and inline-tail byte
-    /// reads both go through it.
+    /// The backing device: whole-page block BIOs and sub-page
+    /// byte-channel fills both go through it.
     device: Arc<dyn BlockDevice>,
     /// The per-inode geometry bundle, collapsed from the decoded
     /// descriptor by `data_geometry` (L3) into plain values.
@@ -276,18 +274,6 @@ impl DataBackend {
     /// branch then reports `m_plen == 0` (linux iomap patches this up
     /// at its own layer, data.c:318-319 — aster callers never pass
     /// 0).
-    // Dead-code ledger (staged landing): the S03-IF suite below is
-    // the only caller until the production consumers land (the S05
-    // submit_read_bio rewrite, then S07 DIO / S08 read_at) — the
-    // suite is compiled out of regular builds, so the map face needs
-    // this root to stay lint-clean there. The `cfg_attr` form, not a
-    // bare `expect`, because the ktest cfg keeps this item live and
-    // a bare `expect` would only be reported unfulfilled there (the
-    // utils.rs precedent). Root semantics: `MapBlocks` and
-    // `map_blocks_flatmode` follow this item's liveness. The expect
-    // half fires `unfulfilled` the moment the S05 consumer lands —
-    // the removal prompt.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn map_blocks(&self, m_la: u64, m_llen: u64) -> Result<MapBlocks> {
         // (a) Layer-3 defensive half (I12; S01-D3 bool snapshot) —
         //     the SINGLE carrying point of the compressed rejection:
@@ -544,15 +530,6 @@ impl DataBackend {
     /// resolved pa, data.c:328) and, vacuously, the empty state
     /// (holes keep `m_deviceid == 0`, so the call is the identity
     /// and the pa is unused).
-    // Dead-code ledger (staged landing, same form as `map_blocks`
-    // above): ktest-suite-only caller until S05/S07/S08; the
-    // `cfg_attr` form keeps the ktest cfg clean of an unfulfilled
-    // `expect`. Root semantics: `upgrade_fs` below, the `fs` field it
-    // reads, and the `Erofs::device_table` / `DeviceTable::flatdev`
-    // / `slot` accessors (fs.rs) all follow this item's liveness in
-    // regular builds. The expect half fires `unfulfilled` when the
-    // first production consumer lands — the removal prompt.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn map_dev(&self, m_pa: u64, m_deviceid: u16) -> Result<u64> {
         // AUTO-TODO(G-M16): Linux sets the backing device's logical block size
         // at mount and switches to a larger one when the superblock demands it
@@ -615,9 +592,55 @@ impl DataBackend {
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem already dropped"))
     }
+
+    // -------------------------------------------------------------------
+    // The page-cache bridge fill (T-025 S05): the shared sub-page arm
+    // of submit_read_bio below. Submit-context code only.
+    // -------------------------------------------------------------------
+
+    /// Fills `bio_segment`'s page with the valid prefix `[0, valid)`
+    /// read from the device byte stream at `pa`, then zero-fills
+    /// the tail `[valid, PAGE_SIZE)`.
+    ///
+    /// G-P02 (candidate ①) single source: the bytes past `i_size`
+    /// must never expose device residue — buffered reads and mmap
+    /// faults both land here, so the zero-fill is single-sourced.
+    /// Shared by the MAPPED last-page arm and the INLINE (META) arm
+    /// of `submit_read_bio`; the completion discipline (call
+    /// `complete_fn` exactly once, synchronously, only after this
+    /// helper returns `Ok`) lives in that dispatch skeleton — this
+    /// helper never completes.
+    ///
+    /// The copy-then-memset order (S05-D4) rides two sequential
+    /// writer views over the same page memory: the prefix view is
+    /// bounded to `valid` bytes and consumed by the byte-channel
+    /// read (`VmIo::read` demands a fallible writer, and
+    /// `to_fallible` consumes the writer it converts — one view
+    /// cannot serve both the channel read and the infallible
+    /// `fill_zeros`), the tail view is a fresh writer skipped past
+    /// the prefix, zeroing exactly the remainder in one pass.
+    fn fill_page_prefix(&self, bio_segment: &BioSegment, pa: u64, valid: usize) -> Result<()> {
+        debug_assert!(0 < valid && valid <= PAGE_SIZE);
+        // Prefix [0, valid): the byte-channel read (C1–C5; the RD2②
+        // end-of-device bound answers EINVAL past the device end,
+        // medium errors EIO — both travel unfolded through `?`).
+        let mut prefix = bio_segment.inner_dma_slice().writer()?.to_fallible();
+        prefix.limit(valid);
+        self.device.read(pa as usize, &mut prefix)?;
+        // Tail [valid, PAGE_SIZE): zero-fill through a fresh
+        // infallible view over the same page.
+        let mut tail = bio_segment.inner_dma_slice().writer()?;
+        tail.skip(valid);
+        debug_assert_eq!(tail.avail(), PAGE_SIZE - valid);
+        tail.fill_zeros(PAGE_SIZE - valid);
+        Ok(())
+    }
 }
 
 impl BlockAsPageCacheBackend for DataBackend {
+    /// The four-arm page fill — the guard order below IS the
+    /// behavioral face; every mapping/device error travels unfolded
+    /// through `?` (seam ④).
     fn submit_read_bio(
         &self,
         idx: usize,
@@ -625,118 +648,90 @@ impl BlockAsPageCacheBackend for DataBackend {
         complete_fn: BioCompleteFn,
         io_batch: &mut IoBatch,
     ) -> Result<()> {
-        // The backend bounds contract (fail with EINVAL past the
-        // end, page_cache/mod.rs read_page_async). Static bound: the
-        // filesystem is read-only, npages never moves.
+        // (a) Out-of-bounds gate: the backend bounds contract (fail
+        //     with EINVAL past the end, page_cache/mod.rs). Doubly
+        //     unreachable — the framework capacity bound rejects
+        //     first (vmo/mod.rs commit_on_internal) and every
+        //     FS-side read is clamped below i_size — kept as
+        //     defense in depth (the ext2 :141-143 form; ext2's gate
+        //     is live under its mutable sizes, this one is
+        //     structural).
         if idx >= self.npages {
-            return_errno_with_message!(Errno::EINVAL, "invalid read size");
+            return_errno_with_message!(Errno::EINVAL, "read page index out of bounds");
         }
-        // Layer-3 defensive half, FINAL shape (S01-D3): the stored
-        // predicate snapshot, consumed here instead of re-derived.
-        // Structurally unreachable after the I12 arm-head assembly
-        // gate (S02-R1) — kept as defense in depth against future
-        // bypasses of that gate, the same unreachable-but-defensive
-        // posture as the F10/F11 mount-site gates, with the same
-        // message string.
-        //
-        // TRANSITIONAL DUPLICATION (T-025 S03): the single carrying
-        // point of this rejection is `map_blocks` (a) since S03;
-        // this minimal face does not call the map layer yet, so the
-        // gate stays duplicated here until the S05 four-arm rewrite
-        // routes submit_read_bio through map_blocks and removes this
-        // copy (S03 §2.3's single-point declaration).
-        if self.geom.compressed {
-            return_errno_with_message!(Errno::EOPNOTSUPP, "compressed inode data is not supported");
-        }
-        match self.geom.chunk {
-            None => {
-                // Flat-mode geometry (erofs_map_blocks_flatmode,
-                // data.c:82-96): erofs_iblks(i_size) = ceil(size/bs),
-                // tailendpacking subtracts the inline last block
-                // (data.c:84). Saturating: a zero-size FLAT_INLINE
-                // inode has iblks == 0 and no readable page at all,
-                // so the 0−1 wrap of the C unsigned arithmetic is
-                // clamped instead (no read can reach either
-                // geometry). The exact u32-truncation mirror of the
-                // linux lastblk arithmetic lands with the flat
-                // map_blocks face (S03, S03-D5).
-                let bs = 1u64 << self.geom.block_bits;
-                let lastblk = self
-                    .geom
-                    .size
-                    .div_ceil(bs)
-                    .saturating_sub(u64::from(self.geom.tail_inline));
-                if (idx as u64) < lastblk {
-                    // Identity mapping: file block idx → device
-                    // block raw_blkaddr + idx (data.c:87-90). One BIO
-                    // block per file block — the 4k-only scope makes
-                    // the erofs block size, BLOCK_SIZE, and PAGE_SIZE
-                    // coincide (pinned by the constructor assert).
-                    // The enqueue error converts through the crate
-                    // error type; completion (including the page
-                    // up-to-date transition and the page lock
-                    // release) runs in the device completion.
-                    self.device.read_blocks_async(
-                        Bid::new(u64::from(self.geom.raw_blkaddr) + idx as u64),
-                        bio_segment,
-                        Some(complete_fn),
-                        io_batch,
-                    )?;
-                    Ok(())
-                } else {
-                    // The inline-tail page: idx == lastblk — the
-                    // npages bound leaves exactly this one page
-                    // beyond the flat region (a FLAT_PLAIN layout
-                    // has npages == lastblk and never gets here; the
-                    // tail length below is [1, bs] whenever the page
-                    // is reachable, the size == 0 corner having
-                    // npages == 0 and no page at all).
-                    let tail_len = (self.geom.size - lastblk * bs) as usize;
-                    // Synchronous fill in the caller's context (the
-                    // page-cache read path), NOT an interrupt
-                    // callback — the three interrupt-context
-                    // prohibitions above stay untouched. The bytes
-                    // land in the page through the segment's DMA
-                    // writer: the DmaStream mapped from the page is
-                    // bidirectional at the DMA layer, and the
-                    // FromDevice gate on `BioSegment::writer` models
-                    // device-filled data only — this arm is the
-                    // filesystem itself producing the bytes (same
-                    // posture as the framework's own
-                    // `BioStatus::Zeros` arm, which also fills the
-                    // page without any device I/O). The zeroed
-                    // bounce buffer keeps the beyond-tail bytes of
-                    // the page reading as zeros.
-                    let mut page_bytes = [0u8; PAGE_SIZE];
-                    // I2 passthrough: the device errno travels
-                    // unfolded to the page-cache exit.
-                    self.device.read_bytes(
-                        self.geom.inline_data_start as usize,
-                        &mut page_bytes[..tail_len],
-                    )?;
-                    bio_segment
-                        .inner_dma_slice()
-                        .writer()?
-                        .write(&mut VmReader::from(&page_bytes[..]));
-                    // Marks the page up-to-date and releases the page
-                    // lock (the closure owns the LockedCachePage).
-                    complete_fn(BioStatus::Complete);
-                    Ok(())
-                }
-            }
-            // TRANSITIONAL ARM (T-025 decomposition decision 4):
-            // purpose — the map layer has carried the real chunk
-            // walk since S04, but this minimal face still bypasses
-            // it, so every chunk-based read keeps failing
-            // EOPNOTSUPP here; removal — S05's four-arm rewrite of
-            // submit_read_bio routes this face through map_blocks.
-            // The main-column image family carries no chunk-based
-            // inode, so behavior is unchanged meanwhile.
-            Some(_) => {
-                return_errno_with_message!(
-                    Errno::EOPNOTSUPP,
-                    "chunk-based mapping lands with the data-path task"
-                );
+        // (b) One extent covering the page (S03; the I1 form of this
+        //     bridge: la page-aligned, llen = PAGE). The compressed
+        //     rejection is carried by map_blocks alone (S03 §2.3) —
+        //     no second gate here.
+        let la = (idx as u64) * PAGE_SIZE as u64;
+        let map = self.map_blocks(la, PAGE_SIZE as u64)?;
+        // (c) The composition contract (I2/S04-D3): exactly one
+        //     map_dev call after map_blocks and before the flags
+        //     dispatch — the identity for flat/META, vacuous for
+        //     holes, the flatdev translation for chunk-8B extents.
+        let base = self.map_dev(map.m_pa, map.m_deviceid)?;
+        // (d) In-extent offset (S03 §6 I5): zero for flat/META (m_la
+        //     echoes la), a page multiple for chunk (the aligned
+        //     write-back).
+        let data_pa = base + (la - map.m_la);
+        // (e) Tristate dispatch (S03 §4.6 whole-page dichotomy):
+        //     full mapped pages take the block channel, every
+        //     sub-page object (the last-page tail and the INLINE
+        //     payload) takes the byte channel (S05-D3). Completion
+        //     discipline (S05-D6): exactly once, synchronously in
+        //     this submit context, only on the success path — an
+        //     Err drops `complete_fn`, whose Drop releases the page
+        //     lock; calling it on the error path would complete
+        //     twice.
+        if map.m_flags == MapFlags::empty() {
+            // Whole-page hole — the synchronous Zeros fast path
+            //     (ext2 :151-155 form): the framework completion
+            //     closure zero-fills the page and marks it up to
+            //     date; zeros cover any tail past i_size as well.
+            //     No device I/O for the page itself, no batch
+            //     record (wait_all passes trivially).
+            complete_fn(BioStatus::Zeros);
+            Ok(())
+        } else if map.m_flags.contains(MapFlags::META) {
+            // INLINE tail page: the prefix is the payload (m_plen
+            //     already clamps to i_size, S03 §3.4 — no second
+            //     clamp), the zero tail rides the same helper
+            //     (G-P02's "INLINE covered in passing" half), and
+            //     the synchronous payload read happens here in
+            //     submit context (the module's interrupt-context
+            //     contract).
+            self.fill_page_prefix(&bio_segment, data_pa, map.m_plen as usize)?;
+            complete_fn(BioStatus::Complete);
+            Ok(())
+        } else {
+            // MAPPED: valid is the page's prefix within i_size —
+            //     idx < npages keeps the subtraction positive.
+            let valid = (self.geom.size as usize - idx * PAGE_SIZE).min(PAGE_SIZE);
+            if valid == PAGE_SIZE {
+                // Whole page: one forwarded BIO. 4k-only plus the
+                // block-multiple extents keep data_pa block-aligned;
+                // Bid::from_offset would silently truncate a
+                // misaligned offset (id.rs), so the invariant is
+                // documented here (B3 posture — the assert does not
+                // catch). The segment construction, completion
+                // closure, and page-lock release are the blanket
+                // mechanism's — erofs is a pure consumer.
+                debug_assert!(data_pa % BLOCK_SIZE as u64 == 0);
+                self.device.read_blocks_async(
+                    Bid::from_offset(data_pa as usize),
+                    bio_segment,
+                    Some(complete_fn),
+                    io_batch,
+                )?;
+                Ok(())
+            } else {
+                // Last page (size % PAGE != 0): the prefix helper,
+                // NOT a whole-page BIO — the block-rounded extent
+                // would carry device residue past i_size into the
+                // page (the ext2 negative example, G-P02 #2).
+                self.fill_page_prefix(&bio_segment, data_pa, valid)?;
+                complete_fn(BioStatus::Complete);
+                Ok(())
             }
         }
     }
@@ -748,11 +743,13 @@ impl BlockAsPageCacheBackend for DataBackend {
         _complete_fn: BioCompleteFn,
         _io_batch: &mut IoBatch,
     ) -> Result<()> {
-        // Structurally unreachable: a read-only filesystem has no
-        // write path, so no page is ever dirtied and writeback never
-        // starts. The explicit EROFS rejection (not EINVAL) keeps
-        // the answer meaningful should a future caller appear.
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
+        // Not structurally unreachable: aster has no SB_RDONLY open
+        // gate, so a writable fd plus a MAP_SHARED write fault can
+        // dirty a page and start writeback (S05-D5's liveness
+        // argument). EROFS — the write-face family errno — is the
+        // honest answer; the blanket write path re-dirties the page
+        // on Err (framework-decided), never this code.
+        return_errno_with_message!(Errno::EROFS, "write to read-only filesystem");
     }
 }
 
@@ -828,6 +825,8 @@ pub(super) const NULL_ADDR: u32 = u32::MAX;
 #[cfg(ktest)]
 mod tests {
     use align_ext::AlignExt;
+    use aster_block::{SECTOR_SIZE, bio::BioType};
+    use io_util::IoError;
     use ostd::prelude::*;
 
     use super::*;
@@ -835,8 +834,8 @@ mod tests {
         Erofs,
         fs::DeviceTable,
         test_utils::{
-            ErofsMemoryDisk, ktest_data_geometry, ktest_flat_geometry, ktest_flatdev_table,
-            ktest_fs_on, ktest_single_device_table, ktest_super_block,
+            BioRequest, ErofsMemoryDisk, ktest_bio_trio, ktest_data_geometry, ktest_flat_geometry,
+            ktest_flatdev_table, ktest_fs_on, ktest_single_device_table, ktest_super_block,
         },
     };
 
@@ -1467,6 +1466,311 @@ mod tests {
         drop(fs);
         let err = backend.map_dev(4096, 1).unwrap_err();
         assert_eq!(err.error(), Errno::EIO);
+    }
+
+    // ------------------------------------------------------------------
+    // The page-cache bridge suite (T-025 S05): submit_read_bio
+    // direct-call vectors over the memory disk — the S05 §10
+    // assertion family, anchored per test.
+    // ------------------------------------------------------------------
+
+    /// A flat-geometry backend over a fresh memory disk (the S05-IF
+    /// fixture form): `raw` is the data start block, `size` the
+    /// i_size; the fs rides the single-device table (flatdev arms
+    /// are the S03/S04 map-layer suites' face).
+    fn ktest_bridge_backend(
+        disk: Arc<ErofsMemoryDisk>,
+        size: u64,
+        raw: u32,
+        tail_inline: bool,
+        inline_data_start: u64,
+    ) -> DataBackend {
+        let fs = ktest_fs_on(disk, ktest_super_block(12, 0), ktest_single_device_table());
+        let geom = ktest_flat_geometry(size, raw, tail_inline, inline_data_start);
+        let npages = size.div_ceil(PAGE_SIZE as u64) as usize;
+        DataBackend::new(fs.self_ref().clone(), fs.block_device().clone(), geom, npages)
+    }
+
+    /// Reads a one-page segment back into bytes.
+    fn ktest_segment_bytes(segment: &BioSegment) -> [u8; PAGE_SIZE] {
+        let mut buf = [0u8; PAGE_SIZE];
+        segment.read_bytes(0, &mut buf).unwrap();
+        buf
+    }
+
+    /// S05-IF-1 (anchor `docs/T-014/S05/index.md` §10): the MAPPED
+    /// whole-page arm — a flat geometry of 3.5 pages over a
+    /// patterned disk; each full page lands as ONE whole-block
+    /// block-channel BIO carrying exactly the disk bytes, completing
+    /// exactly once with `Complete`.
+    #[ktest]
+    fn submit_read_bio_mapped_full_page() {
+        let disk = Arc::new(ErofsMemoryDisk::new(8 * PAGE_SIZE));
+        let pattern = |off: usize| ((off * 13 + 7) & 0xff) as u8;
+        let mut staged = vec![0u8; 4 * PAGE_SIZE];
+        for (i, b) in staged.iter_mut().enumerate() {
+            *b = pattern(4 * PAGE_SIZE + i);
+        }
+        disk.stage_bytes(4 * PAGE_SIZE, &staged);
+        let backend = ktest_bridge_backend(disk.clone(), 7 * PAGE_SIZE as u64 / 2, 4, false, 0);
+        for (n, idx) in [0usize, 2].into_iter().enumerate() {
+            let (segment, mut io_batch, completions) = ktest_bio_trio();
+            backend
+                .submit_read_bio(idx, segment.clone(), completions.complete_fn(), &mut io_batch)
+                .unwrap();
+            io_batch.wait_all().unwrap();
+            assert_eq!(completions.nr_completions(), 1, "idx={idx}");
+            assert_eq!(
+                completions.statuses(),
+                vec![BioStatus::Complete],
+                "idx={idx}"
+            );
+            let buf = ktest_segment_bytes(&segment);
+            for (i, b) in buf.iter().enumerate() {
+                assert_eq!(*b, pattern((4 + idx) * PAGE_SIZE + i), "idx={idx} byte {i}");
+            }
+            // The block-channel geometry: one whole-block BIO per
+            // full page so far (the S05-IF-10a discriminator).
+            let reqs = disk.requests();
+            assert_eq!(reqs.len(), n + 1, "idx={idx}");
+            assert_eq!(
+                reqs[n],
+                BioRequest {
+                    type_: BioType::Read,
+                    start_sector: ((4 + idx) * BLOCK_SIZE / SECTOR_SIZE) as u64,
+                    nr_sectors: (BLOCK_SIZE / SECTOR_SIZE) as u64,
+                },
+                "idx={idx}"
+            );
+        }
+    }
+
+    /// S05-IF-2 (G-P02): the MAPPED last page — the tail disk block
+    /// carries NON-ZERO residue past i_size; the page must hold the
+    /// disk prefix [0, 2048) and zeros beyond, the residue never
+    /// leaking (the ext2 negative example). Exactly one BYTE-channel
+    /// bounce request serves the fill (S05-IF-10a's "tail = 1, byte
+    /// channel").
+    #[ktest]
+    fn submit_read_bio_tail_page_zerofill() {
+        let disk = Arc::new(ErofsMemoryDisk::new(8 * PAGE_SIZE));
+        let pattern = |off: usize| ((off * 13 + 7) & 0xff) as u8;
+        let mut staged = vec![0u8; PAGE_SIZE];
+        for (i, b) in staged.iter_mut().enumerate() {
+            *b = pattern(7 * PAGE_SIZE + i); // non-zero through the whole block
+        }
+        disk.stage_bytes(7 * PAGE_SIZE, &staged);
+        let backend = ktest_bridge_backend(disk.clone(), 7 * PAGE_SIZE as u64 / 2, 4, false, 0);
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        backend
+            .submit_read_bio(3, segment.clone(), completions.complete_fn(), &mut io_batch)
+            .unwrap();
+        io_batch.wait_all().unwrap();
+        assert_eq!(completions.nr_completions(), 1);
+        assert_eq!(completions.statuses(), vec![BioStatus::Complete]);
+        let buf = ktest_segment_bytes(&segment);
+        for (i, b) in buf.iter().enumerate() {
+            if i < 2048 {
+                assert_eq!(*b, pattern(7 * PAGE_SIZE + i), "prefix byte {i}");
+            } else {
+                assert_eq!(*b, 0, "tail byte {i} must be zeroed (G-P02)");
+            }
+        }
+        // The byte channel: one bounce bio of sub-block geometry
+        // (4 sectors, not 8) at the tail block — never a whole-block
+        // BIO that would fetch the residue.
+        assert_eq!(
+            disk.requests(),
+            vec![BioRequest {
+                type_: BioType::Read,
+                start_sector: (7 * BLOCK_SIZE / SECTOR_SIZE) as u64,
+                nr_sectors: (2048 / SECTOR_SIZE) as u64,
+            }]
+        );
+    }
+
+    /// S05-IF-3: the whole-page hole — a chunk table with a NULL
+    /// entry maps the page flags-empty; the fill is the SYNCHRONOUS
+    /// Zeros fast path: one `Zeros` completion, an empty batch, no
+    /// data-plane request for the page. The one recorded request is
+    /// the metadata channel's own table read (the uncached
+    /// point-of-use contract, S02-D2) — the design's "zero device
+    /// requests" counts the data plane (S05-IF-10a's "hole = 0").
+    #[ktest]
+    fn submit_read_bio_whole_page_hole_zeros() {
+        const BS: u64 = 4096;
+        let (disk, _fs, backend) =
+            ktest_chunk_backend(ktest_single_device_table(), 6 * BS, 4, 13, 4000);
+        disk.stage_bytes(4000, &100u32.to_le_bytes());
+        disk.stage_bytes(4004, &NULL_ADDR.to_le_bytes());
+        disk.stage_bytes(4008, &200u32.to_le_bytes());
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        backend
+            .submit_read_bio(2, segment, completions.complete_fn(), &mut io_batch)
+            .unwrap();
+        // The batch carries nothing — wait_all passes trivially.
+        io_batch.wait_all().unwrap();
+        assert_eq!(completions.nr_completions(), 1);
+        assert_eq!(completions.statuses(), vec![BioStatus::Zeros]);
+        // The only device touch is the 4-byte table read of chunk 1's
+        // entry at 4004 (bounced inside one sector).
+        assert_eq!(
+            disk.requests(),
+            vec![BioRequest {
+                type_: BioType::Read,
+                start_sector: (4004 / SECTOR_SIZE) as u64,
+                nr_sectors: 1,
+            }]
+        );
+    }
+
+    /// S05-IF-4: the META arm contract — a FLAT_INLINE geometry with
+    /// a 100-byte tail; the tail page holds the 100 inline payload
+    /// bytes at the front and zeros beyond, completing exactly once
+    /// with `Complete` after one byte-channel payload fetch.
+    #[ktest]
+    fn submit_read_bio_inline_meta_arm() {
+        let disk = Arc::new(ErofsMemoryDisk::new(3 * PAGE_SIZE));
+        let payload: Vec<u8> = (0..100u8).map(|i| i.wrapping_mul(3).wrapping_add(11)).collect();
+        let ids = 2 * PAGE_SIZE + 2000;
+        disk.stage_bytes(ids, &payload);
+        // size = 3*PAGE + 100 → lastblk = 3, the tail page idx = 3;
+        // la = 3*PAGE is block-aligned → data_pa = ids exactly (the
+        // M2 formula's blkoff(la) == 0 half under 4k-only).
+        let backend = ktest_bridge_backend(
+            disk.clone(),
+            3 * PAGE_SIZE as u64 + 100,
+            16,
+            true,
+            ids as u64,
+        );
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        backend
+            .submit_read_bio(3, segment.clone(), completions.complete_fn(), &mut io_batch)
+            .unwrap();
+        io_batch.wait_all().unwrap();
+        assert_eq!(completions.nr_completions(), 1);
+        assert_eq!(completions.statuses(), vec![BioStatus::Complete]);
+        let buf = ktest_segment_bytes(&segment);
+        assert_eq!(buf[..100], payload[..], "the inline prefix");
+        assert!(buf[100..].iter().all(|&b| b == 0), "the zero tail");
+        // One byte-channel bounce fetches the 100 payload bytes: the
+        // request [10192, 10292) rounds to sectors [19, 21) — two
+        // sectors (10192 is 504 bytes INTO sector 19, 10292 crosses
+        // into sector 20's successor), sub-block geometry either
+        // way.
+        assert_eq!(
+            disk.requests(),
+            vec![BioRequest {
+                type_: BioType::Read,
+                start_sector: (ids / SECTOR_SIZE) as u64,
+                nr_sectors: 2,
+            }]
+        );
+    }
+
+    /// S05-IF-5: the cross-block EUCLEAN defense passes through the
+    /// bridge untouched — a crafted geometry whose inline tail would
+    /// straddle a block boundary is rejected before any fetch; the
+    /// completion callback never runs (count 0 — the completion
+    /// discipline's error half).
+    #[ktest]
+    fn submit_read_bio_inline_cross_block_euclean() {
+        let disk = Arc::new(ErofsMemoryDisk::new(2 * PAGE_SIZE));
+        // Tail [8192, 8292) with the inline area at blkoff 4000:
+        // 4000 + 100 > 4096 → EUCLEAN (the S03 §3.4 single source;
+        // this bridge never re-checks).
+        let backend = ktest_bridge_backend(
+            disk.clone(),
+            2 * PAGE_SIZE as u64 + 100,
+            16,
+            true,
+            PAGE_SIZE as u64 + 4000,
+        );
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        let err = backend
+            .submit_read_bio(2, segment, completions.complete_fn(), &mut io_batch)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+        assert_eq!(completions.nr_completions(), 0);
+        assert!(disk.requests().is_empty(), "the guard precedes any fetch");
+    }
+
+    /// S05-IF-6: the npages gate — every idx at or past the bound
+    /// fails EINVAL before any mapping or device I/O.
+    #[ktest]
+    fn submit_read_bio_npages_gate() {
+        let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
+        let backend = ktest_bridge_backend(disk.clone(), PAGE_SIZE as u64, 0, false, 0);
+        for idx in [1usize, 1000, usize::MAX / 2] {
+            let (segment, mut io_batch, completions) = ktest_bio_trio();
+            let err = backend
+                .submit_read_bio(idx, segment, completions.complete_fn(), &mut io_batch)
+                .unwrap_err();
+            assert_eq!(err.error(), Errno::EINVAL, "idx={idx}");
+            assert_eq!(completions.nr_completions(), 0, "idx={idx}");
+        }
+        assert!(disk.requests().is_empty());
+    }
+
+    /// S05-IF-7: the block-channel error terminus — an injected
+    /// IoError completion surfaces at the read exit as EIO through
+    /// the framework From chain (S05 §6.1: the RD2② block-channel
+    /// half is SAME-code with Linux — no drift entry, unlike the
+    /// byte channel's EINVAL).
+    #[ktest]
+    fn submit_read_bio_block_channel_error_eio() {
+        let disk = Arc::new(ErofsMemoryDisk::new(2 * PAGE_SIZE));
+        let backend = ktest_bridge_backend(disk.clone(), 2 * PAGE_SIZE as u64, 0, false, 0);
+        disk.set_fail_reads(true);
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        backend
+            .submit_read_bio(0, segment, completions.complete_fn(), &mut io_batch)
+            .unwrap();
+        let err = io_batch.wait_all().unwrap_err();
+        assert_eq!(err, IoError::Failed);
+        // The read-exit terminus — read_page's `?` goes through this
+        // exact conversion: IoError::Failed → EIO.
+        assert_eq!(Error::from(err).error(), Errno::EIO);
+        assert_eq!(completions.nr_completions(), 1);
+        assert_eq!(completions.statuses(), vec![BioStatus::IoError]);
+    }
+
+    /// S05-IF-8: the tail-page prefix read past the device end — the
+    /// byte channel's framework bound rejects EINVAL BEFORE any
+    /// request reaches the device (RD2②, the aster-semantics half
+    /// of the known-diff entry).
+    #[ktest]
+    fn submit_read_bio_tail_page_past_end_einval() {
+        // A two-page device; the 3.5-page geometry sends idx 3's
+        // prefix read to [3*PAGE, 3*PAGE + 2048) — past the end.
+        let disk = Arc::new(ErofsMemoryDisk::new(2 * PAGE_SIZE));
+        let backend = ktest_bridge_backend(disk.clone(), 7 * PAGE_SIZE as u64 / 2, 0, false, 0);
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        let err = backend
+            .submit_read_bio(3, segment, completions.complete_fn(), &mut io_batch)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+        assert_eq!(completions.nr_completions(), 0);
+        assert!(
+            disk.requests().is_empty(),
+            "the framework bound fires before enqueue"
+        );
+    }
+
+    /// S05-IF-9: submit_write_bio is the constant EROFS rejection
+    /// (the S05-D5 liveness argument: a writable mmap can reach it);
+    /// the callback never runs.
+    #[ktest]
+    fn submit_write_bio_erofs() {
+        let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
+        let backend = ktest_bridge_backend(disk, PAGE_SIZE as u64, 0, false, 0);
+        let (segment, mut io_batch, completions) = ktest_bio_trio();
+        let err = backend
+            .submit_write_bio(0, segment, completions.complete_fn(), &mut io_batch)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EROFS);
+        assert_eq!(completions.nr_completions(), 0);
     }
 
     /// S01-IF-1 (anchor `docs/T-014/S01/index.md` §9): the capacity

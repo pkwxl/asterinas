@@ -44,15 +44,32 @@
 //! (compiled under `#[cfg(ktest)]`, never referenced by production
 //! files).
 //!
+//! # Metadata reads
+//!
+//! EROFS keeps no shared block-device cache. All raw metadata reads
+//! (superblock, device table, inode records, chunk indexes / block
+//! maps, inline payloads, xattr structures) are synchronous, uncached,
+//! byte-precise reads over the main device byte stream (`VmIo`
+//! primitives on `Arc<dyn BlockDevice>`), issued at the point of use
+//! in task context. Errors pass through unchanged (no folding, no
+//! re-mapping). Directory entry walks do NOT use this channel — they
+//! read through the directory inode's own page cache. Page-cache
+//! fills are hosted by the backend in `inode/data.rs`: full mapped
+//! pages go through block BIOs, while sub-page tails and inline
+//! payloads are fetched with the same byte-stream primitives as part
+//! of the fill (submit context) — the uncached point-of-use contract
+//! above governs the metadata consumers only.
+//!
 //! # Bring-up state
 //!
-//! Task T-021 delivers the compilable skeleton: the ten-file layout,
-//! the VFS registration glue, and the utility layer with its embedded
-//! vector tests. The superblock/inode decoding lands with T-022, the
-//! mount assembly with T-023, and the downstream domains (namei, data
-//! path, xattr, ktest fixtures) with T-024..T-027. Until then
-//! `Erofs::open` rejects every mount with a clear error instead of
-//! panicking or swallowing it.
+//! The skeleton, the superblock/inode decoding, the mount assembly,
+//! and the namei family have landed (T-021..T-024). T-025 lands the
+//! non-compressed data path: the mapping layer and the page-cache
+//! bridge in `inode/data.rs` are final since its S05 slice — every
+//! DataBacked page fill (buffered reads, mmap faults, readdir, slow
+//! symlinks) goes through the four-arm backend — while the buffered
+//! `read_at` collection and the O_DIRECT dispatch are the remaining
+//! slices.
 //!
 //! # References
 //!
