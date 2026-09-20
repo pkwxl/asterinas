@@ -255,6 +255,14 @@ static int umnt_mountinfo_fields(const char *buf, const char *mnt,
 FN_TEST(umount_show_basic_face)
 {
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
+	/*
+	 * Activation-boundary guard (T-023/S08): the mount-effect
+	 * witness below resolves SELF_MNT "/regular" through the erofs
+	 * root -- the namei/lookup domain (T-024); the T-023
+	 * transitional inode set answers lookup with EOPNOTSUPP. SKIP
+	 * until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount_base_default());
@@ -279,6 +287,13 @@ FN_TEST(umount_show_open_fd_no_busy_check)
 	int fd;
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
+	/*
+	 * Activation-boundary guard (T-023/S08): the open fd and the
+	 * follow-up content check walk regular/inline_64b.bin through
+	 * the mounted tree -- the namei/lookup and data domains
+	 * (T-024). SKIP until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount_base_default());

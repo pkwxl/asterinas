@@ -748,7 +748,12 @@ impl SuperBlock {
     /// the end of the 16 bytes), so the NIL door must run *before*
     /// this accessor is consulted — an ordering constraint owned by
     /// the mount-time sequence (T-023).
-    // First consumer: the mount-time geometry consumption (T-023).
+    // No consumer inside T-023: the V8 door reads the *predicate*
+    // above, not this accessor. Expectation corrected by the
+    // T-023/S08 expects audit (the sketch note named a mount-time
+    // consumer that the final design never landed); the first real
+    // consumer is post-T-023 (mount logging / a future domain) —
+    // remove the `expect` when it lands.
     #[expect(dead_code)]
     pub(super) fn volume_name(&self) -> FixedCStr<16> {
         FixedCStr::from_bytes_until_nul(&self.volume_name)

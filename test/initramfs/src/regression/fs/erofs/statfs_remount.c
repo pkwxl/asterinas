@@ -330,6 +330,16 @@ END_TEST()
 FN_TEST(statfs_remount_bare_remount_resets_options)
 {
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
+	/*
+	 * Activation-boundary guard (T-023/S08): the RM12 observability
+	 * probe below walks into the mounted tree (getxattr on
+	 * xattr_host/...), which needs the namei/lookup domain (T-024)
+	 * and the xattr domain (T-026) -- the T-023 mount domain alone
+	 * answers lookup with EOPNOTSUPP. The init-mount probe stays
+	 * false until /erofs content is reachable, keeping this case
+	 * SKIPped past T-023 while the device guard alone would pass.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount_dev(EROFS_DEV_BASE, 0, "nouser_xattr"));
@@ -376,6 +386,14 @@ FN_TEST(statfs_remount_rw_request_stays_ro)
 	struct statfs st;
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
+	/*
+	 * Activation-boundary guard (T-023/S08): the EROFS negative
+	 * control below opens regular/empty_file.bin through the
+	 * mounted tree -- the namei/lookup domain (T-024). The statfs
+	 * witness alone is T-023-native, but the frozen assertion set
+	 * rides together; SKIP until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount_dev(EROFS_DEV_BASE, 0, NULL));

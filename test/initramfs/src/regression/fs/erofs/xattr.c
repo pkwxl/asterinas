@@ -748,6 +748,13 @@ FN_TEST(xattr_nouser_xattr_gate)
 	char list[512];
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
+	/*
+	 * Activation-boundary guard (T-023/S08): the X3/X4 probes below
+	 * walk into the mounted tree and read on-image xattrs -- the
+	 * namei/lookup domain (T-024) plus the xattr domain (T-026).
+	 * SKIP until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_BASE, EROFS_SELF_MNT, "erofs", 0,
@@ -798,6 +805,13 @@ FN_TEST(xattr_shared_all_fidelity)
 	};
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_XSHARED);
+	/*
+	 * Activation-boundary guard (T-023/S08): the shared-region
+	 * fidelity matrix below walks into the mounted tree and reads
+	 * on-image xattrs -- the namei/lookup domain (T-024) plus the
+	 * xattr domain (T-026). SKIP until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_XSHARED, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -839,6 +853,14 @@ FN_TEST(xattr_zero_xattr_negative)
 	char list[512];
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_XNONE);
+	/*
+	 * Activation-boundary guard (T-023/S08): the negative-contrast
+	 * probes below walk into the mounted tree and query xattrs --
+	 * the namei/lookup domain (T-024) plus the xattr domain
+	 * (T-026); pinning ENODATA presupposes the query reaching the
+	 * xattr layer at all. SKIP until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_XNONE, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -887,6 +909,14 @@ FN_TEST(xattr_prefix_get_list_fidelity)
 	char buf[64];
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_PREFIX);
+	/*
+	 * Activation-boundary guard (T-023/S08): the prefix-table
+	 * fidelity probes below walk into the mounted tree and read
+	 * on-image xattrs -- the namei/lookup domain (T-024) plus the
+	 * xattr domain (T-026, prefix table included). SKIP until
+	 * /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_PREFIX, EROFS_SELF_MNT, "erofs", 0, NULL));

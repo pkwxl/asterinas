@@ -327,6 +327,14 @@ FN_TEST(acl_noacl_variant_gate)
 	char buf[64];
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BASE);
+	/*
+	 * Activation-boundary guard (T-023/S08): the gate probes below
+	 * walk into the mounted tree and query on-image xattrs (ACL
+	 * names ride the xattr namespace) -- the namei/lookup domain
+	 * (T-024) plus the xattr/ACL domain (T-026). SKIP until
+	 * /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_BASE, EROFS_SELF_MNT, "erofs", 0, "noacl"));

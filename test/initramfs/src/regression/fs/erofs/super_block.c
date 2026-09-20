@@ -114,7 +114,7 @@ END_TEST()
  * G-M13 (AR-4): the true multi-device mount stays rejected during
  * the transition period.
  */
-FN_TEST(super_block_multidev_transition_einval)
+FN_TEST(super_block_multidev_transition_eopnotsupp)
 {
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_FLATDEV);
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_BLOB);
@@ -123,13 +123,25 @@ FN_TEST(super_block_multidev_transition_einval)
 	/*
 	 * 登记差异(G-M13/AR-4): Linux 基线为 DEVICE_TABLE 图像 +
 	 * `device=/dev/vde`(EROFS_DEV_BLOB)计数匹配的真·多设备
-	 * 挂载成功;aster 过渡期拒绝(EINVAL)。与
+	 * 挂载成功;aster 过渡期拒绝(EOPNOTSUPP)。与
 	 * super_block_device_count_mismatch 对照: 同一 data 串形态,
 	 * BASE(extra=0)因计数不匹配拒(对等),FLATDEV(extra=1)
 	 * 计数匹配但过渡拒(本行)。
+	 *
+	 * Expected-value revision (T-023/S08, registered per the
+	 * frozen-expectation rule "revise only from the authority, in
+	 * place, with a trace"): the errno here was frozen as EINVAL in
+	 * the pre-design T-020 era; the design ledger then fixed
+	 * EOPNOTSUPP for the V10-e transition-rejection arm (authority:
+	 * docs/T-012/analysis.md sec. 4.1 and docs/T-012/S03/index.md
+	 * sec. 4.1, design-time AUTO-RESOLVE under AR-S01-4; same
+	 * wording as the T-023 task statement and its verification
+	 * gate). Revised from the authority, never from observed
+	 * behavior; the internal symbol name follows the errno (zero
+	 * behavior impact, logged in docs/T-023/S08/index.md).
 	 */
 	TEST_ERRNO(mount_dev(EROFS_DEV_FLATDEV, "device=" EROFS_DEV_BLOB),
-		   EINVAL);
+		   EOPNOTSUPP);
 }
 END_TEST()
 

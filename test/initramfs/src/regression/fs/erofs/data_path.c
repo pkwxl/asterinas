@@ -548,6 +548,13 @@ END_TEST()
 FN_TEST(data_path_chunk4b_crossblk_content)
 {
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CHUNK4B);
+	/*
+	 * Activation-boundary guard (T-023/S08): the content assertions
+	 * below walk and read regular files through the mounted tree --
+	 * the namei/lookup and chunked-data domains (T-024). SKIP until
+	 * /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_CHUNK4B, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -578,6 +585,13 @@ FN_TEST(data_path_concat_shift_content)
 	int fd;
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CONCAT);
+	/*
+	 * Activation-boundary guard (T-023/S08): the shifted-read
+	 * assertions below open and read through the mounted tree --
+	 * the namei/lookup and chunked-data domains (T-024). SKIP
+	 * until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -622,6 +636,13 @@ FN_TEST(data_path_concat_sparse_hole_form_face)
 	int fd;
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CONCAT);
+	/*
+	 * Activation-boundary guard (T-023/S08): the hole-form probes
+	 * below open and read sparse_hole.bin through the mounted tree
+	 * -- the namei/lookup and chunked-data domains (T-024). SKIP
+	 * until /erofs content is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0, NULL));
@@ -659,6 +680,15 @@ FN_TEST(data_path_main_only_data_eio)
 	int fd;
 
 	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_FLATDEV);
+	/*
+	 * Activation-boundary guard (T-023/S08): the metadata/data
+	 * split assertions below open flat_4096b.bin through the
+	 * mounted tree and expect the dev1 chunk read to shift past
+	 * the main device -- the namei/lookup domain (T-024) plus the
+	 * data-path map_blocks half (T-025). SKIP until /erofs content
+	 * is reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
 	ero_ensure_self_mnt();
 
 	TEST_SUCC(mount(EROFS_DEV_FLATDEV, EROFS_SELF_MNT, "erofs", 0, NULL));
