@@ -497,9 +497,10 @@ pub(super) struct SuperBlock {
     /// `sb_size()`. The V7 upper-bound door is mount-time (T-023).
     pub(super) sb_extslots: u8,
     /// The nid of the root directory inode (host order).
-    // First consumer: the root-inode read of the mount-time assembly
-    // (`fs.rs`, T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S04: `Erofs::root_inode` (`fs.rs`) reads it —
+    // `iget(ErofsNid::from(sb.root_nid))`, the le16 zero-extended
+    // with no range check (Linux has none). The bridging `expect`
+    // was removed when the first consumer landed.
     pub(super) root_nid: u16,
     /// The total number of valid inodes (host order).
     // First consumer: statfs `f_files` (T-023).
@@ -526,9 +527,10 @@ pub(super) struct SuperBlock {
     // removed when the first consumer landed.
     pub(super) blocks: u32,
     /// The start block address of the metadata area (host order).
-    // First consumer: the inode metadata space location (T-023/T-024;
-    // the iloc formula consumes the mirror field).
-    #[expect(dead_code)]
+    // Live since T-023 S04: the iloc formula of `Erofs::iget`
+    // (`fs.rs`) consumes the mirror field
+    // (`(meta_blkaddr << blkszbits) + (nid << ISLOT_BITS)`). The
+    // bridging `expect` was removed when the first consumer landed.
     pub(super) meta_blkaddr: u32,
     /// The start block address of the shared xattr area (host order).
     // First consumer: the shared-xattr walk (`xattr.rs`, T-026).

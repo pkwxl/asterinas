@@ -33,7 +33,12 @@ impl FileSystem for Erofs {
     }
 
     fn root_inode(&self) -> Arc<dyn Inode> {
-        self.root_inode()
+        // Structurally unreachable failure (the ext2 precedent,
+        // `ext2/impl_for_vfs/fs.rs:35-37`): the mount-time F11 read
+        // validated the root and inserted it into the inode cache,
+        // which only grows and holds strong references, so this
+        // iget is always a cache hit for as long as the mount lives.
+        self.root_inode().unwrap()
     }
 
     fn sb(&self) -> SuperBlock {

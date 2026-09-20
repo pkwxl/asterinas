@@ -7,7 +7,8 @@
 //! identified by nid — erofs has no block groups, so inode numbers are
 //! linear and the FS-level cache in `fs.rs` is keyed by nid directly.
 //!
-//! Bring-up state (T-022 S05–S08): the decode half is complete —
+//! Bring-up state (T-022 S05–S08 + T-023 S04): the decode half is
+//! complete —
 //! the two raw inode records (`RawInodeCompact` 32B /
 //! `RawInodeExtended` 64B, sharing the discriminating prefix at
 //! offsets 0/2/4/16), the chunk-domain records (`RawInodeChunkInfo`,
@@ -22,13 +23,13 @@
 //! I7/I8/I10 guards and the G-Z02 dual-caliber `nr_sectors`
 //! accounting, the two ID4 `i_u` accessors, and the decode entry
 //! `read_inode_desc` — the five-step sequence from the 2-byte
-//! pre-read through the `TryFrom`, with the iloc computation and the
-//! iget cache left to the T-024 assembly. The `Inode` handle shell
-//! below
-//! — still the minimal shell required by the `FileSystem` trait
-//! surface — stays interim until T-024 (the nid, descriptor, and
-//! payload fields land then; payload shapes remain deliberately not
-//! pre-declared).
+//! pre-read through the `TryFrom`; its step 1 (the iloc formula) and
+//! the nid-keyed iget cache live in `Erofs::iget` (`fs.rs`, landed
+//! with T-023 S04). The `Inode` handle below carries the nid and the
+//! decoded descriptor since T-023 (transitional form: honest type
+//! face through `desc.kind`; the metadata assembly stays interim);
+//! the payload faces (PageCache/Pipe/device numbers) land with
+//! T-024 and remain deliberately not pre-declared here.
 //!
 //! # Submodules
 //!
@@ -72,40 +73,69 @@ pub(super) type ErofsNid = u64;
 
 /// An in-memory erofs inode.
 ///
-/// Interim placeholder (T-021 skeleton): the real handle additionally
-/// carries the nid, the decoded descriptor, and the type-specific
-/// payload; those shapes land with T-022/T-024. What is already final
-/// here is the weak back-pointer discipline: `self_ref` is the only
-/// link back to the filesystem handle (strong reference cycles are
-/// forbidden family-wide) and the upgrade path carries an `EIO` guard.
+/// Transitional form (T-023): carries the nid and the decoded
+/// descriptor — the single data source of the type face and of the
+/// compressed-data judgement — plus the weak back-pointer and the
+/// VFS extension slot. The payload field (per-kind PageCache/Pipe/
+/// device faces) lands with T-024. What is already final here is the
+/// weak back-pointer discipline: `self_ref` is the only link back to
+/// the filesystem handle (strong reference cycles are forbidden
+/// family-wide) and the upgrade path carries an `EIO` guard.
 pub struct Inode {
-    type_: InodeType,
+    nid: ErofsNid,
+    desc: InodeDesc,
     self_ref: Weak<Erofs>,
     extension: Extension,
 }
 
 impl Inode {
-    /// Constructs the placeholder root-directory inode handed out by
-    /// the interim `Erofs::root_inode`.
-    pub(super) fn placeholder_dir(self_ref: Weak<Erofs>) -> Self {
+    /// Constructs the inode handle (transitional T-023 form): the
+    /// nid, the decoded descriptor, and the weak filesystem
+    /// back-pointer. The sole constructor — every `Inode` comes from
+    /// the slow path of `Erofs::iget` (`fs.rs`). T-024 extends the
+    /// same construction point with the payload assembly (per-kind
+    /// PageCache/Pipe/device faces) and the I12 arm-first gate.
+    pub(super) fn new(nid: ErofsNid, desc: InodeDesc, self_ref: Weak<Erofs>) -> Self {
         Self {
-            type_: InodeType::Dir,
+            nid,
+            desc,
             self_ref,
             extension: Extension::new(),
         }
     }
 
-    /// Returns the inode number (nid).
-    ///
-    /// Placeholder: always 0 until the nid field lands with the T-024
-    /// assembly.
+    /// Returns the inode number (nid) — the linear on-disk inode
+    /// identifier as resolved by `Erofs::iget` (st_ino derives from
+    /// it, X2; the on-disk `i_ino` compat field is never consumed).
     pub(super) fn ino(&self) -> ErofsNid {
-        0
+        self.nid
     }
 
-    /// Returns the inode type.
+    /// Returns the inode type, derived from the decoded descriptor
+    /// (`desc.kind` is the single data source — the handle keeps no
+    /// separate type field and one judgement path).
+    ///
+    /// Honest minimal face (T-023): the seven-kind mapping below is
+    /// the full bijection onto the framework `InodeType`. The
+    /// `Other` arm is structurally unreachable — the I8 guard
+    /// rejects it with `EUCLEAN` before a descriptor escapes the
+    /// decode — and exists only to keep the match exhaustive. The
+    /// formal `From<FileKind> for InodeType` face and the metadata
+    /// payload land with T-024.
     pub(super) fn type_(&self) -> InodeType {
-        self.type_
+        match self.desc.kind {
+            FileKind::Reg => InodeType::File,
+            FileKind::Dir => InodeType::Dir,
+            FileKind::Lnk => InodeType::SymLink,
+            FileKind::Chr => InodeType::CharDevice,
+            FileKind::Blk => InodeType::BlockDevice,
+            FileKind::Fifo => InodeType::NamedPipe,
+            FileKind::Sock => InodeType::Socket,
+            // Unreachable: the I8 guard ("bogus i_mode", EUCLEAN)
+            // rejects the Other kind at the decode, so a runtime
+            // descriptor never carries it.
+            FileKind::Other(_) => unreachable!("I8 rejects the Other kind at decode"),
+        }
     }
 
     /// Returns a reference to the owning `Erofs` filesystem.
@@ -514,10 +544,9 @@ pub(super) const BLOCK_MAP_ENTRY_SIZE: usize = 4;
 /// (T-001 §4.1). Derived from the structure size — same-sourced with
 /// the layout assertions above (C5) — and never written as the
 /// literal 5.
-// First consumer: the inode metadata-space location formula
-// `meta_blkaddr << blkszbits + nid << ISLOT_BITS` (T-024 — the iloc
-// computation is the assembly side's step 1).
-#[expect(dead_code)]
+// Live since T-023 S04: consumed by the iloc formula of `Erofs::iget`
+// (`fs.rs`) — the assembly-side step 1 of the five-step decode. The
+// bridging `expect` was removed when the first consumer landed.
 pub(super) const ISLOT_BITS: u32 = size_of::<RawInodeCompact>().ilog2();
 
 // ---------------------------------------------------------------------------
@@ -809,10 +838,10 @@ pub(super) struct InodeDesc {
     /// The data layout — the entry's one-shot discrimination product,
     /// flowing in as a conversion parameter (I3/I4 are never
     /// re-judged here).
-    // First readers: the path dispatch and the three-way compressed
-    // predicate of the handle (T-024); the layer-3 site joins in
-    // T-025 through `DataLayout::is_compressed`.
-    #[expect(dead_code)]
+    // Live since T-023 S04: read by the layer-3 predicate
+    // `is_data_compressed` below (an expect-carrying item is a
+    // dead-code-analysis root, so its reads count); the path dispatch
+    // of the handle joins with T-024.
     pub(super) datalayout: DataLayout,
     /// Runtime invariant: never `Other` — the I8 guard rejects at
     /// construction, so `Other` exists only on the guard-carrying
@@ -942,6 +971,26 @@ impl InodeDesc {
         let major = (v & 0xfff00) >> 8;
         let minor = (v & 0xff) | ((v >> 12) & 0xfff00);
         DeviceId::new(MajorId::new(major as u16), MinorId::new(minor))
+    }
+
+    /// I12 predicate — rejection-chain layer 3 (G-M15): whether this
+    /// inode carries compressed data whose consumers are shelved under
+    /// scope decision AR-S01-5. Mirrors `erofs_fill_inode`: REG/DIR/LNK
+    /// flow into the a_ops assignment and a compressed datalayout fails
+    /// iget with EOPNOTSUPP under the non-ZIP build, while special
+    /// files (CHR/BLK/FIFO/SOCK) return early and stay exempt. The
+    /// runtime half of this rejection is lazy (map_blocks, T-014);
+    /// this predicate is the single judgement source for both.
+    // First consumers: the F10/F11 mount-time site gates of
+    // `Erofs::open` (T-023 S05, reached through the `Inode`
+    // forwarder that lands with them — the forwarding face must not
+    // rewrite the criteria, single-source contract); later the I12
+    // assembly arm-first gate (T-024) and the map_blocks defensive
+    // half (T-014).
+    #[expect(dead_code)]
+    pub(super) fn is_data_compressed(&self) -> bool {
+        self.datalayout.is_compressed() // T-011 ID2: ⟺ ∈ {1, 3}
+            && matches!(self.kind, FileKind::Reg | FileKind::Dir | FileKind::Lnk)
     }
 }
 
@@ -1288,16 +1337,21 @@ impl TryFrom<(&RawInodeExtended, DataLayout, &SuperBlock)> for InodeDesc {
 ///
 /// Step 1 — the iloc location
 /// `(meta_blkaddr << blkszbits) + (nid << ISLOT_BITS)` — and the
-/// iget cache belong to the T-024 assembly; this entry starts from
-/// the already-computed byte offset. No decoder-side caching (RD3):
-/// every call reads the device directly, so repeat reads of one nid
-/// are the iget caller's business.
+/// iget cache live in `Erofs::iget` (`fs.rs`, landed with T-023
+/// S04); this entry starts from the already-computed byte offset.
+/// No decoder-side caching (RD3): every call reads the device
+/// directly, so repeat reads of one nid are the iget caller's
+/// business.
 // I6 (kmalloc ENOMEM) unreachable: no heap allocation on this path (F4/G-M21)
 //
-// First consumer: the iget assembly (`Inode::new`, T-024), which also
-// computes the `iloc` argument (step 1).
-#[expect(dead_code)]
-fn read_inode_desc(device: &dyn BlockDevice, sb: &SuperBlock, iloc: usize) -> Result<InodeDesc> {
+// Live since T-023 S04: called by `Erofs::iget` (`fs.rs`), which
+// computes the `iloc` argument (step 1 of the five-step sequence).
+// The bridging `expect` was removed when the first consumer landed.
+pub(super) fn read_inode_desc(
+    device: &dyn BlockDevice,
+    sb: &SuperBlock,
+    iloc: usize,
+) -> Result<InodeDesc> {
     // Step 2: the 2-byte pre-read of `i_format` — an I2 read error
     // propagates before any guard runs (the source's first metabuf
     // read, inode.c:45-50, holds the same position).

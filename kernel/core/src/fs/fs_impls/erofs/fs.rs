@@ -9,12 +9,16 @@
 //! root inode -> construct the handle via `Arc::new_cyclic`) is owned
 //! by `Erofs::open` and lands stepwise with T-023: option parsing (the
 //! first step) is in force and fails malformed data strings with the
-//! parser's `EINVAL` surface, and the superblock half has landed below
+//! parser's `EINVAL` surface, the superblock half has landed below
 //! (`read_superblock`: the V1–V10 validation order whose tail step
-//! `scan_devices` produces the immutable `DeviceTable`), in wait of
-//! its only caller — the assembly step of `open` — while every mount
-//! that survives parsing is still rejected with `EOPNOTSUPP` (a clear
-//! error, no panic, no swallowing) until the remaining steps land.
+//! `scan_devices` produces the immutable `DeviceTable`), and the inode
+//! half has landed too (`iget`: the double-checked nid cache whose
+//! slow path runs the iloc formula and the decode entry, with
+//! `root_inode` in its final shape resolving through it) — all in
+//! wait of their only caller, the assembly step of `open`, while
+//! every mount that survives parsing is still rejected with
+//! `EOPNOTSUPP` (a clear error, no panic, no swallowing) until the
+//! remaining steps land.
 //!
 //! Erofs is strictly read-only: there is no write path, no dirty
 //! tracking, and no block allocation anywhere below this handle, so the
@@ -42,7 +46,7 @@ use device_id::DeviceId;
 use ostd::mm::VmIo;
 
 use super::{
-    inode::Inode,
+    inode::{ISLOT_BITS, Inode, read_inode_desc},
     prelude::*,
     super_block::{
         BLKSZBITS_MAX, BLKSZBITS_MIN, DEVT_SLOT_SIZE, FeatureCompatSet, FeatureIncompatSet,
@@ -62,7 +66,10 @@ pub struct Erofs {
     /// Backing block device.
     block_device: Arc<dyn BlockDevice>,
     /// Decoded and validated superblock (immutable after `open`).
-    #[expect(dead_code)]
+    // Live since T-023 S04: read by `Erofs::root_inode` (root_nid) and
+    // `Erofs::iget` (meta_blkaddr/blkszbits of the iloc formula),
+    // both live through the `FileSystem` trait face. The bridging
+    // `expect` was removed when the first consumer landed.
     super_block: SuperBlock,
     /// Parsed mount options (immutable after `open`).
     #[expect(dead_code)]
@@ -72,7 +79,9 @@ pub struct Erofs {
     /// FS event stats for VFS.
     fs_event_subscriber_stats: FsEventSubscriberStats,
     /// FS-level inode cache: nid -> inode identity anchor.
-    #[expect(dead_code)]
+    // Live since T-023 S04: probed and filled by `Erofs::iget`, live
+    // through the `FileSystem` trait face. The bridging `expect` was
+    // removed when the first consumer landed.
     inode_cache: RwMutex<BTreeMap<ErofsNid, Arc<Inode>>>,
     /// Weak self reference handed out to inodes.
     self_ref: Weak<Erofs>,
@@ -272,8 +281,9 @@ impl Erofs {
     /// on-disk structure is read — is in force, so a malformed data
     /// string fails fast with the parser's `EINVAL` surface. The body
     /// of step 2 — `read_superblock` below, the V1–V10 validation
-    /// order including the device scan — has landed; wiring it here,
-    /// then reading the root inode and constructing the handle via
+    /// order including the device scan — has landed, as has the
+    /// root-inode half (`iget` and the final `root_inode` below);
+    /// wiring them here, together with the handle construction via
     /// `Arc::new_cyclic`, lands with the remaining steps of T-023;
     /// until then every mount that survives parsing is rejected with
     /// a clear `EOPNOTSUPP` ("capability deferred"), deliberately
@@ -299,10 +309,11 @@ impl Erofs {
         // EINVAL regardless of the image content.
         let _mount_options = ErofsMountOptions::parse(data)?;
         // Steps 2.. — `read_superblock` below (V1–V10 incl. the
-        // device scan) has landed and is wired in by the assembly
-        // subtask of this task, together with the handle construction
-        // and the packed/root inode reads; `device` and `flags` are
-        // only consumed by those steps.
+        // device scan) and the inode half (`iget`, final
+        // `root_inode`) have landed and are wired in by the assembly
+        // subtask of this task, together with the handle
+        // construction and the packed/root iget call sites;
+        // `device` and `flags` are only consumed by those steps.
         let _ = (device, flags);
         return_errno_with_message!(
             Errno::EOPNOTSUPP,
@@ -325,17 +336,95 @@ impl Erofs {
         &self.fs_event_subscriber_stats
     }
 
+    /// Looks up an inode by nid through the FS-level inode cache,
+    /// constructing it on a miss — the iget parity (`erofs_iget`),
+    /// with the cache contract of the inode-domain design
+    /// (`docs/T-013/analysis.md` §1.2).
+    ///
+    /// Cache shape: strong `Arc` values, no eviction, insert only on
+    /// success — one nid resolves to one inode identity for the
+    /// lifetime of the mount, and a failed construction leaves no
+    /// entry, so every error replays on each call (no negative
+    /// cache). Double-checked locking (the family template of
+    /// `ext2/block_group.rs`): the fast path probes under a read
+    /// lock; on a miss the slow path revalidates under the write
+    /// lock, decodes the inode — reading metadata blocks inside the
+    /// critical section is allowed — and inserts before releasing
+    /// the guard.
+    ///
+    /// Minimal body (the T-023/T-024 split): the iloc formula, the
+    /// decode call, and the transitional handle wrap; the payload
+    /// face (PageCache/Pipe/device numbers) and the I12 arm-first
+    /// gate land with T-024, upgrading the constructor without
+    /// touching this locking skeleton.
+    ///
+    /// Error face — mount-time callers forward it with `?`
+    /// unchanged, no message added here: I2 device reads pass
+    /// through, I3/I4/I10 report `EOPNOTSUPP`, I7/I8 report
+    /// `EUCLEAN`. No nid range pre-check (Linux has none; a
+    /// past-the-volume nid surfaces as the I2 device error).
+    ///
+    /// G-M21: no ENOMEM arm (the cache-node allocation aborts in
+    /// this tree, never an errno). Locking (R1): the critical
+    /// section consumes the block device, the superblock mirror,
+    /// and a weak-self clone only — the mount-options lock is never
+    /// taken here.
+    pub(super) fn iget(&self, nid: ErofsNid) -> Result<Arc<Inode>> {
+        // Fast path: cache hit under read lock.
+        if let Some(inode) = self.inode_cache.read().get(&nid) {
+            return Ok(inode.clone());
+        }
+
+        // Slow path: revalidate under the write lock — another
+        // thread may have inserted the inode between the read and
+        // write lock acquisition.
+        let mut inode_cache = self.inode_cache.write();
+        if let Some(inode) = inode_cache.get(&nid) {
+            return Ok(inode.clone());
+        }
+
+        // Step 1 of the five-step decode — the iloc location
+        // `(meta_blkaddr << blkszbits) + (nid << ISLOT_BITS)`, the
+        // addition wrapping like the C unsigned arithmetic: a
+        // crafted garbage packed_nid wraps into a bogus offset whose
+        // read then fails, which is how "garbage packed_nid must
+        // fail the mount" is honored (no checked_add, no self-made
+        // EOVERFLOW; the F10 passthrough contract).
+        let iloc = ((u64::from(self.super_block.meta_blkaddr)
+            << u32::from(self.super_block.blkszbits))
+            .wrapping_add(nid << ISLOT_BITS)) as usize;
+        // Steps 2–5: the decode entry (I2 passthrough; I3/I4/I10
+        // EOPNOTSUPP; I7/I8 EUCLEAN — `?` forwards them all).
+        //
+        // (G-M10 family read point: an inode-record interval
+        // extending past the device end fails with EINVAL from the
+        // device stack where Linux fails the metabuf read with EIO —
+        // the same registered-drift family as the V5 read; see the
+        // G-M10 note at the checksum arm in read_superblock.)
+        let desc = read_inode_desc(&self.block_device, &self.super_block, iloc)?;
+        // The transitional handle (T-023): nid + descriptor + weak
+        // back-pointer; the payload face lands with T-024. Only the
+        // successful construction above reaches the insert — every
+        // failure returned early and left no entry.
+        let inode = Arc::new(Inode::new(nid, desc, self.self_ref.clone()));
+        inode_cache.insert(nid, inode.clone());
+        Ok(inode)
+    }
+
     /// Returns the root inode.
     ///
-    /// Interim shape (T-021 skeleton): the real lookup — decode the
-    /// root nid from the superblock and resolve it through
-    /// `inode_cache` so a single nid always maps to a single inode
-    /// identity — lands with the T-023 assembly sequence. Since `open`
-    /// rejects every mount for now, this path is unreachable; it
-    /// returns a placeholder directory inode so the `FileSystem`
-    /// trait surface stays total.
-    pub(super) fn root_inode(&self) -> Arc<Inode> {
-        Arc::new(Inode::placeholder_dir(self.self_ref.clone()))
+    /// Final shape: identity resolves through the inode cache —
+    /// `iget(root_nid)` hits the entry the mount-time F11 read
+    /// inserted, and the cache only grows, so every call returns
+    /// the same `Arc<Inode>` (no resident root field: the F10–F12
+    /// mount doors plus the cache are the single source of root
+    /// identity and validity). The root nid is zero-extended from
+    /// the le16 mirror with no range check (see `iget`). The family
+    /// face stays fallible; the `FileSystem` trait face unwraps on
+    /// the structural-unreachability argument (the mount validated
+    /// the root and the strong cache pins it — the ext2 precedent).
+    pub(super) fn root_inode(&self) -> Result<Arc<Inode>> {
+        self.iget(ErofsNid::from(self.super_block.root_nid))
     }
 }
 
