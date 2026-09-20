@@ -77,8 +77,13 @@ use crate::vm::page_cache::BlockAsPageCacheBackend;
 /// `compressed` boolean; the map_blocks dispatcher (S03) keys on
 /// exactly that pair and debug-asserts the validity domain (an
 /// API-misuse face, not an on-disk check).
+///
+/// Declared at erofs scope (`pub(in crate::fs::fs_impls::erofs)`,
+/// the `DataBackend` form below): the ktest fixture face of these
+/// names goes through the `inode/mod.rs` re-export, and a re-export
+/// may not raise the item's own visibility (E0365).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct DataGeometry {
+pub(in crate::fs::fs_impls::erofs) struct DataGeometry {
     /// i_size (I7: <= 2^63-1; compact <= 2^32-1).
     pub size: u64,
     /// sb.blkszbits (== 12 under the G-M08 mount gate; kept
@@ -109,8 +114,9 @@ pub(super) struct DataGeometry {
 }
 
 /// The CHUNK_BASED geometry (the decoded chunk summary, T-011 §5.2).
+/// Erofs-scoped like `DataGeometry` above (the same re-export seam).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ChunkGeometry {
+pub(in crate::fs::fs_impls::erofs) struct ChunkGeometry {
     /// The extent-area element width: 8 (chunk indexes, the INDEXES
     /// bit) or 4 (the bare block-map entry) — the
     /// `AddrState::chunk_unit()` value evaluated in mod.rs.

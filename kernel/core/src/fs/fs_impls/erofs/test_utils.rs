@@ -59,10 +59,7 @@ use aster_block::{
 };
 use device_id::{DeviceId, MajorId, MinorId};
 use io_util::batch::IoBatch;
-use ostd::{
-    mm::{FrameAllocOptions, HasSize, PAGE_SIZE, Segment, VmIo, io::util::HasVmReaderWriter},
-    sync::SpinLock,
-};
+use ostd::mm::{FrameAllocOptions, HasSize, PAGE_SIZE, Segment, VmIo, io::util::HasVmReaderWriter};
 
 use super::{
     Erofs,
@@ -119,8 +116,10 @@ impl BlockDevice for ErofsNullDevice {
 /// assertions — byte-vs-block channel discrimination reads the
 /// recorded granularity and count (a byte-channel bounce bio carries
 /// sub-block geometry; a direct `read_blocks_async` bio is
-/// whole-block aligned).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// whole-block aligned). No `Eq` derive: the upstream `BioType`
+/// does not implement it, and the log assertions compare through
+/// `PartialEq` alone.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct BioRequest {
     pub type_: BioType,
     pub start_sector: u64,
@@ -504,7 +503,9 @@ mod tests {
     /// the byte channel (`VmIo for dyn BlockDevice`), aligned and
     /// unaligned — byte-exact both ways, `read_val` included. Every
     /// bounce bio lands in the request log with the sector-rounded
-    /// geometry of its range.
+    /// geometry of its range. The two stages spell both forms of the
+    /// staging face: the `stage_bytes` convenience and the raw
+    /// `segment()` accessor.
     #[ktest]
     fn memory_disk_byte_channel_roundtrip() {
         let disk = Arc::new(ErofsMemoryDisk::new(3 * PAGE_SIZE));
@@ -514,7 +515,9 @@ mod tests {
             *b = pattern(i);
         }
         disk.stage_bytes(0, &staged);
-        disk.stage_bytes(PAGE_SIZE + 100, &staged[..300]);
+        disk.segment()
+            .write_bytes(PAGE_SIZE + 100, &staged[..300])
+            .unwrap();
 
         let dev: Arc<dyn BlockDevice> = disk.clone();
         // An aligned whole page.
