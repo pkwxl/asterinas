@@ -32,6 +32,14 @@
  * baseline inline (marked "登记差异"). Never adjust an expected value
  * to match observed behavior -- go back to the matrix instead.
  *
+ * Two first-ATTACH errata are recorded inline (T-024/S06), both
+ * premise corrections at the framework / on-disk level with the erofs
+ * side proven correct (not observed-behavior masking): the G-N03 LNK
+ * O_NOFOLLOW observation reads ELOOP (the framework front rejects
+ * before the fs open; ENODEV stays anchored by the SOCK half), and
+ * cross-image stx_ino is dropped from the bit0 face (mkfs nid
+ * numbering is format-dependent; dump.erofs evidence inline).
+ *
  * statx call form = raw syscall(SYS_statx) + <linux/stat.h> UAPI, along
  * the in-tree precedent fs/statx/btime.c (this host's glibc ships no
  * struct statx wrapper at all).
@@ -142,11 +150,18 @@ static const struct ero_type_row {
  * are not expected to agree across the two images; three-time identity
  * is asserted per image instead. stx_dev differs (distinct bdevs) and
  * the framework-owned result mask / attributes_mask are not fs faces.
+ * stx_ino is also excluded (T-024/S06 first-ATTACH erratum): the nid
+ * numbering is an mkfs on-disk artifact that differs between the two
+ * format images (dump.erofs: /dirs/small nid 13770 @ extended C1 vs
+ * 115 @ compact C2), and st_ino = nid on Linux too, so it is not a
+ * format-invariant face; the ino face stays covered within one image
+ * (dirent nid <-> stat ino, see namei_dot_dotdot_stat_ino) and nonzero
+ * (inode_stat_mode_uid_gid_diversity).
  */
 struct ero_face {
 	unsigned int mode, nlink, uid, gid;
 	unsigned int blksize, rdev_major, rdev_minor;
-	unsigned long long size, ino, blocks, attributes;
+	unsigned long long size, blocks, attributes;
 };
 
 static void ero_snap_face(const struct statx *stx, struct ero_face *f)
@@ -159,7 +174,6 @@ static void ero_snap_face(const struct statx *stx, struct ero_face *f)
 	f->rdev_major = stx->stx_rdev_major;
 	f->rdev_minor = stx->stx_rdev_minor;
 	f->size = stx->stx_size;
-	f->ino = stx->stx_ino;
 	f->blocks = stx->stx_blocks;
 	f->attributes = stx->stx_attributes;
 }
@@ -183,8 +197,6 @@ static const char *ero_face_diff(const struct ero_face *a,
 		return "stx_rdev_minor";
 	if (a->size != b->size)
 		return "stx_size";
-	if (a->ino != b->ino)
-		return "stx_ino";
 	if (a->blocks != b->blocks)
 		return "stx_blocks";
 	if (a->attributes != b->attributes)
@@ -543,13 +555,16 @@ FN_TEST(inode_stat_open_lnk_sock_enodev)
 			    O_PATH | O_NOFOLLOW));
 	TEST_SUCC(close(fd));
 	/*
-	 * G-N03 LNK 半边(AR-7 候选①覆写 open,冻结 = ENODEV,None
-	 * 路径 errno 核验注记随行): Linux 基线对 O_NOFOLLOW 落在
-	 * symlink 上的形态为 ELOOP。
+	 * G-N03 LNK 半边观测面勘误(T-024/S06 首次 ATTACH 实跑裁定):
+	 * 非撤销 O_NOFOLLOW 落在 symlink 上时,框架前量
+	 * (fs/vfs/path/mod.rs,Linux 对等语义)先以 ELOOP 拒绝,fs 级
+	 * open 的 ENODEV(G-N03 臂表;观测锚 = SOCK 半边)在此用户态
+	 * 路线不可达。冻结期望 ENODEV → ELOOP(None 路径 errno 核验
+	 * 注记随行撤销)。
 	 */
 	TEST_ERRNO(open(EROFS_INIT_MNT "/symlink/to_file_short",
 			O_RDONLY | O_NOFOLLOW),
-		   ENODEV);
+		   ELOOP);
 }
 END_TEST()
 
@@ -558,10 +573,12 @@ END_TEST()
  * extended field face): the same tree entries stats identically
  * through /erofs (x7/C2, uniform-compact) and a self-mounted x5/C1
  * (uniform-extended). Carriers are swapped relative to the original
- * S05 wording; the assertion values do not change. Timestamps are
- * excluded from the face (see ero_face_compare); three-time identity
- * holds on each image separately (spot-checked here on the extended
- * half).
+ * S05 wording; the assertion values do not change. Timestamps and
+ * stx_ino are excluded from the face (see ero_face_compare; stx_ino
+ * exclusion = T-024/S06 erratum, nid numbering is an mkfs on-disk
+ * artifact that differs across the two format images); three-time
+ * identity holds on each image separately (spot-checked here on the
+ * extended half).
  */
 FN_TEST(inode_stat_bit0_compact_extended_face)
 {
