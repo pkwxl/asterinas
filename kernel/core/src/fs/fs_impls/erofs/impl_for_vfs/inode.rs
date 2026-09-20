@@ -81,10 +81,15 @@ impl Inode for ErofsInode {
         // Interim shape: the metadata assembly reads the descriptor
         // with T-024; until then this reports an empty read-only
         // directory owned by root (ino/type_ are already real — they
-        // derive from the transitional handle). Erofs records no
-        // birth time on disk, so `birth_at: None` is final.
+        // derive from the handle through `kind()` and the
+        // `From<FileKind>` bijection). Erofs records no birth time
+        // on disk, so `birth_at: None` is final.
         let fs = self.fs()?;
-        let nr_hard_links = if self.type_() == InodeType::Dir { 2 } else { 1 };
+        let nr_hard_links = if InodeType::from(self.kind()) == InodeType::Dir {
+            2
+        } else {
+            1
+        };
         Ok(Metadata {
             ino: self.ino(),
             size: 0,
@@ -93,7 +98,7 @@ impl Inode for ErofsInode {
             last_access_at: Duration::ZERO,
             last_modify_at: Duration::ZERO,
             last_meta_change_at: Duration::ZERO,
-            type_: self.type_(),
+            type_: InodeType::from(self.kind()),
             mode: InodeMode::from_bits_truncate(0o555),
             nr_hard_links,
             uid: Uid::new_root(),
@@ -109,7 +114,11 @@ impl Inode for ErofsInode {
     }
 
     fn type_(&self) -> InodeType {
-        self.type_()
+        // The typed kind face: single source = the handle's
+        // `kind()` plus the `From<FileKind> for InodeType`
+        // bijection (S03-D3; the S05 dispatch rewrite forwards
+        // through the metadata assembly instead).
+        InodeType::from(self.kind())
     }
 
     fn mode(&self) -> Result<InodeMode> {

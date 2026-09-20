@@ -48,7 +48,7 @@ use device_id::DeviceId;
 use ostd::mm::VmIo;
 
 use super::{
-    inode::{ISLOT_BITS, Inode, read_inode_desc},
+    inode::Inode,
     prelude::*,
     super_block::{
         BLKSZBITS_MAX, BLKSZBITS_MIN, DEVT_SLOT_SIZE, FeatureCompatSet, FeatureIncompatSet,
@@ -600,6 +600,34 @@ impl Erofs {
         &self.fs_event_subscriber_stats
     }
 
+    /// Returns the backing block device handle (immutable after
+    /// `open`).
+    ///
+    /// Read-side accessor for the inode family: the decode entry
+    /// (`read_inode_desc`, inode/mod.rs) and the minimal data backend
+    /// (inode/data.rs) read through it. Returns the `Arc` itself so
+    /// backend construction can clone the handle.
+    pub(super) fn block_device(&self) -> &Arc<dyn BlockDevice> {
+        &self.block_device
+    }
+
+    /// Returns the decoded superblock mirror (immutable after
+    /// `open`).
+    ///
+    /// Read-side accessor for the inode family: the base-point
+    /// formula family (`inode_location` and friends) and the
+    /// block-size geometry derive from it.
+    pub(super) fn super_block(&self) -> &SuperBlock {
+        &self.super_block
+    }
+
+    /// Returns the weak self reference handed out to inodes and data
+    /// backends (the strong-reference-cycle prohibition, see
+    /// `# Locking`).
+    pub(super) fn self_ref(&self) -> &Weak<Erofs> {
+        &self.self_ref
+    }
+
     /// Looks up an inode by nid through the FS-level inode cache,
     /// constructing it on a miss — the iget parity (`erofs_iget`),
     /// with the cache contract of the inode-domain design
@@ -616,17 +644,23 @@ impl Erofs {
     /// critical section is allowed — and inserts before releasing
     /// the guard.
     ///
-    /// Minimal body (the T-023/T-024 split): the iloc formula, the
-    /// decode call, and the transitional handle wrap; the payload
-    /// face (PageCache/Pipe/device numbers) and the I12 arm-first
-    /// gate land with T-024, upgrading the constructor without
-    /// touching this locking skeleton.
+    /// The construction chain lives in `Inode::new` (inode/mod.rs,
+    /// T-024 final shape): the five-step decode (step 1, the iloc
+    /// formula, migrated there as `inode_location`) plus the payload
+    /// assembly and the `Arc` wrap. This function body stays
+    /// gate-free (C-2): the I12 arm-head gate sits inside
+    /// `InodePayload::new` — the Linux shape, where `iget5_locked`
+    /// carries no check and `erofs_fill_inode` rejects — so the two
+    /// cache paths above perform zero checks (G4 hit-never-refills)
+    /// and this locking skeleton is untouched since T-023.
     ///
-    /// Error face — mount-time callers forward it with `?`
-    /// unchanged, no message added here: I2 device reads pass
-    /// through, I3/I4/I10 report `EOPNOTSUPP`, I7/I8 report
-    /// `EUCLEAN`. No nid range pre-check (Linux has none; a
-    /// past-the-volume nid surfaces as the I2 device error).
+    /// Error face — forwarded with `?` unchanged, no message added
+    /// here: I2 device reads pass through, I3/I4/I10 report
+    /// `EOPNOTSUPP`, I7/I8 report `EUCLEAN`, and I12 (the assembly
+    /// gate) reports `EOPNOTSUPP`; mount-time callers (F10/F11) and
+    /// runtime callers (lookup tails) get the same face — iget does
+    /// not distinguish callers. No nid range pre-check (Linux has
+    /// none; a past-the-volume nid surfaces as the I2 device error).
     ///
     /// G-M21: no ENOMEM arm (the cache-node allocation aborts in
     /// this tree, never an errno). Locking (R1): the critical
@@ -647,30 +681,12 @@ impl Erofs {
             return Ok(inode.clone());
         }
 
-        // Step 1 of the five-step decode — the iloc location
-        // `(meta_blkaddr << blkszbits) + (nid << ISLOT_BITS)`, the
-        // addition wrapping like the C unsigned arithmetic: a
-        // crafted garbage packed_nid wraps into a bogus offset whose
-        // read then fails, which is how "garbage packed_nid must
-        // fail the mount" is honored (no checked_add, no self-made
-        // EOVERFLOW; the F10 passthrough contract).
-        let iloc = ((u64::from(self.super_block.meta_blkaddr)
-            << u32::from(self.super_block.blkszbits))
-        .wrapping_add(nid << ISLOT_BITS)) as usize;
-        // Steps 2–5: the decode entry (I2 passthrough; I3/I4/I10
-        // EOPNOTSUPP; I7/I8 EUCLEAN — `?` forwards them all).
-        //
-        // (G-M10 family read point: an inode-record interval
-        // extending past the device end fails with EINVAL from the
-        // device stack where Linux fails the metabuf read with EIO —
-        // the same registered-drift family as the V5 read; see the
-        // G-M10 note at the checksum arm in read_superblock.)
-        let desc = read_inode_desc(&*self.block_device, &self.super_block, iloc)?;
-        // The transitional handle (T-023): nid + descriptor + weak
-        // back-pointer; the payload face lands with T-024. Only the
-        // successful construction above reaches the insert — every
-        // failure returned early and left no entry.
-        let inode = Arc::new(Inode::new(nid, desc, self.self_ref.clone()));
+        // The construction chain (S01-D7: inside the critical
+        // section — decode + payload assembly + Arc wrap all run in
+        // `Inode::new`). Only the successful construction reaches
+        // the insert below; every failure returned early and left
+        // no entry (G5 — the error replays on the next call).
+        let inode = Inode::new(self, nid)?;
         inode_cache.insert(nid, inode.clone());
         Ok(inode)
     }
