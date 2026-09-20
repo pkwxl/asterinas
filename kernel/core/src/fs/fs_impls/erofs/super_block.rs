@@ -272,20 +272,26 @@ const_assert!(offset_of!(RawSuperBlock, reserved2) == 105); // erofs_fs.h:86
 /// linux/fs/erofs/erofs_fs.h:46-52; field semantics single-sourced in
 /// `docs/T-001/analysis.md` §3.4).
 ///
-/// Archive-A registration: the multi-device scan is pruned (G-M14), so
-/// this structure never enters a read path yet and derives no `Pod`.
-/// Revival comes with the multi-device domain, which takes over the
-/// device-table locating formula (`devt_slotoff × DEVT_SLOT_SIZE`), the
-/// empty-tag door (super.c:171-175, "empty device tag" → EINVAL), the
-/// per-device block accounting, and the `mapped_blkaddr` consumption
-/// (T-025 data path); deriving `Pod` and wiring `read_val` happen then.
-/// No mirror structure is built now — nothing consumes one.
+/// Pod revival (T-023, archive A / AR-S01-4 F): the flatdev half of
+/// the device scan landed and reads slots one by one with `read_val`
+/// at `devt_slotoff × DEVT_SLOT_SIZE + i × 128` (the locating formula
+/// this structure was registered for), so it enters a read path and
+/// derives `Pod` per the A3 rule — repr(C) size 128 / align 4, four
+/// fields explicitly filling the layout with no padding. The flatdev
+/// guards skip tag handling and device opening (super.c:171-205 are
+/// guarded by `!flatdev`): the tag is neither read nor validated
+/// (MD4), and blocks/mapped_blkaddr are taken as-is (MD13). Still no
+/// mirror structure: the flatdev projection (`DeviceSlot` in `fs.rs`)
+/// copies the two consumed fields out at the read site, where the
+/// single `from_le` of each also lives (E1 read-site conversion, new
+/// with T-023).
 // No deadness attribute (and never an `#[allow]`: the workspace bans
 // allow attributes, clippy::allow_attributes, T-010 §3.3): like
 // `RawSuperBlock` above, the type is kept live in every cfg by the
 // permanent `const_assert!` anchors below, so an `expect(dead_code)`
 // would only be reported unfulfilled.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawDeviceSlot {
     /// The device tag (sha256 digest / backend id / doubling as a
     /// path).
@@ -300,12 +306,11 @@ pub(super) struct RawDeviceSlot {
 
 /// The size of one device table slot (`EROFS_DEVT_SLOT_SIZE` =
 /// `sizeof(struct erofs_deviceslot)`, erofs_fs.h:52).
-// Registered constant: consumed by the device-table locating formula
-// when the multi-device domain revives (G-M14); `size_of` keeps it
-// same-sourced with the layout assertions below (C5). `#[expect]`
-// rather than the sketch's `#[allow]` for the same reason as on
-// `RawDeviceSlot`.
-#[expect(dead_code)]
+// Live since T-023 S02: the flatdev slot loop of `scan_devices`
+// (`fs.rs`) steps through the slot area in units of this constant —
+// the device-table locating formula it was registered for; `size_of`
+// keeps it same-sourced with the layout assertions below (C5). The
+// bridging `expect` was removed when the first consumer landed.
 pub(super) const DEVT_SLOT_SIZE: usize = size_of::<RawDeviceSlot>(); // = 128
 
 // Layout triple and per-field offsets (A1), anchored to
@@ -469,8 +474,12 @@ pub(super) struct SuperBlock {
     // the first consumer landed.
     pub(super) build_time: Duration,
     /// The total number of blocks (host order), the statfs basis.
-    // First consumer: statfs/total_blocks geometry (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S02: `scan_devices` (`fs.rs`) seeds its u64
+    // `total_blocks` accumulator from this mirror field
+    // (`u64::from(sb.blocks)`, the primary-device block count); the
+    // statfs face consumes that sum through `DeviceTable::
+    // total_blocks()` (single source). The bridging `expect` was
+    // removed when the first consumer landed.
     pub(super) blocks: u32,
     /// The start block address of the metadata area (host order).
     // First consumer: the inode metadata space location (T-023/T-024;
@@ -506,17 +515,22 @@ pub(super) struct SuperBlock {
     #[expect(dead_code)]
     pub(super) u1: u16,
     /// The number of devices besides the primary device (host order).
-    // First consumer: the DEVICE_TABLE face of the mount-time
-    // sequence (T-023; the multi-device scan itself stays pruned,
-    // G-M14).
-    #[expect(dead_code)]
+    // Live since T-023 S02: the V10 device scan (`scan_devices`,
+    // `fs.rs`) reads this mirror field as the on-disk count (`ondisk`,
+    // gated by DEVICE_TABLE) for the count check and the flatdev slot
+    // loop. The bridging `expect` was removed when the first consumer
+    // landed.
     pub(super) extra_devices: u16,
     /// The device table start offset, in `DEVT_SLOT_SIZE` units (host
-    /// order). Cut-domain field (SB5): the multi-device scan stays
-    /// pruned under archive A (G-M14), so nothing reads this offset
-    /// until that domain revives and takes over the device-table
-    /// locating formula and the empty-tag door.
-    #[expect(dead_code)]
+    /// order). Cut-domain registration (SB5) superseded: the flatdev
+    /// half of the device scan landed with T-023 (archive A,
+    /// AR-S01-4 F) and consumes this offset through the device-table
+    /// locating formula (`devt_slotoff × DEVT_SLOT_SIZE`); the
+    /// empty-tag door (super.c:171-175) stays unreachable — flatdev
+    /// never validates tags (MD4).
+    // Live since T-023 S02: `scan_devices` (`fs.rs`) computes the slot
+    // area base from this mirror field. The bridging `expect` was
+    // removed when the first consumer landed.
     pub(super) devt_slotoff: u16,
     /// The directory block size in bit shift; non-zero is a
     /// mount-time error (T-023).
@@ -631,9 +645,12 @@ impl SuperBlock {
     /// `from_bits_truncate` — meaningful only behind the unknown-bit
     /// door, which the mount-time sequence must run first (T-023):
     /// after that door, truncation loses nothing.
-    // First consumers: the DEVICE_TABLE/COMPR_CFGS/ZTAILPACKING bit
-    // judgements of the mount-time sequence (T-023).
-    #[expect(dead_code)]
+    // Live since T-023 S02: `scan_devices` (`fs.rs`) gates the on-disk
+    // extra-device count on `DEVICE_TABLE` through this accessor; the
+    // remaining mount-time bit judgements (the unknown-bit door,
+    // COMPR_CFGS, ZTAILPACKING) join with the read_superblock step.
+    // The bridging `expect` was removed when the first consumer
+    // landed.
     pub(super) fn feature_incompat(&self) -> FeatureIncompatSet {
         FeatureIncompatSet::from_bits_truncate(self.feature_incompat)
     }
