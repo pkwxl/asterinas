@@ -716,7 +716,7 @@ impl BlockAsPageCacheBackend for DataBackend {
                 // catch). The segment construction, completion
                 // closure, and page-lock release are the blanket
                 // mechanism's — erofs is a pure consumer.
-                debug_assert!(data_pa % BLOCK_SIZE as u64 == 0);
+                debug_assert!(data_pa.is_multiple_of(BLOCK_SIZE as u64));
                 self.device.read_blocks_async(
                     Bid::from_offset(data_pa as usize),
                     bio_segment,
@@ -1488,7 +1488,12 @@ mod tests {
         let fs = ktest_fs_on(disk, ktest_super_block(12, 0), ktest_single_device_table());
         let geom = ktest_flat_geometry(size, raw, tail_inline, inline_data_start);
         let npages = size.div_ceil(PAGE_SIZE as u64) as usize;
-        DataBackend::new(fs.self_ref().clone(), fs.block_device().clone(), geom, npages)
+        DataBackend::new(
+            fs.self_ref().clone(),
+            fs.block_device().clone(),
+            geom,
+            npages,
+        )
     }
 
     /// Reads a one-page segment back into bytes.
@@ -1516,7 +1521,12 @@ mod tests {
         for (n, idx) in [0usize, 2].into_iter().enumerate() {
             let (segment, mut io_batch, completions) = ktest_bio_trio();
             backend
-                .submit_read_bio(idx, segment.clone(), completions.complete_fn(), &mut io_batch)
+                .submit_read_bio(
+                    idx,
+                    segment.clone(),
+                    completions.complete_fn(),
+                    &mut io_batch,
+                )
                 .unwrap();
             io_batch.wait_all().unwrap();
             assert_eq!(completions.nr_completions(), 1, "idx={idx}");
@@ -1631,7 +1641,9 @@ mod tests {
     #[ktest]
     fn submit_read_bio_inline_meta_arm() {
         let disk = Arc::new(ErofsMemoryDisk::new(3 * PAGE_SIZE));
-        let payload: Vec<u8> = (0..100u8).map(|i| i.wrapping_mul(3).wrapping_add(11)).collect();
+        let payload: Vec<u8> = (0..100u8)
+            .map(|i| i.wrapping_mul(3).wrapping_add(11))
+            .collect();
         let ids = 2 * PAGE_SIZE + 2000;
         disk.stage_bytes(ids, &payload);
         // size = 3*PAGE + 100 → lastblk = 3, the tail page idx = 3;
