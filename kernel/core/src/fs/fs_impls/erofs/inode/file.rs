@@ -208,7 +208,7 @@ impl Inode {
 #[cfg(ktest)]
 mod tests {
     use aster_block::bio::BioType;
-    use ostd::mm::io::Fallible;
+    use ostd::{mm::io::Fallible, prelude::*};
 
     use super::{
         super::{
@@ -217,6 +217,7 @@ mod tests {
         *,
     };
     use crate::fs::fs_impls::erofs::{
+        Erofs,
         fs::DeviceTable,
         test_utils::{
             BioRequest, ErofsMemoryDisk, ktest_flatdev_table, ktest_fs_on,
@@ -250,12 +251,12 @@ mod tests {
     /// `InodePayload::new`, so the backend and page-cache wiring is
     /// the real chain `read_direct_at` walks. Construction itself
     /// performs zero device I/O (the geometry collapse is pure).
-    fn ktest_reg_inode(
-        disk: Arc<ErofsMemoryDisk>,
-        table: DeviceTable,
-        knobs: RegKnobs,
-    ) -> Arc<Inode> {
-        let fs = ktest_fs_on(disk, ktest_super_block(12, knobs.meta_blkaddr), table);
+    /// The caller-owned-fs form: the backend keeps only a weak fs
+    /// handle, so flatdev/chunk-index walks (map_dev with a nonzero
+    /// device id, index-table re-reads) need the `Erofs` alive for
+    /// as long as the inode reads — hold this `fs` binding in the
+    /// test scope (the S04 suite's posture).
+    fn ktest_reg_inode_on(fs: &Erofs, knobs: RegKnobs) -> Arc<Inode> {
         let desc = InodeDesc {
             version: InodeVersion::Compact,
             datalayout: knobs.datalayout,
@@ -271,7 +272,19 @@ mod tests {
             addr_state: knobs.addr_state,
             nr_sectors: 0,
         };
-        ktest_inode_from_desc(&fs, 64, desc)
+        ktest_inode_from_desc(fs, 64, desc)
+    }
+
+    /// The self-contained form for layouts whose walk never upgrades
+    /// the weak fs handle (flat single-device: map_dev's id-0 arm);
+    /// the short-lived `fs` inside is sound for those.
+    fn ktest_reg_inode(
+        disk: Arc<ErofsMemoryDisk>,
+        table: DeviceTable,
+        knobs: RegKnobs,
+    ) -> Arc<Inode> {
+        let fs = ktest_fs_on(disk, ktest_super_block(12, knobs.meta_blkaddr), table);
+        ktest_reg_inode_on(&fs, knobs)
     }
 
     /// A flat REG fixture with the common knobs pre-filled
@@ -336,7 +349,7 @@ mod tests {
         assert!(misalign < SECTOR_SIZE);
         let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
         let mut pad = (SECTOR_SIZE - (writer.cursor().addr() % SECTOR_SIZE)) % SECTOR_SIZE;
-        if misalign == 0 && (writer.cursor().addr() + pad) % PAGE_SIZE == 0 {
+        if misalign == 0 && (writer.cursor().addr() + pad).is_multiple_of(PAGE_SIZE) {
             pad += SECTOR_SIZE;
         }
         pad += misalign;
@@ -370,7 +383,7 @@ mod tests {
             "fixture: the control buffer is 512-aligned"
         );
         assert_eq!(inode.read_direct_at(512, &mut writer).unwrap(), 1024);
-        drop(writer);
+
         for i in 0..1024 {
             assert_eq!(buf[pad + i], pattern(PAGE_SIZE + 512 + i), "byte {i}");
         }
@@ -440,7 +453,7 @@ mod tests {
         assert_eq!(addr % SECTOR_SIZE, 0, "512-aligned");
         assert_ne!(addr % PAGE_SIZE, 0, "yet off the 4K grid (the #6 form)");
         assert_eq!(inode.read_direct_at(512, &mut writer).unwrap(), SECTOR_SIZE);
-        drop(writer);
+
         for i in 0..SECTOR_SIZE {
             assert_eq!(buf[pad + i], pattern(PAGE_SIZE + 512 + i), "byte {i}");
         }
@@ -505,7 +518,7 @@ mod tests {
             300,
             "truncated to size − offset"
         );
-        drop(writer);
+
         for i in 0..300 {
             assert_eq!(buf[pad + i], pattern(2 * PAGE_SIZE + i), "byte {i}");
         }
@@ -560,7 +573,9 @@ mod tests {
 
         // The INLINE tail: 100 payload bytes staged in the metadata
         // area (ids = 14368, blkoff 2080 — a legal same-block
-        // geometry), read directly by the flagged pread.
+        // geometry), read directly by the flagged pread. The buffer
+        // is reused from the control read — re-zeroed so the bytes
+        // past the 100-byte window can only come from this read.
         let payload: Vec<u8> = (0..100u8)
             .map(|i| i.wrapping_mul(5).wrapping_add(3))
             .collect();
@@ -572,9 +587,10 @@ mod tests {
             0,
             1,
         );
+        buf.fill(0);
         let (mut writer, pad) = ktest_dio_writer(&mut buf, 0, SECTOR_SIZE);
         assert_eq!(inode.read_direct_at(PAGE_SIZE, &mut writer).unwrap(), 100);
-        drop(writer);
+
         assert_eq!(&buf[pad..pad + 100], &payload[..], "the inline payload");
         assert!(buf[pad + 100..pad + SECTOR_SIZE].iter().all(|&b| b == 0));
         // Second request: the tail bounce over [14368, 14468) —
@@ -616,7 +632,7 @@ mod tests {
         let mut buf = vec![0u8; 4 * PAGE_SIZE];
         let (mut writer, pad) = ktest_dio_writer(&mut buf, 0, 3 * PAGE_SIZE);
         assert_eq!(inode.read_direct_at(0, &mut writer).unwrap(), 3 * PAGE_SIZE);
-        drop(writer);
+
         for i in 0..3 * PAGE_SIZE {
             assert_eq!(buf[pad + i], pattern(PAGE_SIZE + i), "FLAT_PLAIN byte {i}");
         }
@@ -630,9 +646,13 @@ mod tests {
         );
 
         // FLAT_INLINE: 2 flat blocks + a 512-byte inline tail (ids =
-        // 14368, blkoff 2080; 2080 + 512 <= 4096 — legal).
-        let payload: Vec<u8> = (0..512u8)
-            .map(|i| i.wrapping_mul(7).wrapping_add(1))
+        // 14368, blkoff 2080; 2080 + 512 <= 4096 — legal). A fresh
+        // disk, so the request log below carries this state's
+        // traffic alone (the CHUNK_BASED state re-stages likewise).
+        let disk = Arc::new(ErofsMemoryDisk::new(4 * PAGE_SIZE));
+        stage_pattern(&disk, PAGE_SIZE, 2 * PAGE_SIZE);
+        let payload: Vec<u8> = (0..512)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(1))
             .collect();
         disk.stage_bytes(ktest_ids(3, 0) as usize, &payload);
         let inode = ktest_flat_reg(
@@ -647,7 +667,7 @@ mod tests {
             inode.read_direct_at(0, &mut writer).unwrap(),
             2 * PAGE_SIZE + 512
         );
-        drop(writer);
+
         for i in 0..2 * PAGE_SIZE {
             assert_eq!(
                 buf[pad + i],
@@ -689,9 +709,13 @@ mod tests {
         stage_index(&disk, table, 0, 1);
         stage_index(&disk, table + 8, 0, NULL_ADDR);
         stage_index(&disk, table + 16, 0, 4);
-        let inode = ktest_reg_inode(
+        let fs = ktest_fs_on(
             disk.clone(),
+            ktest_super_block(12, 3),
             ktest_single_device_table(),
+        );
+        let inode = ktest_reg_inode_on(
+            &fs,
             RegKnobs {
                 meta_blkaddr: 3,
                 datalayout: DataLayout::ChunkBased,
@@ -707,7 +731,7 @@ mod tests {
         let mut buf = vec![0u8; 7 * PAGE_SIZE];
         let (mut writer, pad) = ktest_dio_writer(&mut buf, 0, 3 * 8192);
         assert_eq!(inode.read_direct_at(0, &mut writer).unwrap(), 3 * 8192);
-        drop(writer);
+
         for i in 0..8192 {
             assert_eq!(buf[pad + i], pattern(PAGE_SIZE + i), "chunk 0 byte {i}");
         }
@@ -861,9 +885,13 @@ mod tests {
         let table = ktest_ids(3, 0) as usize; // 14368, 8-aligned
         stage_index(&disk, table, 1, 2);
         stage_index(&disk, table + 8, 1, 3);
-        let inode = ktest_reg_inode(
+        let fs = ktest_fs_on(
             disk.clone(),
+            ktest_super_block(12, 3),
             ktest_flatdev_table(&[(10, 2)], 1),
+        );
+        let inode = ktest_reg_inode_on(
+            &fs,
             RegKnobs {
                 meta_blkaddr: 3,
                 datalayout: DataLayout::ChunkBased,
@@ -879,7 +907,7 @@ mod tests {
         let mut buf = vec![0u8; 6 * PAGE_SIZE];
         let (mut writer, pad) = ktest_dio_writer(&mut buf, 0, 2 * 8192);
         assert_eq!(inode.read_direct_at(0, &mut writer).unwrap(), 2 * 8192);
-        drop(writer);
+
         for i in 0..8192 {
             assert_eq!(
                 buf[pad + i],
@@ -923,9 +951,13 @@ mod tests {
         // the table inside the one-page disk.
         let disk = Arc::new(ErofsMemoryDisk::new(PAGE_SIZE));
         stage_index(&disk, ktest_ids(0, 0) as usize, 3, 5);
-        let inode = ktest_reg_inode(
+        let fs = ktest_fs_on(
             disk.clone(),
+            ktest_super_block(12, 0),
             ktest_flatdev_table(&[(10, 100), (20, 200)], 3),
+        );
+        let inode = ktest_reg_inode_on(
+            &fs,
             RegKnobs {
                 meta_blkaddr: 0,
                 datalayout: DataLayout::ChunkBased,
