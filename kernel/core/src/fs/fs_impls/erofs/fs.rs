@@ -497,11 +497,6 @@ impl Erofs {
         Ok(())
     }
 
-    /// Returns the device ID of the underlying block device.
-    pub(super) fn container_device_id(&self) -> DeviceId {
-        self.block_device.id()
-    }
-
     /// Read-side snapshot of the per-fs flags (ext2 fs.rs:212-215
     /// shape). RDONLY is permanently present: set by the open
     /// constructor (F1) and re-forced by every remount (RM13, S07).
