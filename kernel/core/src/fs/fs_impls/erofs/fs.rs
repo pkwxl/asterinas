@@ -374,7 +374,10 @@ impl Erofs {
         // there is deliberately NO "packed inode must be compressed"
         // cross-check; dual-malformed images (plain packed inode) keep
         // mounting (matrix §5.1 row 6).
-        if erofs.super_block.feature_incompat().contains(FeatureIncompatSet::FRAGMENTS)
+        if erofs
+            .super_block
+            .feature_incompat()
+            .contains(FeatureIncompatSet::FRAGMENTS)
             && erofs.super_block.packed_nid != 0
         {
             let packed = erofs.iget(erofs.super_block.packed_nid)?;
@@ -393,10 +396,7 @@ impl Erofs {
         // assertion surface (matrix §2.2 G-M15 row).
         let root = erofs.iget(ErofsNid::from(erofs.super_block.root_nid))?;
         if root.is_data_compressed() {
-            return_errno_with_message!(
-                Errno::EOPNOTSUPP,
-                "compressed inode data is not supported"
-            );
+            return_errno_with_message!(Errno::EOPNOTSUPP, "compressed inode data is not supported");
         }
         if !root.is_dir() {
             return_errno_with_message!(Errno::EINVAL, "root inode is not a directory");
