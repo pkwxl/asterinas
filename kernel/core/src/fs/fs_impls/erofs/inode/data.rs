@@ -212,8 +212,10 @@ impl BlockAsPageCacheBackend for DataBackend {
                     // bounce buffer keeps the beyond-tail bytes of
                     // the page reading as zeros.
                     let mut page_bytes = [0u8; PAGE_SIZE];
+                    // I2 passthrough: the device errno travels
+                    // unfolded to the page-cache exit.
                     self.device
-                        .read_bytes(tail.start as usize, &mut page_bytes[..tail.len])?; // I2, unfolded
+                        .read_bytes(tail.start as usize, &mut page_bytes[..tail.len])?;
                     bio_segment
                         .inner_dma_slice()
                         .writer()?
