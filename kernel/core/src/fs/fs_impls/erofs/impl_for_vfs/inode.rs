@@ -9,7 +9,12 @@
 //! — a one-line forward into an inherent method (possibly with a
 //! view conversion), a single-line descriptor-field getter, or a
 //! write-face minimal body. No logic lives here; the bodies are
-//! hosted by the `inode/` submodules and cited per member.
+//! hosted by the `inode/` submodules and cited per member. The one
+//! conditional landed with T-025 S07: `read_at` dispatches on the
+//! direct-I/O status flag before forwarding (F7) — a flag-based
+//! choice between two one-line forwards, still "dispatch only"
+//! (ext2 `impl_for_vfs/inode.rs:35-47` the exact precedent), and
+//! the SINGLE place in erofs that reads the flag.
 //!
 //! Same-name pairs (`metadata`/`lookup`/`open`/`read_link`/
 //! `page_cache`/`fs`) resolve to the TYPED INHERENT faces through
@@ -66,9 +71,25 @@ impl FileOps for ErofsInode {
         writer: &mut VmWriter,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        // file.rs: EISDIR guard first, zero-length early exit, then
-        // the T-025 data body.
-        self.read_at(offset, writer, status_flags)
+        // F7: THE direct-I/O dispatch point — the only line in erofs
+        // that reads the flag (it is visible at this layer alone;
+        // pushing it into the inherent faces would sink a VFS
+        // per-open concept into the FS family). A missing dispatch
+        // would silently degrade flagged preads into buffered reads
+        // (the S10-4 hidden-drift trap), so the single grep hit is
+        // the mechanical defense. Both arms begin with the same
+        // EISDIR guard (file.rs), so directory fds read EISDIR
+        // either way.
+        if status_flags.contains(StatusFlags::O_DIRECT) {
+            // file.rs read_direct_at: EISDIR, zero-length early out,
+            // the G-P01 512-byte three-factor gate, then the Y3
+            // no-fallback extent walk.
+            self.read_direct_at(offset, writer)
+        } else {
+            // file.rs read_at: EISDIR guard first, zero-length early
+            // exit, then the buffered body (the S08 collection).
+            self.read_at(offset, writer)
+        }
     }
 
     fn write_at(

@@ -67,9 +67,12 @@
 //! non-compressed data path: the mapping layer and the page-cache
 //! bridge in `inode/data.rs` are final since its S05 slice — every
 //! DataBacked page fill (buffered reads, mmap faults, readdir, slow
-//! symlinks) goes through the four-arm backend — while the buffered
-//! `read_at` collection and the O_DIRECT dispatch are the remaining
-//! slices.
+//! symlinks) goes through the four-arm backend — and the direct-I/O
+//! read path (the flag dispatch in `impl_for_vfs` plus
+//! `read_direct_at` in `inode/file.rs`) since S07: DIO reads walk
+//! the extents straight through the device byte channel and never
+//! touch the page cache. The buffered `read_at` collection is the
+//! remaining slice.
 //!
 //! # References
 //!

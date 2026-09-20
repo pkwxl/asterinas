@@ -294,9 +294,9 @@ impl Inode {
     }
 
     /// Data-mapping backend handle (DataBacked only).
-    // First consumer: the final data-path face (T-025) — the
-    // minimal backend is consumed through the page cache meanwhile.
-    #[expect(dead_code)]
+    // Live since T-025 S07: the DIO read path (file.rs
+    // `read_direct_at`) consumes the backend through this face; the
+    // buffered face joins with the S08 collection.
     pub(super) fn data_backend(&self) -> Option<&Arc<DataBackend>> {
         match &self.payload {
             InodePayload::DataBacked { backend, .. } => Some(backend),

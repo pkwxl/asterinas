@@ -203,9 +203,14 @@ pub(in crate::fs::fs_impls::erofs) struct DataBackend {
     // Live since T-025 S03: `upgrade_fs` reads it on every nonzero-id
     // map_dev walk, and since S04 on every chunk-8B mask fetch too.
     fs: Weak<Erofs>,
-    /// The backing device: whole-page block BIOs and sub-page
-    /// byte-channel fills both go through it.
-    device: Arc<dyn BlockDevice>,
+    /// The backing device: whole-page block BIOs (the page-cache
+    /// bridge), sub-page byte-channel fills (`fill_page_prefix`),
+    /// and the one-hop DIO data reads (file.rs `read_direct_at`)
+    /// all go through it.
+    // `pub(super)` since T-025 S07 (S07-D4): the DIO data arm in
+    // inode/file.rs is the one outside consumer — a getter would
+    // wrap a plain field read with no invariant to keep.
+    pub(super) device: Arc<dyn BlockDevice>,
     /// The per-inode geometry bundle, collapsed from the decoded
     /// descriptor by `data_geometry` (L3) into plain values.
     geom: DataGeometry,
