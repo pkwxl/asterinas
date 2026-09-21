@@ -545,7 +545,7 @@ impl<'a> IbodyEntryWalk<'a> {
     /// S07). The gate also decides the inline entry-area start:
     /// `suffix_xattr_start + header_sz` (read point #12's inline
     /// start, via the base-point family — no recomputation here).
-    fn new(fs: &Erofs, nid: ErofsNid, desc: &InodeDesc, state: &InodeXattrState) -> Self {
+    fn new(fs: &'a Erofs, nid: ErofsNid, desc: &InodeDesc, state: &InodeXattrState) -> Self {
         let header_sz = size_of::<RawXattrIbodyHeader>() + 4 * state.shared_ids.len();
         let suffix = suffix_xattr_start(fs.super_block(), nid, desc);
         if header_sz >= desc.xattr_isize {
