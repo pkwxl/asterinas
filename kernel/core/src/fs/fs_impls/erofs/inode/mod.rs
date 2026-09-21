@@ -171,9 +171,10 @@ pub(in crate::fs::fs_impls::erofs) struct InodeXattrState {
     /// The shared-xattr id array, read once at the lazy init (one
     /// bare `u32` per `h_shared_count`); `len()` IS the C
     /// `xattr_shared_count` (S01-D3: no separate count field).
-    // First reader: the shared-entry walk (T-026 S03). Transitional
-    // expect — remove when that reader lands.
-    #[expect(dead_code)]
+    // Live since T-026 S02: the X23 header-size gate of the ibody
+    // walk reads `len()` (the cached-count single source, xattr.c
+    // :322-323 — no header re-read); the value iteration joins with
+    // the shared-entry walk (T-026 S03).
     pub(in crate::fs::fs_impls::erofs) shared_ids: Vec<u32>,
 }
 
