@@ -39,8 +39,9 @@
 //! context — never from interrupt handlers or page-cache completion
 //! callbacks. Mount-option gates read `mount_options` under a short
 //! read guard at their chain position (ahead of the cell access on
-//! both the get and acl chains) and release it before the cell is
-//! touched, so no lock is ever held across `try_call_once` and no
+//! the get and acl chains; per-entry inside the list foreach, after
+//! the cell access) and release it immediately — the guards are
+//! leaves, so no lock is ever held across `try_call_once` and no
 //! lock is ever nested here.
 
 // AUTO-TODO(G-M17): Linux installs an sb->s_xattr handler list at mount
@@ -170,18 +171,16 @@ const XATTR_INDEX_USER: u8 = 1; // erofs_fs.h:212
 
 /// Name index of the access-ACL pseudo-name
 /// (`EROFS_XATTR_INDEX_POSIX_ACL_ACCESS`, erofs_fs.h:213).
-// First consumer: the list base-prefix row 2 (T-026 S07); the ACL
-// exact-name match (S08) joins later. Transitional expect — remove
-// when the first consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S07: consumed by the list base-prefix row 2
+// below (the ACL exact-name match joins at S08). The bridging
+// `expect` was removed when the first consumer landed.
 const XATTR_INDEX_POSIX_ACL_ACCESS: u8 = 2; // erofs_fs.h:213
 
 /// Name index of the default-ACL pseudo-name
 /// (`EROFS_XATTR_INDEX_POSIX_ACL_DEFAULT`, erofs_fs.h:214).
-// First consumer: the list base-prefix row 3 (T-026 S07); the ACL
-// exact-name match (S08) joins later. Transitional expect — remove
-// when the first consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S07: consumed by the list base-prefix row 3
+// below (the ACL exact-name match joins at S08). The bridging
+// `expect` was removed when the first consumer landed.
 const XATTR_INDEX_POSIX_ACL_DEFAULT: u8 = 3; // erofs_fs.h:214
 
 /// Name index of `trusted.*` attributes (`EROFS_XATTR_INDEX_TRUSTED`,
@@ -341,11 +340,12 @@ impl Inode {
     /// unreachable under the strong inode cache — the same guard as
     /// `Inode::fs`).
     // Live since T-026 S06: consumed by the get entry chain below
-    // (the list/acl chains join at S07/S08). The dead-code-analysis
-    // root is now the get entry itself (transitional expect until
-    // the S09 trait forward lands); the cell field read and the init
-    // function stay live through that root. The bridging `expect`
-    // was removed when the first consumer landed.
+    // and, since S07, the list entry chain (the acl chain joins at
+    // S08). The dead-code-analysis roots are the get and list
+    // entries themselves (transitional expects until the S09 trait
+    // forwards land); the cell field read and the init function
+    // stay live through those roots. The bridging `expect` was
+    // removed when the first consumer landed.
     pub(in crate::fs::fs_impls::erofs) fn xattr_state(&self) -> Result<&InodeXattrState> {
         let fs = self.fs()?;
         let (nid, desc) = (self.ino(), self.desc());
@@ -469,17 +469,18 @@ pub(super) struct XattrEntryAt {
     e_name_len: u8,
     /// `e_name_index`: bit 7 (`0x80`) is the long-prefix flag, the
     /// low 7 bits the prefix-table/short-prefix index.
-    // Live since T-026 S06: read by `entry_matches` below (the list
-    // matching joins at S07). The bridging `expect` was removed when
-    // the first reader landed.
+    // Live since T-026 S06: read by `entry_matches` below and, since
+    // S07, the list long-prefix test. The bridging `expect` was
+    // removed when the first reader landed.
     e_name_index: u8,
     /// `e_value_size`, already from_le'd (XA0 walk-point decode).
     e_value_size: u16,
 }
 
 // Live since T-026 S06: the accessors and `entry_size` are consumed
-// by the get chain bodies below (the list chain joins at S07). The
-// bridging `expect` was removed when those consumers landed.
+// by the get chain bodies below and, since S07, the list foreach
+// body. The bridging `expect` was removed when those consumers
+// landed.
 impl XattrEntryAt {
     /// The entry's on-disk total size — `erofs_xattr_entry_size`
     /// (erofs_fs.h:254-260): header + name + value, rounded up to
@@ -535,8 +536,8 @@ struct IbodyEntryWalk<'a> {
 }
 
 // Live since T-026 S06: constructed and driven by the get entry
-// chain below (the list chain joins at S07). The bridging `expect`
-// was removed when those consumers landed.
+// chain below and, since S07, the list entry chain. The bridging
+// `expect` was removed when those consumers landed.
 impl<'a> IbodyEntryWalk<'a> {
     /// Construction IS the X23 gate (xattr.c:322-327):
     /// `header_sz = size_of::<RawXattrIbodyHeader>() + 4 ×
@@ -653,8 +654,8 @@ struct SharedEntryWalk<'a> {
 }
 
 // Live since T-026 S06: constructed and driven by the get entry
-// chain below (the list chain joins at S07). The bridging `expect`
-// was removed when those consumers landed.
+// chain below and, since S07, the list entry chain. The bridging
+// `expect` was removed when those consumers landed.
 impl<'a> SharedEntryWalk<'a> {
     /// Pure-arithmetic construction: zero I/O, zero error face, zero
     /// validation — no `xattr_blkaddr` value-domain check either
@@ -810,18 +811,18 @@ pub(in crate::fs::fs_impls::erofs) struct XattrPrefixItem {
     /// The short-prefix index byte, kept exactly as on disk — no
     /// value-domain check: a malformed base_index simply never matches
     /// on the get side and is skipped on the list side (S05 §1.4).
-    // Live since T-026 S06: read by `entry_matches` below (the list
-    // base-row gate joins at S07). The bridging `expect` was removed
+    // Live since T-026 S06: read by `entry_matches` below and, since
+    // S07, the list base-row gate. The bridging `expect` was removed
     // when the first consumer landed.
     pub(in crate::fs::fs_impls::erofs) base_index: u8,
     /// The infix bytes following the base index (record length − 1),
     /// kept verbatim — may be non-UTF-8 and may contain NUL; the list
     /// path concatenates them as raw bytes (S05 §1.4; the W-X06 output
     /// half never narrows through &str).
-    // Live since T-026 S06: read by `entry_matches` below (the list
-    // concatenation joins at S07 — raw bytes, never narrowed through
-    // &str). The bridging `expect` was removed when the first
-    // consumer landed.
+    // Live since T-026 S06: read by `entry_matches` below and, since
+    // S07, the list name assembly — both raw-byte faces, never
+    // narrowed through &str. The bridging `expect` was removed when
+    // the first consumer landed.
     pub(in crate::fs::fs_impls::erofs) infix: Vec<u8>,
 }
 
@@ -1042,9 +1043,9 @@ impl Erofs {
     /// `None` is decided solely by the bounds. The get side treats
     /// `None` as a non-match and iterates on; the list side skips the
     /// entry — the two consumer faces (S05 §2.5).
-    // Live since T-026 S06: consumed by `entry_matches` below (the
-    // list matching joins at S07). Through the get chain's
-    // dead-code root, the `XATTR_LONG_PREFIX_MASK` consumption and
+    // Live since T-026 S06: consumed by `entry_matches` below and,
+    // since S07, the list foreach body. Through the get/list chains'
+    // dead-code roots, the `XATTR_LONG_PREFIX_MASK` consumption and
     // the item construction face stay live. The bridging `expect`
     // was removed when the first consumer landed.
     pub(in crate::fs::fs_impls::erofs) fn long_prefix(
@@ -1351,5 +1352,308 @@ impl Inode {
         _writer: &mut VmWriter<'_>,
     ) -> Result<usize> {
         return_errno_with_message!(Errno::EOPNOTSUPP, "system xattr: acl channel pending")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The list entry chain (T-026 S07; `docs/T-015/S07/index.md` §2.1–§2.6 —
+// the `erofs_listxattr` counterpart, xattr.c:428-455, plus the list
+// foreach consumer of both storage walks, xattr.c:200-249). The entry is
+// an inherent method on `Inode`; the trait override in `impl_for_vfs`
+// joins as the one-line forward at T-026 S09 (gate position: every gate
+// lives in this body — `impl_for_vfs` stays dispatch-only). Structurally
+// free of any bloom reference (the get/list asymmetry, S04 §2.5): the
+// caller set of `xattr_filter_denies` stays exactly one — the get chain
+// above; same image, same name, get may be denied while list still
+// emits it.
+// ---------------------------------------------------------------------------
+
+/// Base-row visibility gate + output prefix — the single-source Rust
+/// counterpart of `erofs_xattr_prefix` (xattr.h:21-45) combined with
+/// `xattr_handler_can_list` (include/linux/xattr.h:60-64:
+/// `handler && (!handler->list || handler->list(dentry))`).
+///
+/// Evaluated per entry (the C `.list` callbacks are per-entry too);
+/// mount options are read under a short guard each call — a live
+/// remount change takes effect on the next syscall (O4). The
+/// concurrent-remount torn-list corner (early entries visible, late
+/// ones skipped) exists in C in the same position (`test_opt` is an
+/// unlocked per-entry read); both sides are isomorphic, no assertion.
+///
+/// Returns `None` → skip silently: no error, and the entry is NOT
+/// counted in the total (C `prefix == NULL → return 0`, xattr.c:226).
+///
+/// The full visibility matrix factorizes over three independent
+/// inputs — the caller's cap state (carried by `namespace`, W-X02
+/// state B), `user_xattr`, and `posix_acl` (S07 §2.1's 8-combination
+/// exhaustive table): user rows read `user_xattr` only, the acl rows
+/// read `posix_acl` only, the trusted row reads the cap signal only,
+/// security is always visible, dead indexes never — disjoint
+/// predicates, so the factorization IS the exhaustion. Consequence
+/// (X34): the size=0 total varies with the visible set — root and
+/// non-root answer different totals on the same inode (the trusted
+/// row modulates it).
+fn list_base_prefix(
+    fs: &Erofs,
+    namespace: XattrNamespace,
+    base_index: u8,
+) -> Option<&'static [u8]> {
+    match base_index {
+        XATTR_INDEX_USER => {
+            // X4 (xattr.c:126-129): nouser_xattr → skip. NOTE: the get
+            // side rejects the same option with EOPNOTSUPP (X3, the
+            // get chain ⑩) — one option, two manifestations on the
+            // two halves; the two must not be conflated (XAT-33④).
+            fs.mount_options.read().user_xattr().then_some(b"user.")
+        }
+        XATTR_INDEX_POSIX_ACL_ACCESS => {
+            // X43's list half: noacl → SKIP (the get half answers
+            // EOPNOTSUPP — again one option, two codes, XAT-33②).
+            // The row's output segment is the FULL access-acl name —
+            // F17: no trailing dot (the nop acl handlers carry
+            // `.name`, not `.prefix`; the ext2 trailing-dot form is
+            // the B4 drift cell #3).
+            fs.mount_options
+                .read()
+                .posix_acl()
+                .then_some(b"system.posix_acl_access")
+        }
+        XATTR_INDEX_POSIX_ACL_DEFAULT => {
+            // Rows 2/3 share the gate predicate (IS_POSIXACL ←
+            // SB_POSIXACL ← the parsed `acl`/`noacl` option) and
+            // differ only in the emitted full name.
+            fs.mount_options
+                .read()
+                .posix_acl()
+                .then_some(b"system.posix_acl_default")
+        }
+        XATTR_INDEX_TRUSTED => {
+            // X5 (xattr.c:131-134): per-entry capable(CAP_SYS_ADMIN) —
+            // carried by the `namespace` parameter here (W-X02 state
+            // B: a capability signal, NOT a filter; see the entry doc
+            // below). C evaluates the creds per entry; they cannot
+            // change inside one syscall call, so the signal-carrying
+            // form is equivalent.
+            (namespace == XattrNamespace::Trusted).then_some(b"trusted.")
+        }
+        XATTR_INDEX_SECURITY => {
+            // F7: the security handler has no `.list` callback, so
+            // `xattr_handler_can_list` short-circuits true — always
+            // listable, parameter- and option-independent.
+            Some(b"security.")
+        }
+        // X10: 0 / 5 (the empty lustre slot) / >=7 (outside the
+        // 7-entry handler map) — never listable, regardless of caller
+        // or options; C's `idx && idx < ARRAY_SIZE(handlers)` gate
+        // dissolves structurally in the match skeleton. A dead index
+        // is a SKIP, never an error (the ext2 all-branch lustre
+        // revival is drift cell #2).
+        _ => None,
+    }
+}
+
+/// Per-call list state (call-scoped; never cached across calls).
+///
+/// S07-D2 (G-X10/X36 shape): the staged `buf` is the kernel-side
+/// counterpart of C's klist buffer — the user buffer is touched only
+/// at the terminal single-point `write_fallible` of the entry below,
+/// so ERANGE and walk errors leave it pristine (an X36 failure
+/// discards the staged bytes wholesale). The per-entry X36 increment
+/// check precedes each staging, which bounds `buf.len()` by `avail`
+/// (≤ 65536) plus the last name_total (≈ 535 B worst case) — the
+/// same bound C's klist carries; the rejected total-first staging of
+/// the whole visible set (a ~35 MB crafted upper bound) is exactly
+/// what this shape exists to avoid.
+struct ListCtx {
+    /// `writer.avail() == 0` at entry — the X34 two-phase size query:
+    /// names are never read, only summed (C `!it->buffer`).
+    zero_pass: bool,
+    /// The user buffer size — C `it.buffer_size`.
+    avail: usize,
+    /// The accumulated total — C `it.buffer_ofs` (skipped entries are
+    /// never counted; X34: this is what a size=0 query returns).
+    total: usize,
+    /// Staged output bytes: prefix + infix + name + NUL per visible
+    /// entry; only grows while `total <= avail`.
+    buf: Vec<u8>,
+}
+
+/// The list foreach body — the list half of the shared foreach
+/// (xattr.c:200-249). `Ok(())` is dual-purpose — output or skip both
+/// continue (X37: the entry below runs both walks unconditionally in
+/// order; only an `Err` terminates, discarding the staged bytes).
+fn list_foreach_body(
+    fs: &Erofs,
+    namespace: XattrNamespace,
+    entry: &XattrEntryAt,
+    ctx: &mut ListCtx,
+) -> Result<()> {
+    // 1. Long-prefix segment (xattr.c:209-222): a `0x80 | k` index
+    //    resolves through the mounted table; out-of-table k —
+    //    including every k when the table is empty — skips, not
+    //    counted (the X27 list shape: the same resolve face as get,
+    //    whose reaction is a non-match instead). The infix bytes are
+    //    concatenated verbatim below — non-UTF-8 and NUL-carrying
+    //    infixes included (the W-X06 OUTPUT half is a VmWriter byte
+    //    face, never narrowed through &str).
+    let (base_index, infix): (u8, &[u8]) = if entry.e_name_index & XATTR_LONG_PREFIX != 0 {
+        let Some(pf) = fs.long_prefix(entry.e_name_index) else {
+            return Ok(()); // skip: not counted
+        };
+        (pf.base_index, pf.infix.as_slice())
+    } else {
+        (entry.e_name_index, &[][..])
+    };
+    // 2. Base-row visibility gate (xattr.c:224-226; the table above):
+    //    X4/X5/X10/the acl rows → skip, not counted.
+    let Some(prefix) = list_base_prefix(fs, namespace, base_index) else {
+        return Ok(()); // skip: X4/X5/X10/acl gate closed
+    };
+    // 3. name_total = prefix_len + infix_len + e_name_len + 1
+    //    (xattr.c:227-228; the 1 is the NUL). F17 corollary: rows 2/3
+    //    carry the full acl name as the prefix segment with no
+    //    trailing dot, so a mkfs-normal entry (e_name_len == 0) lists
+    //    the exact name while a crafted non-empty suffix concatenates
+    //    verbatim, unvalidated ("system.posix_acl_accessfoo\0" —
+    //    XAT-35; its get side is unreachable through X44's
+    //    empty-suffix exact match, S08).
+    let name_total = prefix.len() + infix.len() + entry.e_name_len as usize + 1;
+    // 4. Two-phase / accumulating judgement (xattr.c:230-236; the
+    //    G-X10 eager form: judge first, stage after).
+    if ctx.zero_pass {
+        // X34: the name bytes are NOT read on this path (C `!buffer`
+        // — a size=0 query over a name area beyond the device end
+        // still answers the total; the read is unreachable).
+        ctx.total += name_total;
+        return Ok(());
+    }
+    if ctx.total + name_total > ctx.avail {
+        // X36 (xattr.c:235-236): per-entry, BEFORE this entry's name
+        // read — the C position verbatim, so the "visible set
+        // overflows the buffer ∧ a later walk error" combination
+        // answers ERANGE on both sides (a crafted out-of-device
+        // shared id is preempted exactly as in C). The staged bytes
+        // die with the error; the user buffer is never touched.
+        return_errno_with_message!(Errno::ERANGE, "xattr list buffer too small");
+    }
+    // 5. Assembly staging (xattr.c:238-248): prefix memcpy + infix
+    //    memcpy + e_name copy + one hand-written NUL per name
+    //    (exactly one — names carry no terminator on disk,
+    //    e_name_len is the length). e_value is never read on the
+    //    list path: the value region is skipped by `entry_size`'s
+    //    ALIGN4 advance inside the inline walk, the shared walk has
+    //    no advance at all, and `value_pos()` has zero list-side
+    //    references.
+    ctx.buf.extend_from_slice(prefix);
+    ctx.buf.extend_from_slice(infix);
+    // e_name_len ≤ 255: a fixed stack scratch, zero per-entry
+    // allocation (X2: no ENOMEM arm).
+    let mut name = [0u8; NAME_LEN];
+    fs.block_device().read_bytes(
+        entry.name_pos() as usize,
+        &mut name[..entry.e_name_len as usize],
+    )?;
+    ctx.buf
+        .extend_from_slice(&name[..entry.e_name_len as usize]);
+    ctx.buf.push(0); // the hand-written '\0' (xattr.c:248)
+    ctx.total += name_total;
+    Ok(())
+}
+
+impl Inode {
+    /// The list-face entry — the `erofs_listxattr` counterpart
+    /// (xattr.c:428-455), matrix-two rows 5–13; the gate order below
+    /// IS the priority order.
+    ///
+    /// The chain has NO acl dispatch, NO name copying, NO
+    /// xattr_permission, and NO prefix parsing (T-005 §4.1): all
+    /// visibility filtering sinks into the foreach body above. The
+    /// list-face negative discipline: no permission gate (the Linux
+    /// list chain checks none — the ramfs F43 masking form is
+    /// prohibited), no type gate (X13 is get-only: symlinks and
+    /// special files list normally), nouser_xattr is a SKIP not
+    /// EOPNOTSUPP (X4 vs X3), a dead index is a SKIP not an error
+    /// (X10), concatenated acl names are not validated (F17), and
+    /// there is no partial write (G-X10).
+    ///
+    /// W-X02 (registered workaround, state B): the trait passes a
+    /// single namespace chosen by the syscall layer
+    /// (`get_current_xattr_namespace`, `crate::syscall`'s
+    /// `listxattr.rs`): `Trusted` iff the caller holds CAP_SYS_ADMIN
+    /// (permitted + LSM-checked), `User` otherwise. We consume that
+    /// parameter **as a capability signal, not as a filter**: the
+    /// output is the caller-visible set of the Linux visibility
+    /// matrix — the only consumption point is the trusted-row gate
+    /// (X5) above; every other row is parameter-independent. Do NOT
+    /// copy the ext2 "namespace == User ⇒ drop non-user entries"
+    /// form (B5) — it silently loses security.* for non-root callers
+    /// (three drift cells; the targeted parity assertions are
+    /// XAT-32②/33③/34).
+    ///
+    /// Implicit contract (registered risk, W-X02): "parameter value
+    /// == caller cap state" is a framework-side invariant we rely
+    /// on. If the syscall layer ever enumerates namespaces per call
+    /// (a state-A signature extension) or changes the selector
+    /// semantics, the trusted gate here must be re-derived from the
+    /// caller's credentials; the rest of this method is unaffected.
+    // Transitional — consumed by the trait forward that lands with
+    // T-026 S09; remove this expect then. Until then it is the
+    // dead-code-analysis root that keeps the list chain above alive
+    // (list_base_prefix, ListCtx, list_foreach_body, the ACL index
+    // constants, and the posix_acl accessor they consume).
+    #[expect(dead_code)]
+    pub(in crate::fs::fs_impls::erofs) fn list_xattr(
+        &self,
+        namespace: XattrNamespace,
+        writer: &mut VmWriter<'_>,
+    ) -> Result<usize> {
+        // The strong-cache unreachable-EIO guard (the `Inode::fs`
+        // discipline, T-013 §1.2).
+        let fs = self.fs()?;
+        // ① init with the X35 conversion (xattr.c:434-436): ENODATA
+        //    is the ONLY code the list side swallows — isize == 0
+        //    becomes a 0-length listing (an empty name list is not
+        //    an error; the get side transparently propagates ENODATA
+        //    instead — the two-half split, XAT-36's same-inode dual
+        //    call). X1a EOPNOTSUPP / X1b EUCLEAN / the channel codes
+        //    pass through unconverted.
+        let state = match self.xattr_state() {
+            Ok(state) => state,
+            Err(e) if e.error() == Errno::ENODATA => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        // ② The per-call context; a zero-pass (avail == 0) call
+        //    allocates nothing and reads no name bytes (X34).
+        let avail = writer.avail();
+        let mut ctx = ListCtx {
+            zero_pass: avail == 0,
+            avail,
+            total: 0,
+            buf: Vec::new(),
+        };
+        // ③ The dual walk (S03 §4.2's list skeleton, verbatim: the
+        //    two loops run unconditionally in order — X37's "any
+        //    inline Ok → shared" has no continue condition left to
+        //    get wrong in the cursor form; only an `Err` terminates,
+        //    an inline X24 EUCLEAN masking the shared names and
+        //    discarding the staged bytes with it).
+        let mut ibody = IbodyEntryWalk::new(&fs, self.ino(), self.desc(), state);
+        while let Some(entry) = ibody.next_entry()? {
+            list_foreach_body(&fs, namespace, &entry, &mut ctx)?;
+        }
+        let mut shared = SharedEntryWalk::new(&fs, state);
+        while let Some(entry) = shared.next_entry()? {
+            list_foreach_body(&fs, namespace, &entry, &mut ctx)?;
+        }
+        // ④ The terminal: one single-point user write (G-X10 zero
+        //    touch — an EFAULT carries the framework's own code,
+        //    code-equivalent to X32; the layer and timing difference
+        //    is the W-X05 registered family, no assertion), then the
+        //    total (X34: size=0 and size≥total answer the same
+        //    number; skipped entries are never counted).
+        if !ctx.zero_pass {
+            writer.write_fallible(&mut VmReader::from(ctx.buf.as_slice()))?;
+        }
+        Ok(ctx.total)
     }
 }

@@ -101,9 +101,10 @@ pub struct Erofs {
     // first consumer landed.
     // AUTO-DECISION: `pub(in crate::fs::fs_impls::erofs)` field over
     // an accessor pair — the xattr-domain chain gates (`xattr.rs`,
-    // the X3/nouser_xattr gate since T-026 S06; the noacl gate joins
-    // at S08) take the short read guard in place, exactly as the
-    // design sample spells it (`fs.mount_options.read().user_xattr()`);
+    // the X3/nouser_xattr gate since T-026 S06; the list ACL rows
+    // since S07; the get-side noacl gate joins at S08) take the short
+    // read guard in place, exactly as the design sample spells it
+    // (`fs.mount_options.read().user_xattr()`);
     // an accessor pair would be a one-caller shim per gate site with
     // the same exposure. `Erofs.xattr_prefixes` (S05 D7) and
     // `Inode.xattrs` (S01) are the same cross-module host form. The
@@ -175,8 +176,10 @@ impl ErofsMountOptions {
         self.user_xattr
     }
 
-    // First consumer: the ACL read path (T-015).
-    #[expect(dead_code)]
+    // Live since T-026 S07: consumed by the ACL base-rows of the
+    // list gate (`list_base_prefix`, xattr.rs — the O4 short-guard
+    // live read); the get-side noacl gate (X43) joins at S08. The
+    // bridging `expect` was removed when that consumer landed.
     pub(super) fn posix_acl(&self) -> bool {
         self.posix_acl
     }

@@ -199,9 +199,9 @@ pub struct Inode {
     /// above): vacant at construction, filled by the first xattr
     /// access through `xattr_state` (`xattr.rs`); initialization
     /// failures leave it vacant so the next access retries (F3).
-    // Read by `xattr_state` (`xattr.rs`), live through the get
-    // entry chain's dead-code root until the S09 trait forward
-    // lands; no expect needed.
+    // Read by `xattr_state` (`xattr.rs`), live through the get and
+    // list entry chains' dead-code roots until the S09 trait
+    // forwards land; no expect needed.
     pub(in crate::fs::fs_impls::erofs) xattrs: Once<InodeXattrState>,
 }
 
