@@ -338,7 +338,8 @@ impl Inode {
     pub(in crate::fs::fs_impls::erofs) fn xattr_state(&self) -> Result<&InodeXattrState> {
         let fs = self.fs()?;
         let (nid, desc) = (self.ino(), self.desc());
-        self.xattrs.try_call_once(|| init_inode_xattrs(&fs, nid, desc))
+        self.xattrs
+            .try_call_once(|| init_inode_xattrs(&fs, nid, desc))
     }
 }
 
@@ -350,11 +351,7 @@ impl Inode {
 /// boundary note of `docs/T-015/S01/index.md` §3.2).
 // Transitional compatibility layer — replace with the S02 body; the
 // signature is final.
-fn init_inode_xattrs(
-    _fs: &Erofs,
-    _nid: ErofsNid,
-    _desc: &InodeDesc,
-) -> Result<InodeXattrState> {
+fn init_inode_xattrs(_fs: &Erofs, _nid: ErofsNid, _desc: &InodeDesc) -> Result<InodeXattrState> {
     return_errno_with_message!(Errno::EOPNOTSUPP, "xattr init walk not landed yet")
 }
 

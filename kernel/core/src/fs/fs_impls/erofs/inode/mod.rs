@@ -158,12 +158,6 @@ pub(super) type ErofsNid = u64;
 // kmalloc'd array is an allocation-shape artifact); the F4 corner
 // (shared_count == 0 → ZERO_SIZE_PTR) is an empty Vec here: zero
 // allocation, no failure face.
-//
-// Constructed only by `init_inode_xattrs` (`xattr.rs`), whose real
-// body lands with the ibody walk slice (T-026 S02) — until then no
-// constructor exists anywhere. Bridging expect — remove it together
-// with that body (it fires unfulfilled then).
-#[expect(dead_code)]
 pub(in crate::fs::fs_impls::erofs) struct InodeXattrState {
     /// The name bloom-filter bitmap (`h_name_filter`, le32; bit
     /// value 1 = not present) — consumed by the bloom gate on the
