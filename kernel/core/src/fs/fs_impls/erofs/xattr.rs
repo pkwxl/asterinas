@@ -1089,7 +1089,7 @@ struct XattrQuery<'a> {
 /// gate chain: AFTER the G-X09/G-X08 gates, BEFORE the X3 gate (the C
 /// order xattr_permission → resolve → handler get, §1.1 ⑥→⑧→⑨ of the
 /// booklet: X13/X15 surface before X7/X3).
-fn resolve_query_name(name: &XattrName<'_>) -> Result<XattrQuery<'_>> {
+fn resolve_query_name<'a>(name: &XattrName<'a>) -> Result<XattrQuery<'a>> {
     // The prefix is determined FORWARD from the namespace — a private
     // three-arm match with System structurally excluded. Excluding
     // System here is the structural half of NOT copying ext2's
@@ -1177,7 +1177,7 @@ fn entry_matches(fs: &Erofs, entry: &XattrEntryAt, query: &XattrQuery<'_>) -> Re
     let mut name_buf = vec![0u8; entry.e_name_len as usize];
     fs.block_device()
         .read_bytes(entry.name_pos() as usize, &mut name_buf)?;
-    Ok(name_buf.as_slice() == query.suffix[infix_len..])
+    Ok(*name_buf.as_slice() == query.suffix[infix_len..])
 }
 
 /// The explicit counterpart of C's -ENOATTR mismatch (S02 §2.3: an
