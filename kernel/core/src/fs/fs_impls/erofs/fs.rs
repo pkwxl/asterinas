@@ -114,7 +114,14 @@ pub struct Erofs {
     /// The decoded long-xattr name-prefix table: published exactly
     /// once by the F15 call at mount step 6 and frozen for the mount
     /// lifetime (a once-cell — see `# Locking` and `xattr.rs`).
-    xattr_prefixes: XattrPrefixes,
+    // Erofs-scope field, not private-plus-accessor: the sole faces
+    // touching it live in `xattr.rs` (`load_xattr_prefixes` /
+    // `Erofs::long_prefix`) — the same host shape as `Inode.xattrs`
+    // (T-026 S01). Publication stays confined to `XattrPrefixes::load`.
+    // AUTO-DECISION: `pub(in crate::fs::fs_impls::erofs)` field over a
+    // `pub(super)` accessor pair — the Inode.xattrs precedent is the
+    // established xattr-domain host form; one line, no shim method.
+    pub(in crate::fs::fs_impls::erofs) xattr_prefixes: XattrPrefixes,
 }
 
 /// Parsed erofs mount options (main column: XATTR=y, POSIX_ACL=y,
