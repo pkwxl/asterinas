@@ -593,6 +593,116 @@ impl<'a> IbodyEntryWalk<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The shared-area entry cursor (T-026 S03; `docs/T-015/S03/index.md` §2 —
+// the walk half of `erofs_xattr_iter_shared`, xattr.c:358-382). The
+// get/list orchestration that falls through to this walk — "get only on
+// inline-walk exhaustion, success stops", "list continues on any inline
+// Ok" (X37), and the X24 masking order — belongs to the consumer chains
+// (S06/S07); the orchestration contract table lives in
+// `docs/T-015/S03/index.md` §4.
+// ---------------------------------------------------------------------------
+
+/// The shared-block entry cursor — the walk half of
+/// `erofs_xattr_iter_shared` (xattr.c:358-382).
+///
+/// G-X01/X25 negative fact: NO bound check of any kind on the shared
+/// ids — the read position is computed and read unconditionally. The
+/// shared area has no on-disk length field (the superblock carries
+/// only its start, `xattr_blkaddr`), and a shared entry has no X24
+/// counterpart (no remaining-size gate): an out-of-range id surfaces
+/// only through the device channel or as coincidentally parseable
+/// bytes, never as a walk rejection (the three-shape parity table is
+/// `docs/T-015/S03/index.md` §3.1).
+///
+/// Structural differences from `IbodyEntryWalk`: no X23/X24 gates and
+/// no entry-size advance — every id is an independent base point. C
+/// recomputes `it->pos` at each loop head (xattr.c:368); the partial
+/// advances the foreach consumers make are overwritten by the next
+/// round, which the cursor form carries structurally (consumers never
+/// move this walk). Shared-entry bytes are uncached: every get/list
+/// call re-reads them through the device channel (point-of-use
+/// contract); the once-cell caches only the decoded id array — the
+/// memory state this walk iterates.
+struct SharedEntryWalk<'a> {
+    dev: &'a dyn BlockDevice,
+    /// Read point #15's base half, precomputed once as the loop
+    /// invariant: `xattr_blkaddr × block_size` (the
+    /// `erofs_pos(sb, xattr_blkaddr)` counterpart; an RO invariant
+    /// hoisted out of the loop with zero behavioral difference,
+    /// S03-D1). This base computation is the mirror field's only
+    /// runtime consumer (F50: superblock definition → mirror read →
+    /// this point closes the consumption set).
+    base: u64,
+    /// The init-cached shared-id array (`InodeXattrState::
+    /// shared_ids`, read at point #11 by S02 §2.1): an empty slice
+    /// is shared_count == 0 and iterates zero times — the natural
+    /// empty-`Iter` form, no explicit branch (S03-D3; contrast X27's
+    /// mandatory count == 0 branch, a lookup on a zero-length table
+    /// — a different mechanism, owned by S05).
+    ids: core::slice::Iter<'a, u32>,
+}
+
+// Transitional — constructed by the get/list chain bodies
+// (T-026 S06/S07), themselves wired to the trait forwards at S09;
+// remove this expect when those consumers land.
+#[expect(dead_code)]
+impl<'a> SharedEntryWalk<'a> {
+    /// Pure-arithmetic construction: zero I/O, zero error face, zero
+    /// validation — no `xattr_blkaddr` value-domain check either
+    /// (the T-012 zero-validation mirror read carries over to this
+    /// first runtime consumer).
+    fn new(fs: &'a Erofs, state: &'a InodeXattrState) -> Self {
+        // Both factors widen to u64 before multiplying (S03-D2): the
+        // C counterparts are the u64-shifting `erofs_pos` macro and
+        // the size_t-promoted `id × sizeof` product (internal.h:221,
+        // xattr.c:368-369); a u32-domain `4 * id` would wrap on
+        // crafted ids > 0x3FFFFFFF — behavioral drift.
+        let base = fs.super_block().xattr_blkaddr as u64 * fs.super_block().block_size() as u64;
+        Self {
+            dev: &**fs.block_device(),
+            base,
+            ids: state.shared_ids.iter(),
+        }
+    }
+
+    /// The next entry: read point #15's start = `base + 4 × id` (a
+    /// 4-byte-granularity byte-stream offset, decoupled from the
+    /// block size; the id passes in unbound-checked). The 4-byte
+    /// header read reuses the single `read_xattr_entry_at`
+    /// implementation — read point #12 has no second copy for the
+    /// shared site — and the consumers read the name/value bytes
+    /// through `name_pos`/`value_pos` the same way (the #12
+    /// variable region, same shape). `entry_size()` is deliberately
+    /// not consumed on this path: every id is an independent base
+    /// point, so there is no advance and no ALIGN4 skip site (C's
+    /// sole `erofs_xattr_entry_size` call sits in iter_inline, :337).
+    ///
+    /// X25: no bound check is added here — not the device end, not
+    /// the shared-area edge, not the id value domain, and no
+    /// remaining-style entry gate either (`docs/T-015/S03/index.md`
+    /// §3.3 items 1–4). The only failure path is the channel read
+    /// itself, whose error codes pass through uncollapsed (§3.3
+    /// item 7: EINVAL/EIO stay distinct — no errno folding, and
+    /// this walk produces no EUCLEAN; on-disk malformation has no
+    /// surfacing point on the shared path). An ext2-style EIO gate
+    /// on on-disk content is the F45 hard prohibition (§3.3 item
+    /// 5): this walk neither interprets nor validates what it
+    /// reads.
+    fn next_entry(&mut self) -> Result<Option<XattrEntryAt>> {
+        let Some(&id) = self.ids.next() else {
+            return Ok(None); // walk exhausted (shared_count == 0 is the same shape)
+        };
+        // The id widens before multiplying (S03-D2); the addition
+        // carries no overflow check (§3.3 item 6) — the u64
+        // magnitude bound (base ≤ (2^32−1)×2^12 plus 4×(2^32−1) ≈
+        // 2^44+2^34) is far below 2^64, C has no check in the same
+        // position, and adding one would be a new defense face.
+        let pos = self.base + 4 * id as u64;
+        read_xattr_entry_at(self.dev, pos).map(Some) // channel codes passthrough
+    }
+}
+
 /// F15 — the mount-time long-xattr name-prefix table load
 /// (`erofs_xattr_prefixes_init`, `super.c:746-748`), called from
 /// step 6 of `Erofs::open` (`fs.rs`).

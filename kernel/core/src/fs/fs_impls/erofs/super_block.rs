@@ -540,8 +540,12 @@ pub(super) struct SuperBlock {
     // bridging `expect` was removed when the first consumer landed.
     pub(super) meta_blkaddr: u32,
     /// The start block address of the shared xattr area (host order).
-    // First consumer: the shared-xattr walk (`xattr.rs`, T-026).
-    #[expect(dead_code)]
+    // Live since T-026 S03: the shared-xattr walk base —
+    // `SharedEntryWalk::new` (`xattr.rs`) computes `xattr_blkaddr ×
+    // block_size`, the base half of read point #15; this is the
+    // field's only runtime consumer (F50), and by the X25 negative
+    // fact no value-domain check runs on it. The bridging `expect`
+    // was removed when the first consumer landed.
     pub(super) xattr_blkaddr: u32,
     /// The 128-bit volume UUID (byte array, read as-is).
     // Live since T-023 S06: the fsid branch discriminator of
