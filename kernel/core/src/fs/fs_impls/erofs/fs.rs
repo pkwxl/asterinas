@@ -99,7 +99,16 @@ pub struct Erofs {
     // are the option getters of the xattr domain (short-guard
     // copy-out, T-015). The bridging `expect` was removed when the
     // first consumer landed.
-    mount_options: RwMutex<ErofsMountOptions>,
+    // AUTO-DECISION: `pub(in crate::fs::fs_impls::erofs)` field over
+    // an accessor pair — the xattr-domain chain gates (`xattr.rs`,
+    // the X3/nouser_xattr gate since T-026 S06; the noacl gate joins
+    // at S08) take the short read guard in place, exactly as the
+    // design sample spells it (`fs.mount_options.read().user_xattr()`);
+    // an accessor pair would be a one-caller shim per gate site with
+    // the same exposure. `Erofs.xattr_prefixes` (S05 D7) and
+    // `Inode.xattrs` (S01) are the same cross-module host form. The
+    // write side stays confined to `reconfigure` in this file.
+    pub(in crate::fs::fs_impls::erofs) mount_options: RwMutex<ErofsMountOptions>,
     /// Recorded VFS filesystem flags.
     flags: AtomicFsFlags,
     /// FS event stats for VFS.
@@ -159,8 +168,9 @@ impl Default for ErofsMountOptions {
 }
 
 impl ErofsMountOptions {
-    // First consumer: the xattr visibility gate (T-015).
-    #[expect(dead_code)]
+    // Live since T-026 S06: consumed by the X3 gate of the get entry
+    // chain (`xattr.rs`; the O4 short-guard live read). The bridging
+    // `expect` was removed when that consumer landed.
     pub(super) fn user_xattr(&self) -> bool {
         self.user_xattr
     }

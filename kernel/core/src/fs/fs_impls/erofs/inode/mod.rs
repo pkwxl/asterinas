@@ -162,11 +162,10 @@ pub(in crate::fs::fs_impls::erofs) struct InodeXattrState {
     /// The name bloom-filter bitmap (`h_name_filter`, le32; bit
     /// value 1 = not present) — consumed by the bloom gate on the
     /// get and ACL paths (`xattr.rs`).
-    // First reader: the get-path bloom arm and the ACL channel
-    // (T-026 S06/S08; the S04 predicate receives the value as a
-    // parameter). Transitional expect — remove when the first reader
-    // lands.
-    #[expect(dead_code)]
+    // Live since T-026 S06: read by the get-chain bloom arm
+    // (`xattr.rs`, through `xattr_state`); the ACL channel joins at
+    // S08. The bridging `expect` was removed when the first reader
+    // landed.
     pub(in crate::fs::fs_impls::erofs) name_filter: u32,
     /// The shared-xattr id array, read once at the lazy init (one
     /// bare `u32` per `h_shared_count`); `len()` IS the C
@@ -200,8 +199,9 @@ pub struct Inode {
     /// above): vacant at construction, filled by the first xattr
     /// access through `xattr_state` (`xattr.rs`); initialization
     /// failures leave it vacant so the next access retries (F3).
-    // Read by `xattr_state` (`xattr.rs`, dead-code root until the
-    // entry chains land) — live through that root; no expect needed.
+    // Read by `xattr_state` (`xattr.rs`), live through the get
+    // entry chain's dead-code root until the S09 trait forward
+    // lands; no expect needed.
     pub(in crate::fs::fs_impls::erofs) xattrs: Once<InodeXattrState>,
 }
 
