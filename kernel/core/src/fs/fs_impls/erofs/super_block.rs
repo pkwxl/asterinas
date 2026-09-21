@@ -184,8 +184,12 @@ bitflags! {
         /// Fragments (packed inode, initialized at super.c:724).
         /// Alias, same value 0x20: `EROFS_FEATURE_INCOMPAT_DEDUPE`.
         const FRAGMENTS = 1 << 5;
-        /// Long xattr name prefixes; behavior follows
-        /// `xattr_prefix_count` (T-026).
+        /// Long xattr name prefixes. G-X04: deliberately NOT consumed
+        /// anywhere — the prefix-table load gates on
+        /// `xattr_prefix_count` alone (bit set + count 0 = a P1
+        /// no-op mount; bit clear + count > 0 loads the table all the
+        /// same); the bit's only face is V6 known-bit membership
+        /// (accepted, never rejected, never acted on).
         const XATTR_PREFIXES = 1 << 6;
     }
 }
@@ -603,13 +607,20 @@ pub(super) struct SuperBlock {
     // bridging `expect` was removed when the first consumer landed.
     pub(super) dirblkbits: u8,
     /// The number of long xattr name prefixes; read directly (u8).
-    // First consumer: the long-prefix domain (`xattr.rs`, T-026).
-    #[expect(dead_code)]
+    // Live since T-026 S05: the prefix-table load
+    // (`load_xattr_prefixes`, `xattr.rs`) consumes it as the record
+    // count — the load's ONLY gate (P1: count == 0 exits before any
+    // I/O; no incompat-bit cross-check exists, G-X04). The bridging
+    // `expect` was removed when the first consumer landed.
     pub(super) xattr_prefix_count: u8,
     /// The start of the long xattr name prefix area (host order).
-    // First consumer: the long-prefix domain (`xattr.rs`, T-026;
-    // located at `xattr_prefix_start × 4`).
-    #[expect(dead_code)]
+    // Live since T-026 S05: the prefix-table load (`xattr.rs`)
+    // computes the record-stream base as this value << 2 — a 4-byte
+    // unit shift, deliberately NOT the erofs_pos block unit (unlike
+    // the #15 base of the shared-xattr walk); no value-domain check
+    // (an out-of-range start surfaces as the first record's channel
+    // error). The bridging `expect` was removed when the first
+    // consumer landed.
     pub(super) xattr_prefix_start: u32,
     /// The nid of the special packed inode (fragments; host order).
     // Live since T-023 S05: the F10 door of `Erofs::open` (`fs.rs`)

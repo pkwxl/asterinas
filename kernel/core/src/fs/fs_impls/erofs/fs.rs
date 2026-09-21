@@ -41,6 +41,14 @@
 //! reference cycles are forbidden: the handle keeps a weak self
 //! reference (`self_ref`) and hands out `Weak<Erofs>` clones to
 //! inodes.
+//!
+//! The `xattr_prefixes` cell holds the decoded long-prefix table: it
+//! is published exactly once at mount step 6 (before the handle
+//! becomes reachable through the FsCache) and is immutable
+//! afterwards. It is a once-cell, not an OS lock — it adds no
+//! lock-order constraint, and loading reads only the superblock
+//! mirror, the device byte stream / the packed inode's page cache
+//! (via a guaranteed cache-hit iget), never the two locks above.
 
 use core::sync::atomic::Ordering;
 
@@ -55,7 +63,7 @@ use super::{
         NAME_LEN, RawDeviceSlot, RawSuperBlock, SUPER_MAGIC_V1, SUPER_OFFSET, SUPER_REGION_MAX,
         SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
-    xattr::load_xattr_prefixes,
+    xattr::{XattrPrefixes, load_xattr_prefixes},
 };
 use crate::fs::vfs::file_system::{
     AtomicFsFlags, FsEventSubscriberStats, FsFlags, SuperBlock as VfsSuperBlock,
@@ -103,6 +111,10 @@ pub struct Erofs {
     inode_cache: RwMutex<BTreeMap<ErofsNid, Arc<Inode>>>,
     /// Weak self reference handed out to inodes.
     self_ref: Weak<Erofs>,
+    /// The decoded long-xattr name-prefix table: published exactly
+    /// once by the F15 call at mount step 6 and frozen for the mount
+    /// lifetime (a once-cell — see `# Locking` and `xattr.rs`).
+    xattr_prefixes: XattrPrefixes,
 }
 
 /// Parsed erofs mount options (main column: XATTR=y, POSIX_ACL=y,
@@ -326,8 +338,9 @@ impl Erofs {
     /// layer-3 compressed-data gate on it; (5) F11/F12: iget the root
     /// inode, layer-3 gate BEFORE the directory type judgement, so a
     /// compressed root (EOPNOTSUPP) stays errno-distinguishable from
-    /// a readable non-directory root (EINVAL); (6) the F15
-    /// xattr-prefix call slot; (7) success. Step 3 is pure-memory
+    /// a readable non-directory root (EINVAL); (6) the F15 long-xattr
+    /// prefix-table load (state-A full load; errors fail the mount);
+    /// (7) success. Step 3 is pure-memory
     /// construction — no errno path — and any later failure unwinds
     /// the whole handle through Drop, leaving no half-assembled
     /// instance and no FsCache entry (M1–M6 single-track rollback).
@@ -377,6 +390,7 @@ impl Erofs {
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             inode_cache: RwMutex::new(BTreeMap::new()),
             self_ref: weak_self.clone(),
+            xattr_prefixes: XattrPrefixes::new(),
         });
 
         // Step 4 — F10 packed inode (super.c:724-729): FRAGMENTS bit AND
@@ -417,11 +431,19 @@ impl Erofs {
             return_errno_with_message!(Errno::EINVAL, "root inode is not a directory");
         }
 
-        // Step 6 — F15 slot: xattr prefix table load (super.c:746-748),
-        // only when the on-disk prefix count > 0. Body owned by the
-        // xattr domain design (T-015, G-X02/G-X03); errors pass through
-        // and fail the mount (EFSCORRUPTED → EUCLEAN per the errno
-        // table). Slot-only until then: `load_xattr_prefixes`.
+        // Step 6 — F15: the long-xattr name-prefix table load
+        // (super.c:746-748, `erofs_xattr_prefixes_init` — the body is
+        // `load_xattr_prefixes` in `xattr.rs`). The state-A full load,
+        // gated by the on-disk prefix count alone (P1: count == 0 →
+        // zero reads, zero allocation; no incompat-bit cross-check,
+        // G-X04); prefix bytes flow through the G-X02 dual mapping —
+        // the packed inode's page cache when the FRAGMENTS door (step
+        // 4) paired with a non-zero packed_nid, the device byte stream
+        // otherwise. Errors pass through and fail the whole mount
+        // (P4 EFSCORRUPTED → EUCLEAN; channel codes uncollapsed); on
+        // success the decoded table is published into the frozen
+        // `xattr_prefixes` cell (compute-then-publish — see the
+        // `# Locking` section).
         load_xattr_prefixes(&erofs)?;
 
         // F17 — success log (erofs_info "mounted with root inode @ nid",
@@ -678,6 +700,7 @@ impl Erofs {
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             inode_cache: RwMutex::new(BTreeMap::new()),
             self_ref: weak_self.clone(),
+            xattr_prefixes: XattrPrefixes::new(),
         })
     }
 

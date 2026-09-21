@@ -53,12 +53,13 @@
 use core::mem::offset_of;
 
 use ostd::{const_assert, mm::VmIo};
+use spin::Once;
 
 use super::{
     fs::Erofs,
     inode::{Inode, InodeDesc, InodeXattrState, suffix_xattr_start},
     prelude::*,
-    super_block::{FeatureCompatSet, SuperBlock},
+    super_block::{FeatureCompatSet, FeatureIncompatSet, NAME_LEN, SuperBlock},
     utils::xxh32,
 };
 
@@ -207,9 +208,9 @@ const XATTR_LONG_PREFIX: u8 = 0x80; // erofs_fs.h:223
 /// The low 7 bits of `e_name_index`: the prefix-table index when the
 /// long-prefix bit is set (`EROFS_XATTR_LONG_PREFIX_MASK`,
 /// erofs_fs.h:224).
-// First consumer: `Erofs::long_prefix` (T-026 S05). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S05: consumed by `Erofs::long_prefix` below — the
+// single mask point of the table-resolve face. The bridging `expect`
+// was removed when the first consumer landed.
 const XATTR_LONG_PREFIX_MASK: u8 = 0x7f; // erofs_fs.h:224
 
 /// The bloom-filter bit width (`EROFS_XATTR_FILTER_BITS`,
@@ -244,15 +245,15 @@ const FILTER_SEED: u32 = 0x25BBE08F; // erofs_fs.h:228
 // (the walk's ALIGN4 size helper).
 const XATTR_ENTRY_ALIGN: usize = size_of::<RawXattrEntry>();
 
-/// The fixed part of an on-disk long-prefix record (`base_index` +
-/// the 4-byte rounded `infix_len` header precedes the infix bytes):
-/// the lower bound of the record domain is 1 byte of infix
-/// (`docs/T-015/S05/index.md` §2.2; the C shape is the
-/// `erofs_xattr_long_prefix` flexible member — no struct is modeled,
-/// U3).
-// First consumer: `read_prefix_record` bounds (T-026 S05).
-// Transitional expect — remove when that consumer lands.
-#[expect(dead_code)]
+/// The fixed part of an on-disk long-prefix record:
+/// `sizeof(struct erofs_xattr_long_prefix)` = the single `base_index`
+/// byte (erofs_fs.h:240-243; the flexible infix member is not
+/// modeled, U3) — the lower bound of the record-length domain; the
+/// upper bound is `NAME_LEN` + this constant (the P4 check of the
+/// prefix load below).
+// Live since T-026 S05: consumed by the record-domain bounds check of
+// the prefix load below. The bridging `expect` was removed when the
+// first consumer landed.
 const LONG_PREFIX_FIXED_LEN: usize = 1;
 
 /// ACL tag: the file-owner entry (`ACL_USER_OBJ`,
@@ -784,23 +785,268 @@ fn xattr_filter_denies(sb: &SuperBlock, name_filter: u32, index: u8, suffix: &[u
     name_filter & (1u32 << hashbit) != 0
 }
 
+// ---------------------------------------------------------------------------
+// The long xattr name-prefix table (T-026 S05; `docs/T-015/S05/index.md`
+// §2.1–§2.6 — `erofs_xattr_prefixes_init`/`erofs_read_metadata`,
+// xattr.c:457-511 + super.c:113-145): the state-A full load behind the
+// F15 slot of mount step 6, the decoded-table once-cell on `Erofs`, and
+// the `0x80 | k` resolve face consumed by the get/list entry matching
+// (T-026 S06/S07). Domain split of the record reads (G-X02): the meta
+// half is a plain device-byte-stream read (read point #3's long-prefix
+// half, revived); the packed half rides the #13 page-cache exception
+// family — "file-content reads go through the inode's own page cache"
+// — with the backend still sourced from `fs.block_device`.
+// ---------------------------------------------------------------------------
+
+/// One decoded long-prefix record (the `erofs_xattr_prefix_item`
+/// counterpart, xattr.c:502-503): `infix.len()` IS the C `infix_len`
+/// (= record length − 1; the S01-D3 no-redundant-length rule).
+pub(in crate::fs::fs_impls::erofs) struct XattrPrefixItem {
+    /// The short-prefix index byte, kept exactly as on disk — no
+    /// value-domain check: a malformed base_index simply never matches
+    /// on the get side and is skipped on the list side (S05 §1.4).
+    // First consumer: the get/list entry matching (T-026 S06/S07).
+    // Transitional expect — remove when that consumer lands.
+    #[expect(dead_code)]
+    pub(in crate::fs::fs_impls::erofs) base_index: u8,
+    /// The infix bytes following the base index (record length − 1),
+    /// kept verbatim — may be non-UTF-8 and may contain NUL; the list
+    /// path concatenates them as raw bytes (S05 §1.4; the W-X06 output
+    /// half never narrows through &str).
+    // First consumer: the get/list entry matching (T-026 S06/S07).
+    // Transitional expect — remove when that consumer lands.
+    #[expect(dead_code)]
+    pub(in crate::fs::fs_impls::erofs) infix: Vec<u8>,
+}
+
+/// The FS-level long-prefix table host — the C `sbi->xattr_prefixes`
+/// array plus `xattr_prefix_count` collapsed into one value (the
+/// table length == `Vec::len` == the mount-time superblock count; the
+/// superblock is never re-read at runtime). Interior: a once-cell
+/// published exactly once at mount step 6 and frozen for the mount
+/// lifetime (S05-D4: `call_once`, not `try_call_once` — a failed load
+/// fails the whole mount, so there is no retry path to model, and the
+/// re-entrancy panic face of `call_once` is structurally unreachable:
+/// mounting is single-threaded and the handle is not yet reachable
+/// through the FsCache).
+pub(in crate::fs::fs_impls::erofs) struct XattrPrefixes(Once<Vec<XattrPrefixItem>>);
+
+impl XattrPrefixes {
+    /// The vacant cell every handle starts from (the fs.rs constructor
+    /// line); publication happens only in `load`, only at mount step 6.
+    pub(in crate::fs::fs_impls::erofs) fn new() -> Self {
+        Self(Once::new())
+    }
+
+    /// The F15 body — the P1–P6 branches of `docs/T-015/S05/index.md`
+    /// §1.1 (`xattr.c:470-511`).
+    fn load(&self, fs: &Erofs) -> Result<()> {
+        // P1 (xattr.c:478-479): count == 0 → zero reads, zero
+        // allocation (`Vec::new()` never allocates — the C "no
+        // kzalloc" parity) — and the EMPTY table is still published:
+        // "the cell is complete after a successful mount" holds
+        // unconditionally, so the resolve face below has no unloaded
+        // state to handle. This loop gate is the sole consumption
+        // face of the `xattr_prefix_count` mirror.
+        let count = fs.super_block().xattr_prefix_count as usize;
+        if count == 0 {
+            self.0.call_once(Vec::new);
+            return Ok(());
+        }
+        // pos0 (xattr.c:474): `xattr_prefix_start << 2` — a hard-coded
+        // 4-BYTE unit shift, NOT the erofs_pos block unit (deliberately
+        // unlike read point #15's `xattr_blkaddr × block_size`); the
+        // u32 mirror widens to u64 BEFORE the shift (S03-D2 arithmetic
+        // discipline). No value-domain pre-check on the start: an
+        // out-of-range area surfaces as the channel error of the first
+        // record read (XAT-22; a pre-check would be a new defense face
+        // — the image is trusted, S05 §2.6 item 4).
+        let pos = u64::from(fs.super_block().xattr_prefix_start) << 2;
+        // G-X02 dual mapping (xattr.c:485-488): the C test is
+        // `sbi->packed_inode != NULL`, whose assignment predicate is
+        // re-derived here (FRAGMENTS bit ∧ packed_nid ≠ 0 — the very
+        // predicate mount step 4/F10 already ran); no resident packed
+        // handle exists on purpose (identity single-sources through
+        // the inode cache), so this is a guaranteed cache-hit iget.
+        // The two forms share ONE textual record implementation,
+        // instantiated per source type (the compile-minimal form of
+        // the `&dyn VmIo` sample — see the AUTO-DECISION note at
+        // `read_prefix_record`).
+        let items = if fs
+            .super_block()
+            .feature_incompat()
+            .contains(FeatureIncompatSet::FRAGMENTS)
+            && fs.super_block().packed_nid != 0
+        {
+            // Packed form: the prefix bytes are regular file content
+            // of the packed inode — read through its DataBacked page
+            // cache (C `buf.mapping = packed_inode->i_mapping`; pos is
+            // a packed-file-relative offset). The iget Err face is
+            // structurally unreachable (step 4 iget'd the same nid and
+            // the cache never evicts) — `?` is defensive passthrough;
+            // the hit path takes only a read guard, never the
+            // inode-cache write side (R1).
+            let packed = fs.iget(fs.super_block().packed_nid)?;
+            // Keepalive borrow form (context risk 5): the local
+            // `Arc<Inode>` pins the page cache (and its backend) for
+            // the whole record loop — the borrow checker enforces the
+            // lifetime the two-tuple sample carried, in the minimal
+            // shape that compiles.
+            let Some(pc) = packed.page_cache() else {
+                // A crafted non-DataBacked packed payload (special
+                // file / fast symlink): C hits an aops-less undefined
+                // face here; this tree rejects cleanly — on-disk
+                // malformation → EUCLEAN (registered known-diff, no
+                // assertion family).
+                return_errno_with_message!(Errno::EUCLEAN, "packed inode has no data payload");
+            };
+            read_prefix_table(pc, pos, count)
+        } else {
+            // Meta form: the prefix area is read straight off the
+            // device byte stream at the absolute offset pos0 — read
+            // point #3's long-prefix half, revived (the
+            // algorithm-config half of erofs_read_metadata stays cut
+            // with compression, shelf A).
+            read_prefix_table(&**fs.block_device(), pos, count)
+        }?;
+        // Compute-then-publish (S05-D4): only a fully-built table is
+        // published. On failure the cell stays vacant and the whole
+        // handle dies with the mount error — the half-built local Vec
+        // drops with it (the C cleanup counterpart is plain Rust
+        // ownership: no explicit free call, no leak face, and the
+        // put_super cleanup collapses into the Erofs Drop).
+        self.0.call_once(|| items);
+        Ok(())
+    }
+}
+
+/// The record loop (xattr.c:496-507): `count` records, first failure
+/// stops (P3 passthrough / P4 EUCLEAN), the half-built items die with
+/// the error. Generic over the record source so that the G-X02 dual
+/// mapping shares ONE implementation (instantiated once for the packed
+/// page cache, once for the device byte stream).
+fn read_prefix_table<S: VmIo + ?Sized>(
+    src: &S,
+    mut pos: u64,
+    count: usize,
+) -> Result<Vec<XattrPrefixItem>> {
+    let mut items = Vec::with_capacity(count); // ≤ 255; X2: no ENOMEM arm (G-M21)
+    for _ in 0..count {
+        let rec = read_prefix_record(src, &mut pos)?; // P3: the read happens FIRST
+        // P4 (xattr.c:496-501), AFTER the read: the record domain is
+        // [LONG_PREFIX_FIXED_LEN, NAME_LEN + LONG_PREFIX_FIXED_LEN] =
+        // [1, 256]. A zero header length was already mapped to 65536
+        // inside the reader, so it always lands on this upper bound —
+        // the oversized READ must happen before any domain judgement
+        // (P5: the rejection force is entirely the upper bound;
+        // short-circuiting an empty length into a rejection here would
+        // reorder observable I/O against the C flow).
+        if rec.len() < LONG_PREFIX_FIXED_LEN || rec.len() > NAME_LEN + LONG_PREFIX_FIXED_LEN {
+            return_errno_with_message!(Errno::EUCLEAN, "bogus xattr prefix length");
+        }
+        // P6 (xattr.c:502-503): base_index verbatim + infix = the
+        // remaining len − 1 bytes; no content validation of either
+        // (malformed base_index / non-UTF-8 / NUL-carrying infixes are
+        // stored as-is — S05 §2.6 items 2 and 3).
+        let (base_index, infix) = match rec.split_first() {
+            Some((&b, rest)) => (b, rest.to_vec()),
+            // P4 guarantees len >= 1 here (the 0-arm of the domain
+            // check above); the From<FileKind> unreachable precedent.
+            None => unreachable!("P4 guarantees len >= 1"),
+        };
+        items.push(XattrPrefixItem { base_index, infix });
+    }
+    Ok(items)
+}
+
+/// `erofs_read_metadata` equivalent (super.c:113-145; the T-001 §3.6
+/// length-prefixed record convention) — the single reader of the
+/// long-prefix record stream. Record form: `le16 len` header, then
+/// `len` body bytes; the next record starts at the next 4-byte
+/// boundary. `len == 0` means 65536 (the U16_MAX + 1 encoding,
+/// super.c:125-126 — P5's root: the oversized read is issued BEFORE
+/// the caller's domain check can reject it).
+// AUTO-DECISION: generic `<S: VmIo + ?Sized>` instead of the design
+// sample's `src: &dyn VmIo` — `&dyn BlockDevice` does not coerce to
+// `&dyn VmIo` (VmIo is not a supertrait of BlockDevice; the existing
+// `impl VmIo for dyn BlockDevice` enables method calls but not the
+// trait-object coercion), so the meta-form arm cannot produce a
+// `&dyn VmIo` without a hand-written adapter type. The generic keeps
+// ONE textual implementation (the design's "single code path, dual
+// form") with two monomorphizations — semantically identical.
+// Rejected: a manual adapter struct forwarding VmIo over
+// `&dyn BlockDevice` (a new type and a second implementation surface
+// for zero benefit); duplicating the reader per mapping arm (violates
+// the single-implementation contract).
+fn read_prefix_record<S: VmIo + ?Sized>(src: &S, pos: &mut u64) -> Result<Vec<u8>> {
+    *pos = (*pos).next_multiple_of(4); // round_up 4: inter-record padding skipped (super.c:119)
+    // The single le16 length read (C1); the offset cast is loss-free
+    // on 64-bit targets (the read-site precedent). P3: channel error
+    // codes pass through uncollapsed.
+    let raw = src.read_val::<u16>(*pos as usize)?;
+    *pos += size_of::<u16>() as u64; // super.c:130
+    let len = match u16::from_le(raw) as usize {
+        0 => u16::MAX as usize + 1, // len == 0 → 65536 (super.c:125-126)
+        n => n,
+    };
+    let mut buf = vec![0u8; len]; // the kmalloc half; X2: no ENOMEM arm (G-M21)
+    // C's per-block slice loop (`cnt = min(block tail, remaining)`,
+    // one bread + memcpy per slice) is a block-granular-mapping
+    // artifact: both target forms are byte-precise unbounded readers,
+    // so the whole body is one read — the RD2① registered
+    // read-granularity family, observable only under fault injection,
+    // no assertion (S05 §2.2 argument 1). No short read.
+    src.read_bytes(*pos as usize, &mut buf)?;
+    *pos += len as u64; // the record body is consumed
+    Ok(buf) // the CALLER judges the domain (P4 is post-read by design)
+}
+
 /// F15 — the mount-time long-xattr name-prefix table load
-/// (`erofs_xattr_prefixes_init`, `super.c:746-748`), called from
-/// step 6 of `Erofs::open` (`fs.rs`).
-///
-/// Slot-only transitional shape: the call site and its position in
-/// the assembly order are final (`open` is the single ordering
-/// authority — F12 before this call, success after it), while the
-/// body — gated by the on-disk prefix count, reading the prefix
-/// area through the mirror fields, with its EFSCORRUPTED → EUCLEAN
-/// error family — lands with the xattr domain design (T-015;
-/// markers G-X02/G-X03, anchored here and in `fs.rs`). Until then
-/// this accepts unconditionally: an image with a positive prefix
-/// count mounts without the table (no interim rejection the real
-/// body would have to walk back).
-// Transitional compatibility layer — remove when the xattr domain
-// implementation lands (T-026 executes the T-015 design); the call
-// site itself is final.
-pub(super) fn load_xattr_prefixes(_fs: &Erofs) -> Result<()> {
-    Ok(())
+/// (`erofs_xattr_prefixes_init`, xattr.c:470-511), called from step 6
+/// of `Erofs::open` (`fs.rs`). The state-A full load: a positive
+/// prefix count gets its table assembled and published before the
+/// mount succeeds. Failure family: EUCLEAN (the P4 record domain; the
+/// non-DataBacked packed corner) and the channel codes (EIO/EINVAL,
+/// P3) pass through and fail the whole mount — first failure stops,
+/// no errno folding.
+// G-X04: this path consults `xattr_prefix_count` alone — ZERO
+// incompat-bit references. The XATTR_PREFIXES bit's only face is V6
+// known-bit membership: bit set + count 0 mounts as the P1 no-op, bit
+// clear + count > 0 loads the table all the same — no cross-check
+// exists, and adding one would reject images C accepts.
+// Live since T-026 S05: the real body replaced the slot-only
+// placeholder (the open-step-6 call site was final all along).
+pub(super) fn load_xattr_prefixes(fs: &Erofs) -> Result<()> {
+    fs.xattr_prefixes.load(fs)
+}
+
+/// The runtime table-resolve face — the single X27 entry, consumed by
+/// the entry matching of get/list (T-026 S06/S07).
+impl Erofs {
+    /// Resolves a `0x80 | k` on-disk name index against the mounted
+    /// table. Call ONLY when the long-prefix bit is set — the mask is
+    /// applied here, at this one point (`k = 0..=127`). Out-of-table k
+    /// — including every k when the table is empty — returns `None`
+    /// through the explicit `Vec::get` bounds check: the structural
+    /// replacement of C's pointer comparison `pf >= prefixes + count`
+    /// (xattr.c:266-268, :213-214), whose count == 0 truth relies on
+    /// `NULL + k >= NULL + 0` — C-practice pointer arithmetic that
+    /// Rust must not and does not borrow. After a successful mount the
+    /// cell is always complete (P1 publishes the empty Vec), so
+    /// `None` is decided solely by the bounds. The get side treats
+    /// `None` as a non-match and iterates on; the list side skips the
+    /// entry — the two consumer faces (S05 §2.5).
+    // Transitional — first consumed by the get/list entry matching
+    // (T-026 S06/S07), wired to the trait forwards at S09; remove
+    // this expect when that consumer lands. As a dead-code-analysis
+    // root it keeps the `XATTR_LONG_PREFIX_MASK` consumption and the
+    // item construction face live until then.
+    #[expect(dead_code)]
+    pub(in crate::fs::fs_impls::erofs) fn long_prefix(
+        &self,
+        e_name_index: u8,
+    ) -> Option<&XattrPrefixItem> {
+        let k = (e_name_index & XATTR_LONG_PREFIX_MASK) as usize; // 0..=127
+        self.xattr_prefixes.0.get().and_then(|table| table.get(k))
+    }
 }
