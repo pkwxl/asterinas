@@ -146,6 +146,8 @@ bitflags! {
         const MTIME = 1 << 1;
         /// Xattr name filter (bloom); effective only when
         /// `xattr_filter_reserved == 0` (xattr.c:401).
+        // Live since T-026 S04: tested through `feature_compat()` by
+        // the bloom effectivity gate (`xattr.rs`) at every get entry.
         const XATTR_FILTER = 1 << 2;
     }
 }
@@ -618,9 +620,13 @@ pub(super) struct SuperBlock {
     pub(super) packed_nid: u64,
     /// The xattr name filter reservation byte; the bloom filter is
     /// effective only when this is zero (read directly, u8).
-    // First consumer: the bloom effectiveness gate (`xattr.rs`,
-    // T-026).
-    #[expect(dead_code)]
+    // Live since T-026 S04: the bloom effectivity gate
+    // (`xattr_filter_active`, `xattr.rs`) reads it as the second half
+    // of the per-get-entry predicate (xattr.c:401) — a pure gate
+    // input with zero value-domain judgement (a non-zero value was
+    // accepted at mount and only switches the gate off, never a
+    // rejection). The bridging `expect` was removed when the first
+    // consumer landed.
     pub(super) xattr_filter_reserved: u8,
 }
 
@@ -702,9 +708,10 @@ impl SuperBlock {
     /// dropped by the truncation without any rejection (G4).
     // Live since T-023 S03: the V5 checksum trigger of
     // `read_superblock` (`fs.rs`) tests SB_CHKSUM through this
-    // accessor; the XATTR_FILTER bloom gate joins with the xattr
-    // domain (T-026). The bridging `expect` was removed when the
-    // first consumer landed.
+    // accessor; the XATTR_FILTER bloom gate half joined with T-026
+    // S04 (`xattr_filter_active`, `xattr.rs`, reads it at every get
+    // entry). The bridging `expect` was removed when the first
+    // consumer landed.
     pub(super) fn feature_compat(&self) -> FeatureCompatSet {
         FeatureCompatSet::from_bits_truncate(self.feature_compat)
     }

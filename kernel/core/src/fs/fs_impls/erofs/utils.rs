@@ -32,19 +32,19 @@
 //! regenerated with the LCG rule defined there and cross-checked against
 //! fixed head bytes).
 
-#![cfg_attr(not(ktest), expect(dead_code))]
-// Dead-code ledger (why the `expect` above stays fulfilled): in
-// regular builds `xxh32` has no caller until the xattr name-filter
-// bloom domain lands (`xattr.rs`, T-026) — until then it is
-// referenced only by the ktest suite, which is compiled out of
-// regular builds, so its dead-code lint fires under the module-level
-// `expect`. `crc32c` is live in both cfgs since T-022 S03 (the
-// `#[expect(dead_code)]` checksum verification in `super_block.rs`
-// is a dead-code-analysis root, and its call counts as a live use),
-// as is `duration_from_parts` (called by the live
-// `From<RawSuperBlock>` mirror decode). The module-level `expect`
-// becomes unfulfilled — and the compiler will ask for its removal —
-// only once `xxh32` gains a regular-build caller too.
+// Dead-code ledger (closed at T-026 S04): this module previously
+// carried a module-level dead-code expectation (applied to non-ktest
+// builds only) whose sole regular-build subject was `xxh32` — no
+// caller before the xattr bloom domain. The first regular-build
+// caller, the bloom denial predicate in `xattr.rs` (itself a
+// dead-code-analysis root under a transitional expect until the get
+// entry chain consumes it, T-026 S06), landed with T-026 S04: every
+// item here is live in every cfg now, and the module-level
+// expectation was removed (keeping it would be reported unfulfilled).
+// Earlier liveness: `crc32c` since T-022 S03 (called by the checksum
+// verification in `super_block.rs`, a dead-code-analysis root whose
+// call counts), and `duration_from_parts` since the live
+// `From<RawSuperBlock>` mirror decode.
 
 use core::time::Duration;
 
