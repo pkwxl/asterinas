@@ -172,15 +172,17 @@ const XATTR_INDEX_USER: u8 = 1; // erofs_fs.h:212
 /// Name index of the access-ACL pseudo-name
 /// (`EROFS_XATTR_INDEX_POSIX_ACL_ACCESS`, erofs_fs.h:213).
 // Live since T-026 S07: consumed by the list base-prefix row 2
-// below (the ACL exact-name match joins at S08). The bridging
-// `expect` was removed when the first consumer landed.
+// below and, since S08, the acl exact-name dispatch
+// (`get_system_xattr`). The bridging `expect` was removed when the
+// first consumer landed.
 const XATTR_INDEX_POSIX_ACL_ACCESS: u8 = 2; // erofs_fs.h:213
 
 /// Name index of the default-ACL pseudo-name
 /// (`EROFS_XATTR_INDEX_POSIX_ACL_DEFAULT`, erofs_fs.h:214).
 // Live since T-026 S07: consumed by the list base-prefix row 3
-// below (the ACL exact-name match joins at S08). The bridging
-// `expect` was removed when the first consumer landed.
+// below and, since S08, the acl exact-name dispatch
+// (`get_system_xattr`). The bridging `expect` was removed when the
+// first consumer landed.
 const XATTR_INDEX_POSIX_ACL_DEFAULT: u8 = 3; // erofs_fs.h:214
 
 /// Name index of `trusted.*` attributes (`EROFS_XATTR_INDEX_TRUSTED`,
@@ -266,55 +268,59 @@ const LONG_PREFIX_FIXED_LEN: usize = 1;
 
 /// ACL tag: the file-owner entry (`ACL_USER_OBJ`,
 /// include/uapi/linux/posix_acl.h:28).
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the tag dispatch of
+// `parse_posix_acl` below. The bridging `expect` was removed when
+// that consumer landed.
 const ACL_USER_OBJ: u16 = 0x01; // posix_acl.h:28
 
 /// ACL tag: a named-user entry (`ACL_USER`, posix_acl.h:29).
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the tag dispatch of
+// `parse_posix_acl` and the identity write-back of
+// `serialize_posix_acl` below. The bridging `expect` was removed
+// when those consumers landed.
 const ACL_USER: u16 = 0x02; // posix_acl.h:29
 
 /// ACL tag: the group-owner entry (`ACL_GROUP_OBJ`, posix_acl.h:30).
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the tag dispatch of
+// `parse_posix_acl` below. The bridging `expect` was removed when
+// that consumer landed.
 const ACL_GROUP_OBJ: u16 = 0x04; // posix_acl.h:30
 
 /// ACL tag: a named-group entry (`ACL_GROUP`, posix_acl.h:31).
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the tag dispatch of
+// `parse_posix_acl` and the identity write-back of
+// `serialize_posix_acl` below. The bridging `expect` was removed
+// when those consumers landed.
 const ACL_GROUP: u16 = 0x08; // posix_acl.h:31
 
 /// ACL tag: the mask entry (`ACL_MASK`, posix_acl.h:32).
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the tag dispatch of
+// `parse_posix_acl` below. The bridging `expect` was removed when
+// that consumer landed.
 const ACL_MASK: u16 = 0x10; // posix_acl.h:32
 
 /// ACL tag: the others entry (`ACL_OTHER`, posix_acl.h:33).
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the tag dispatch of
+// `parse_posix_acl` below. The bridging `expect` was removed when
+// that consumer landed.
 const ACL_OTHER: u16 = 0x20; // posix_acl.h:33
 
 /// The on-disk ACL value version word (`POSIX_ACL_XATTR_VERSION`,
 /// include/uapi/linux/posix_acl_xattr.h: the `a_version` header
 /// field of `posix_acl_xattr_header`).
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the header check of
+// `parse_posix_acl` and the header emit of `serialize_posix_acl`
+// below. The bridging `expect` was removed when those consumers
+// landed.
 const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
 
 /// The undefined-ACL-id sentinel (`ACL_UNDEFINED_ID` = (uid_t)-1,
 /// posix_acl.h:21) — the sole invalid `e_id` for ACL_USER/ACL_GROUP
 /// entries under the `init_user_ns` identity domain.
-// First consumer: `parse_posix_acl` (T-026 S08). Transitional
-// expect — remove when that consumer lands.
-#[expect(dead_code)]
+// Live since T-026 S08: consumed by the named-entry id gate of
+// `parse_posix_acl` and the default-class rewrite of
+// `serialize_posix_acl` below. The bridging `expect` was removed
+// when those consumers landed.
 const ACL_UNDEFINED_ID: u32 = u32::MAX; // (-1), posix_acl.h:21
 
 // ---------------------------------------------------------------------------
@@ -339,13 +345,13 @@ impl Inode {
     /// flow through the cell's failure semantics (it is structurally
     /// unreachable under the strong inode cache — the same guard as
     /// `Inode::fs`).
-    // Live since T-026 S06: consumed by the get entry chain below
-    // and, since S07, the list entry chain (the acl chain joins at
-    // S08). The dead-code-analysis roots are the get and list
-    // entries themselves (transitional expects until the S09 trait
-    // forwards land); the cell field read and the init function
-    // stay live through those roots. The bridging `expect` was
-    // removed when the first consumer landed.
+    // Live since T-026 S06: consumed by the get entry chain below,
+    // the list entry chain since S07, and the acl channel
+    // (`get_system_xattr` below) since S08. The dead-code-analysis
+    // roots are the get and list entries themselves (transitional
+    // expects until the S09 trait forwards land); the cell field
+    // read and the init function stay live through those roots. The
+    // bridging `expect` was removed when the first consumer landed.
     pub(in crate::fs::fs_impls::erofs) fn xattr_state(&self) -> Result<&InodeXattrState> {
         let fs = self.fs()?;
         let (nid, desc) = (self.ino(), self.desc());
@@ -536,8 +542,9 @@ struct IbodyEntryWalk<'a> {
 }
 
 // Live since T-026 S06: constructed and driven by the get entry
-// chain below and, since S07, the list entry chain. The bridging
-// `expect` was removed when those consumers landed.
+// chain below, the list entry chain since S07, and the acl channel's
+// `acl_find_value` since S08. The bridging `expect` was removed when
+// those consumers landed.
 impl<'a> IbodyEntryWalk<'a> {
     /// Construction IS the X23 gate (xattr.c:322-327):
     /// `header_sz = size_of::<RawXattrIbodyHeader>() + 4 ×
@@ -654,8 +661,9 @@ struct SharedEntryWalk<'a> {
 }
 
 // Live since T-026 S06: constructed and driven by the get entry
-// chain below and, since S07, the list entry chain. The bridging
-// `expect` was removed when those consumers landed.
+// chain below, the list entry chain since S07, and the acl channel's
+// `acl_find_value` since S08. The bridging `expect` was removed when
+// those consumers landed.
 impl<'a> SharedEntryWalk<'a> {
     /// Pure-arithmetic construction: zero I/O, zero error face, zero
     /// validation — no `xattr_blkaddr` value-domain check either
@@ -716,12 +724,12 @@ impl<'a> SharedEntryWalk<'a> {
 // The bloom-filter gate (T-026 S04; `docs/T-015/S04/index.md` §2.1–§2.3 —
 // the `vi->xattr_name_filter` consumption of `erofs_getxattr`,
 // xattr.c:401-407). Get-path only by construction: the caller set of
-// `xattr_filter_denies` is exactly one site, the get entry chain
-// (T-026 S06); the ACL internal query reaches the same gate through
-// that chain (empty suffix, index 2/3, T-026 S08), and the list chain
-// is structurally free of any bloom reference — the get/list
-// asymmetry negative fact (S04 §2.5: same image, same name, get
-// denied while list still emits it).
+// `xattr_filter_denies` is exactly two sites — the get entry chain
+// (T-026 S06) and, since S08, the acl channel's own gate (same door,
+// same order — the empty-suffix internal query, index 2/3) — while
+// the list chain is structurally free of any bloom reference — the
+// get/list asymmetry negative fact (S04 §2.5: same image, same name,
+// get denied while list still emits it).
 // ---------------------------------------------------------------------------
 
 /// The bloom-filter effectivity gate — the single-source Rust
@@ -775,9 +783,11 @@ fn xattr_filter_active(sb: &SuperBlock) -> bool {
 /// input, not an exempt channel (F13) — and non-UTF-8 suffixes are
 /// structurally absent at the framework layer (W-X06, a registered
 /// difference; the pointer lives at the S06 name resolution).
-// Live since T-026 S06: consumed by the get entry chain below (the
-// ACL internal query rides the same chain at T-026 S08). The
-// dead-code-analysis root is now the get entry itself; through it,
+// Live since T-026 S06: consumed by the get entry chain below and,
+// since S08, the acl channel's gate (`get_system_xattr` — same door,
+// same order; the empty suffix is a legal xxh32 input, not an exempt
+// channel). The dead-code-analysis root is now the get entry itself;
+// through it,
 // `xattr_filter_active`, `xxh32`, the XATTR_FILTER_BITS/FILTER_SEED
 // constants, and the `xattr_filter_reserved` mirror field stay
 // live. The bridging `expect` was removed when the first consumer
@@ -1140,7 +1150,9 @@ fn resolve_query_name<'a>(name: &XattrName<'a>) -> Result<XattrQuery<'a>> {
 /// half of the foreach consumers (C: xattr.c:263-300 served both the
 /// generic query and the acl channel's empty-suffix query through the
 /// same foreach; the S08-D1 extraction, landed here directly per
-/// analysis §12.4 ① — the acl consumer body joins at T-026 S08).
+/// analysis §12.4 ① — the acl consumer `acl_foreach_body` has shared
+/// it since T-026 S08, so the match logic stays single-source exactly
+/// as C's one foreach served both call faces).
 /// Short-circuit order mirrors C: index/total-length arithmetic
 /// first, infix compare next, e_name read+compare last (read errors
 /// surface at the same logical point as C's per-block name copy
@@ -1245,7 +1257,7 @@ impl Inode {
         let fs = self.fs()?;
         // ⑥ System dispatch → the acl channel (X42 exact names / X43
         //    noacl+symlink gates / X44 empty-suffix query / X45/X46
-        //    parse+serialize — the body lands with T-026 S08). The
+        //    parse+serialize — the body landed with T-026 S08). The
         //    order mirrors C ⑤: the dispatch precedes permission —
         //    an acl name never passes G-X08/G-X09 (xattr.c:736
         //    ahead of :434-436).
@@ -1331,27 +1343,145 @@ impl Inode {
         return_errno_with_message!(Errno::ENODATA, "no matching xattr")
     }
 
-    /// The System-namespace entry — the S06 §2.5 ⑥ dispatch slot with
-    /// a transitional body; T-026 S08 fills the real channel (the X42
-    /// exact-name dispatch, the X43 noacl+symlink gates, the X44
-    /// empty-suffix internal query, the X45/X46 parse+serialize
-    /// protocol).
-    // The placeholder answers EOPNOTSUPP — the terminal code every
-    // non-exact system.* name keeps forever (the X42 else-arm, the
-    // X6-equivalent: Linux's resolve reaches no handler for them,
-    // and a bare "system." is NOT the X7 EINVAL case — X7 requires a
-    // handler prefix to match first) — and the code the framework's
-    // trait default already serves for the whole face until the S09
-    // forward lands, so nothing observable changes while the slot
-    // waits. Signature = the S08 §2.1 sample verbatim (params
-    // underscore-bound only while the body is the placeholder).
+    /// The System-namespace entry — the S06 §2.5 ⑥ dispatch slot,
+    /// with the real channel landed by S08 (the C chain:
+    /// do_getxattr's is_posix_acl_xattr dispatch, linux/fs/xattr.c:
+    /// 725-745, + vfs_get_acl's gate pair, posix_acl.c:1173-1205, +
+    /// erofs_get_acl, xattr.c:513-551, + posix_acl_from_xattr /
+    /// vfs_posix_acl_to_xattr, posix_acl.c:736-835/894-939).
+    ///
+    /// ACL names bypass G-X08/G-X09 entirely — an acl name never
+    /// passes xattr_permission (posix_acl.c:1184-1187; the aster
+    /// System namespace carries no cap gate either — shape-aligned,
+    /// no assertion). The channel is zero-conversion on the init
+    /// codes: ENODATA stays ENODATA (C's NULL-acl → ENODATA is the
+    /// same code, xattr.c:542-543), EOPNOTSUPP/EUCLEAN and the
+    /// channel codes pass through exactly like the generic get face.
     pub(in crate::fs::fs_impls::erofs) fn get_system_xattr(
         &self,
-        _fs: &Erofs,
-        _name: XattrName<'_>,
-        _writer: &mut VmWriter<'_>,
+        fs: &Erofs,
+        name: XattrName<'_>,
+        writer: &mut VmWriter<'_>,
     ) -> Result<usize> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "system xattr: acl channel pending")
+        // X42, the exact-name dispatch (linux/fs/xattr.c:736 +
+        // include/linux/xattr.h:25-29): full-string compare against
+        // the two exact names — NOT prefix matching. The else arm IS
+        // the X6-equivalent: every non-exact system.* name (bare
+        // "system.", "system.foo", the glued
+        // "system.posix_acl_accessfoo") reaches no handler in
+        // Linux's resolve (the erofs s_xattr table has no
+        // system-prefix handler), so both sides answer EOPNOTSUPP —
+        // the name layer's only errno for this namespace, with ZERO
+        // strip and ZERO name-layer EINVAL (the ext2 B4 trio — the
+        // From<System> single-value mapping, the trailing-dot
+        // prefix, the strip-failure EINVAL — is the prohibited copy
+        // face; see also S08 §2.3 note 1). A bare "system." is NOT
+        // the X7 EINVAL case: X7 requires a handler prefix to match
+        // first (as "user." does). X42 precedes X43 (C's dispatch
+        // precedes vfs_get_acl): a non-exact name on a noacl mount
+        // is answered here, never by the noacl gate (same code,
+        // order preserved — XAT-39).
+        let index = match name.full_name() {
+            "system.posix_acl_access" => XATTR_INDEX_POSIX_ACL_ACCESS, // 2
+            "system.posix_acl_default" => XATTR_INDEX_POSIX_ACL_DEFAULT, // 3
+            _ => return_errno_with_message!(Errno::EOPNOTSUPP, "unknown system xattr name"),
+        };
+        // X43 ②, the noacl gate (vfs_get_acl:1192-1193): the standing
+        // EOPNOTSUPP equivalent — it is NOT ENODATA, and the two
+        // codes must never be swapped (the gate fires even on an
+        // inode whose acl entry exists on disk — the distinguishing
+        // shape of XAT-41①). Read live under the short guard (O4: a
+        // remount swap takes effect on the next syscall).
+        if !fs.mount_options.read().posix_acl() {
+            return_errno_with_message!(Errno::EOPNOTSUPP, "posix acl disabled");
+        }
+        // X43 ③, the symlink gate (vfs_get_acl:1194-1195):
+        // EOPNOTSUPP, not ENODATA, and ONLY the SymLink kind is
+        // rejected — devices, fifos and sockets query normally (a
+        // different source from the G-X09 four-kind rejection; do
+        // not conflate the two shapes). ②③ precede init (the §6.3
+        // judgement order): "noacl ∧ isize == 0" answers EOPNOTSUPP
+        // where init alone would answer ENODATA — the order
+        // assertion face XAT-41②. The noacl-vs-symlink relative
+        // order is same-code (indistinguishable, no assertion).
+        if matches!(self.type_(), InodeType::SymLink) {
+            return_errno_with_message!(Errno::EOPNOTSUPP, "acl on symlink");
+        }
+        // ④ The lazy init (S02: the X1 states / X2 no arm / channel
+        //    codes — all transmitted; the acl channel converts
+        //    nothing, unlike the list-side X35).
+        let state = self.xattr_state()?;
+        // ⑤ The X44 internal query (erofs_get_acl:534's "" literal):
+        //    an INTERNAL construction — it bypasses
+        //    `resolve_query_name` entirely, so the W-X03
+        //    empty-suffix EINVAL gate never applies to it (that gate
+        //    only sees user-provided full names; the acl channel's
+        //    name is kernel-constructed).
+        let query = XattrQuery { index, suffix: &[] };
+        // ⑥ The bloom gate (S04's interface 1/2: same door, same
+        //    order — after init, before the walk; C :534 → :401-407):
+        //    the empty suffix goes into xxh32 verbatim (seed
+        //    FILTER_SEED + 2/3), and a trusted contradictory bitmap
+        //    denies the acl query all the same — the empty suffix is
+        //    NOT an exempt input (XAT-45). A denial answers ENODATA
+        //    with zero walk construction and zero walk I/O.
+        if xattr_filter_denies(fs.super_block(), state.name_filter, query.index, query.suffix) {
+            return_errno_with_message!(Errno::ENODATA, "bloom filter: absent");
+        }
+        // (X21's suffix-length gate: an empty suffix is ≤ NAME_LEN
+        //  unconditionally — the same judgement C makes at :410-412 —
+        //  so this chain carries no separate site; the ⑬ gate of the
+        //  generic face only ever sees user-provided names.)
+        // ⑦ The dual walk (the S03 §4.2 orchestration, acl shape):
+        //    a mismatch iterates on, ONLY inline-walk exhaustion
+        //    falls through to the shared walk, a match stops, and an
+        //    inline X24 EUCLEAN masks a same-indexed shared entry —
+        //    identical to the generic get face (the acl consumer is
+        //    the fourth consumer of the same pair of walks).
+        let Some(value) = acl_find_value(fs, self, &query, state)? else {
+            // X44's tail: dual-walk exhaustion. An on-disk acl-index
+            // entry with e_name_len > 0 never matches the
+            // empty-suffix query (the F17 get-side dual — the list
+            // half emits the glued name all the same, XAT-35) →
+            // ENODATA (XAT-42①).
+            return_errno_with_message!(Errno::ENODATA, "no acl entry");
+        };
+        // ⑧ X45, the value parse (`parse_posix_acl` below — the
+        //    three-code split with the C order preserved: version
+        //    before alignment, parse errors before any buffer
+        //    judgement). The parse runs UNCONDITIONALLY: even a
+        //    size=0 user buffer parses first, so a malformed value
+        //    reports its own code instead of the length (S08 §1.2
+        //    corollary 1; the generic get face answers the length
+        //    with zero value reads — the read-timing dual,
+        //    XAT-44③).
+        let Some(entries) = parse_posix_acl(&value)? else {
+            // A pure header: "legal but empty" answers as absent
+            // (posix_acl.c:751-752; XAT-43⑦).
+            return_errno_with_message!(Errno::ENODATA, "empty acl");
+        };
+        // ⑨ X46, the buffer protocol (vfs_posix_acl_to_xattr:907-911):
+        //    real_size = 4 + 8n (== e_value_size — alignment is a
+        //    parse hard gate, so the identity holds; XAT-40③); the
+        //    two-phase length answer / judge-before-write order; the
+        //    emitted bytes are the ROUND-TRIP product (default-class
+        //    e_id rewritten to 0xFFFFFFFF), never an on-disk
+        //    passthrough (XAT-47 is the anti-passthrough lock). E2BIG
+        //    is unreachable (F14: real_size == e_value_size ≤ 65535
+        //    < 65536).
+        let real_size = size_of::<u32>() + entries.len() * size_of::<PosixAclEntry>();
+        if writer.avail() == 0 {
+            return Ok(real_size); // two-phase: the parse has already run
+        }
+        if real_size > writer.avail() {
+            return_errno_with_message!(Errno::ERANGE, "acl value buffer too small");
+        }
+        let bytes = serialize_posix_acl(&entries);
+        // The single user-write point; an EFAULT carries the
+        // framework's own code (the W-X05 registered family —
+        // code-equivalent to X18, layer/timing drift registered).
+        writer.write_fallible(&mut VmReader::from(bytes.as_slice()))?;
+        Ok(real_size)
     }
 }
 
@@ -1363,8 +1493,9 @@ impl Inode {
 // joins as the one-line forward at T-026 S09 (gate position: every gate
 // lives in this body — `impl_for_vfs` stays dispatch-only). Structurally
 // free of any bloom reference (the get/list asymmetry, S04 §2.5): the
-// caller set of `xattr_filter_denies` stays exactly one — the get chain
-// above; same image, same name, get may be denied while list still
+// caller set of `xattr_filter_denies` — the get chain above and,
+// since S08, the acl channel — never includes any list-side site;
+// same image, same name, get may be denied while list still
 // emits it.
 // ---------------------------------------------------------------------------
 
@@ -1656,4 +1787,231 @@ impl Inode {
         }
         Ok(ctx.total)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The ACL read channel (T-026 S08; `docs/T-015/S08/index.md` §2.1–§2.4 —
+// erofs_get_acl's consumers: the X44 acl foreach body over the same dual
+// walk as the generic get face, plus the X45/X46 value parser and
+// serializer). The entry — `get_system_xattr` above, the ⑥ dispatch slot
+// — owns the gate chain; the pieces here are the walk consumer, the
+// on-disk record view, and the two value-protocol halves. State two of
+// the acl design: exact-name reads only. The permission-evaluation half
+// of ACLs stays registered as cut (G-M07: no ACL enforcement layer
+// consumes the value — this channel's output is user-visible bytes only;
+// erofs does not repair the framework, AR-S01-6). Zero new locks (S08
+// §2.5): the Once cell caches the xattr state, never the acl value —
+// every query re-runs the walk and the parse, the no-acl-cache mirror
+// of C's uncached `.get_inode_acl` face (xattr.c:513-551 has no cached
+// acl get on this kernel; the get_cached_acl snapshot above it misses
+// by construction).
+// ---------------------------------------------------------------------------
+
+/// The acl consumer's per-entry outcome — the value-protocol
+/// counterpart of `GetOutcome`: a mismatch iterates on, a match
+/// carries the whole value bytes (read unconditionally — the acl
+/// value protocol has no entry-level two-phase short-circuit).
+enum AclOutcome {
+    Matched(Vec<u8>),
+    Mismatch,
+}
+
+/// The acl channel's foreach body — the X44 value protocol in its acl
+/// special case (C: xattr.c:251-312's foreach served the acl channel's
+/// empty-suffix query through the same body, xattr.c:534/:539). The
+/// single-pass form: a match reads the value UNCONDITIONALLY — the
+/// behavior-equivalent single-pass fusion of C's two-call shape (S08
+/// §1.2 corollary 3: the init Once fast path, the bloom
+/// re-evaluation, and both walks are idempotent, so one pass and two
+/// passes answer the same code in the same order — the I/O halving is
+/// device-read count, not user-visible behavior). A mismatched
+/// entry's value is never read (same shape on both sides); a read
+/// failure surfaces at the matched entry with the channel's own code
+/// (an oversized crafted e_value_size surfaces here even for a
+/// size=0 user buffer — the read-timing dual XAT-44④).
+fn acl_foreach_body(
+    fs: &Erofs,
+    entry: &XattrEntryAt,
+    query: &XattrQuery<'_>,
+) -> Result<AclOutcome> {
+    if !entry_matches(fs, entry, query)? {
+        return Ok(AclOutcome::Mismatch); // X28: a mismatch iterates on (orchestration)
+    }
+    // e_value_size ≤ 65535; X2: no ENOMEM arm (G-M21). An empty value
+    // (C's rc == 0 guard keeps the buffer NULL, xattr.c:542) is the
+    // empty Vec here — it flows into the parse's short-value EINVAL
+    // arm (S08 §1.2 corollary 2), unlike the generic get face where
+    // an empty value is a legal Ok(0): the same on-disk entry, two
+    // channels, two codes.
+    let mut value = vec![0u8; entry.e_value_size as usize];
+    fs.block_device()
+        .read_bytes(entry.value_pos() as usize, &mut value)?;
+    Ok(AclOutcome::Matched(value))
+}
+
+/// The acl channel's dual-walk orchestration — the S03 §4.2 get
+/// skeleton verbatim with `acl_foreach_body` as the consumer: the
+/// inline walk first, ONLY inline-walk exhaustion falls through to
+/// the shared walk (a match returns, an error terminates — an inline
+/// X24 EUCLEAN masks a same-indexed shared entry), and exhaustion
+/// answers `None` → the entry's terminal ENODATA. The fourth consumer
+/// of the same orchestration contract (get / list / acl), reading the
+/// same init-cached state the entry chain already acquired.
+fn acl_find_value(
+    fs: &Erofs,
+    inode: &Inode,
+    query: &XattrQuery<'_>,
+    state: &InodeXattrState,
+) -> Result<Option<Vec<u8>>> {
+    let mut ibody = IbodyEntryWalk::new(fs, inode.ino(), inode.desc(), state);
+    while let Some(entry) = ibody.next_entry()? {
+        if let AclOutcome::Matched(value) = acl_foreach_body(fs, &entry, query)? {
+            return Ok(Some(value)); // success stops
+        }
+    }
+    let mut shared = SharedEntryWalk::new(fs, state);
+    while let Some(entry) = shared.next_entry()? {
+        if let AclOutcome::Matched(value) = acl_foreach_body(fs, &entry, query)? {
+            return Ok(Some(value)); // success stops
+        }
+    }
+    Ok(None) // dual-walk exhaustion → the entry's terminal ENODATA
+}
+
+/// One decoded acl record — the host-order mirror of the on-disk
+/// `posix_acl_xattr_entry` (include/uapi/linux/posix_acl_xattr.h:
+/// e_tag/e_perm le16 + e_id le32, exactly 8 bytes). `repr(C)` so the
+/// layout anchors below double as the record-domain anchor: the
+/// parse/serialize stride and the entry's `real_size = 4 + 8n`
+/// arithmetic both consume `size_of::<PosixAclEntry>()` — the same
+/// discipline as `XATTR_ENTRY_ALIGN` = `size_of::<RawXattrEntry()>`
+/// (the constant IS the structure size, C5).
+// AUTO-DECISION: one repr(C) struct instead of the booklet's separate
+// `PosixAclEntryOnDisk` layout-anchor + a host-order copy (S08 §2.3
+// sample). The parse reads fields per-`from_le_bytes` off the in-
+// memory value slice — no Pod face exists (or is wanted: the slice is
+// 1-aligned, so a transmute read would be wrong anyway) — so a second
+// constructed-nowhere anchor struct would only restate these very
+// offsets while risking the never-constructed dead-code face. The
+// anchors below carry the same on-disk facts; semantic zero-
+// difference (the `read_prefix_record` compile-minimal adaptation of
+// S05 is the same precedent).
+#[repr(C)]
+struct PosixAclEntry {
+    e_tag: u16, // @0  __le16
+    e_perm: u16, // @2  __le16
+    e_id: u32, // @4  __le32
+}
+
+// Layout triple and per-field offsets (A1), anchored to
+// include/uapi/linux/posix_acl_xattr.h (the source-side counterpart
+// is the size/count helper family of linux/include/linux/
+// posix_acl_xattr.h:18-35: real_size = 4 + 8n over exactly these
+// fields).
+const_assert!(size_of::<PosixAclEntry>() == 8); // posix_acl_xattr.h
+const_assert!(align_of::<PosixAclEntry>() == 4); // the le32 member pins the alignment
+const_assert!(offset_of!(PosixAclEntry, e_tag) == 0); // posix_acl_xattr.h
+const_assert!(offset_of!(PosixAclEntry, e_perm) == 2); // posix_acl_xattr.h
+const_assert!(offset_of!(PosixAclEntry, e_id) == 4); // posix_acl_xattr.h
+
+/// `posix_acl_from_xattr`'s validation half (fix_xattr_common,
+/// posix_acl.c:736-755, + the from_xattr entry loop, :781-835) — the
+/// three-code split with the C order preserved line by line: EINVAL
+/// (short value), EOPNOTSUPP (version), EINVAL (misalignment),
+/// `Ok(None)` = a pure header ("legal but empty" treated as absent →
+/// the caller's ENODATA), then the per-entry checks in entry order
+/// (an unknown tag or an undefined named id fails at its own entry,
+/// like C's fail path). `e_perm` is never validated (any 16 bits
+/// pass; serialize re-emits them verbatim); the four default-class
+/// tags leave `e_id` semantically unread (serialize rewrites it
+/// unconditionally). No alloc-failure arm exists (X2/G-M21: the C
+/// kmalloc points :796-798 both map to this tree's abort family).
+fn parse_posix_acl(value: &[u8]) -> Result<Option<Vec<PosixAclEntry>>> {
+    // :741-744 — the two short arms of C (a NULL value and a value
+    // smaller than the 4-byte header) answer the same EINVAL; the
+    // empty Vec of the acl consumer and a real short value are one
+    // shape at the slice face (the value length is single-source
+    // here — no merge loss; the rc==0 NULL distinction C makes at
+    // :542 has already collapsed into the empty Vec upstream).
+    if value.len() < size_of::<u32>() {
+        return_errno_with_message!(Errno::EINVAL, "bogus acl value");
+    }
+    let a_version = u32::from_le_bytes(value[..size_of::<u32>()].try_into().unwrap());
+    // :745-746 — the version check PRECEDES the alignment check: a
+    // "version ≠ 2 ∧ misaligned" value answers EOPNOTSUPP, not
+    // EINVAL — the order IS the assertion face (XAT-43②).
+    if a_version != POSIX_ACL_XATTR_VERSION {
+        return_errno_with_message!(Errno::EOPNOTSUPP, "acl version");
+    }
+    // :748-750 — posix_acl_xattr_count's negative case: the remainder
+    // must be a whole number of 8-byte records.
+    let rest = value.len() - size_of::<u32>();
+    if rest % size_of::<PosixAclEntry>() != 0 {
+        return_errno_with_message!(Errno::EINVAL, "acl size misaligned");
+    }
+    let count = rest / size_of::<PosixAclEntry>();
+    if count == 0 {
+        // :751-752 — a pure header carries zero entries: "legal but
+        // empty" answers as absent (Ok(None) → the caller's ENODATA).
+        return Ok(None);
+    }
+    // count ≤ (65535 − 4) / 8 = 8188 records ≤ 64 KiB; X2: no ENOMEM
+    // arm (G-M21).
+    let mut entries = Vec::with_capacity(count);
+    for rec in value[size_of::<u32>()..].chunks_exact(size_of::<PosixAclEntry>()) {
+        // Field offsets 0/2/4 are the const_assert anchors above.
+        let e_tag = u16::from_le_bytes(rec[..2].try_into().unwrap());
+        let e_perm = u16::from_le_bytes(rec[2..4].try_into().unwrap()); // unvalidated
+        let e_id = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+        match e_tag {
+            ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER => {
+                // The default classes: e_id is semantically unread —
+                // C's from_xattr leaves it undefined (:801-811) and
+                // serialize rewrites it unconditionally below.
+            }
+            ACL_USER | ACL_GROUP => {
+                // The init_user_ns identity domain (S08-D3): the sole
+                // invalid id is the -1 sentinel — the make_kuid/kgid
+                // INVALID_UID/GID judgement (`uid_t -1`) transcribed
+                // verbatim (erofs has no idmap/user_namespace face);
+                // every other u32 passes, and existence is NOT
+                // queried on either side (a lookup would be drift).
+                if e_id == ACL_UNDEFINED_ID {
+                    return_errno_with_message!(Errno::EINVAL, "acl id undefined");
+                }
+            }
+            // :825-826/:831-833 — an unknown tag fails at its own
+            // entry (e_tag outside {0x01,0x02,0x04,0x08,0x10,0x20}).
+            _ => return_errno_with_message!(Errno::EINVAL, "acl unknown tag"),
+        }
+        entries.push(PosixAclEntry { e_tag, e_perm, e_id });
+    }
+    Ok(Some(entries))
+}
+
+/// `vfs_posix_acl_to_xattr`'s emit half (posix_acl.c:913-937). The
+/// round trip is NOT a byte passthrough (S08 §1.4): the named
+/// entries (ACL_USER/ACL_GROUP) write e_id back identically (the
+/// init_user_ns identity domain), while the four default classes
+/// carry an UNCONDITIONAL 0xFFFFFFFF rewrite (:933-934) — parse never
+/// read their e_id, serialize never preserves it. The difference
+/// face is exactly that single field: normal mkfs/setfacl images are
+/// byte-equal through the round trip (their default-class e_id is
+/// already -1 on disk), while crafted values surface the rewrite —
+/// XAT-47 is the anti-passthrough lock (a verbatim-copy
+/// implementation passes XAT-40 and fails exactly there).
+fn serialize_posix_acl(entries: &[PosixAclEntry]) -> Vec<u8> {
+    let cap = size_of::<u32>() + entries.len() * size_of::<PosixAclEntry>();
+    let mut out = Vec::with_capacity(cap);
+    out.extend_from_slice(&POSIX_ACL_XATTR_VERSION.to_le_bytes());
+    for e in entries {
+        out.extend_from_slice(&e.e_tag.to_le_bytes()); // verbatim
+        out.extend_from_slice(&e.e_perm.to_le_bytes()); // verbatim
+        let e_id = match e.e_tag {
+            ACL_USER | ACL_GROUP => e.e_id, // identity write-back
+            _ => ACL_UNDEFINED_ID,          // default-class rewrite
+        };
+        out.extend_from_slice(&e_id.to_le_bytes());
+    }
+    out
 }
