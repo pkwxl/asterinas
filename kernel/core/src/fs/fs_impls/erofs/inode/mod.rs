@@ -29,7 +29,9 @@
 //!
 //! Since T-024 S01 the handle below is the final assembly shape:
 //! nid, decoded descriptor, type-specific payload (`InodePayload`),
-//! weak back-pointer, and the VFS extension slot, all constructed by
+//! weak back-pointer, the VFS extension slot, and — since T-026 S01 —
+//! the initially vacant xattr once-cell (see `InodeXattrState` below;
+//! zero I/O at construction), all constructed by
 //! `Inode::new` — the decode + assembly chain that the slow path of
 //! `Erofs::iget` (`fs.rs`) drives inside its write-guard critical
 //! section. The payload assembly carries the I12 arm-head gate
@@ -68,7 +70,13 @@
 //! `InodeDesc`, the type-specific payload, and the weak back-reference
 //! to the filesystem are all fixed by `erofs_iget` and never change,
 //! because erofs is read-only and never updates atime. There is no
-//! per-inode lock and no cross-inode lock order. Data-backed payloads
+//! per-inode lock and no cross-inode lock order. The one
+//! interior-mutable field is `xattrs`, a once-cell holding the
+//! per-inode xattr state: it is initialized lazily on the first xattr
+//! access (never during inode construction) and is immutable once
+//! published; initialization failures leave the cell vacant, so the
+//! next access retries (see `xattr.rs`). The cell is a leaf — it is
+//! never held while acquiring any other lock. Data-backed payloads
 //! own a framework `PageCache` that synchronizes itself, and the VFS
 //! `Extension` slot is self-synchronizing as well.
 //!
@@ -95,6 +103,7 @@ use core::mem::offset_of;
 use align_ext::AlignExt;
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::{const_assert, mm::VmIo};
+use spin::Once;
 
 // The erofs-level name of the data backend: `Inode::data_backend`
 // and the `DataBacked` payload field expose the type at `pub(super)`
@@ -135,13 +144,52 @@ use crate::{
 /// An erofs inode number (`nid`): the linear on-disk inode identifier.
 pub(super) type ErofsNid = u64;
 
+/// Per-inode xattr state, populated lazily by the first xattr access
+/// (the `xattr_state` once-cell fill in `xattr.rs`) and immutable
+/// once published — the in-memory mirror of the C
+/// `vi->xattr_name_filter`/`xattr_shared_count`/`xattr_shared_xattrs`
+/// triple (internal.h:259-263). Hosted here in the inode domain —
+/// the same-side host as the C internal.h field block; a definition
+/// in `xattr.rs` would force a reverse import edge (inode → xattr)
+/// that the layering rules forbid.
+// AUTO-DECISION: S01-D3 (`docs/T-015/S01/index.md` §10) —
+// `shared_count` is deliberately not a separate field:
+// `shared_ids.len()` IS the count (the C split of count and
+// kmalloc'd array is an allocation-shape artifact); the F4 corner
+// (shared_count == 0 → ZERO_SIZE_PTR) is an empty Vec here: zero
+// allocation, no failure face.
+//
+// Constructed only by `init_inode_xattrs` (`xattr.rs`), whose real
+// body lands with the ibody walk slice (T-026 S02) — until then no
+// constructor exists anywhere. Bridging expect — remove it together
+// with that body (it fires unfulfilled then).
+#[expect(dead_code)]
+pub(in crate::fs::fs_impls::erofs) struct InodeXattrState {
+    /// The name bloom-filter bitmap (`h_name_filter`, le32; bit
+    /// value 1 = not present) — consumed by the bloom gate on the
+    /// get and ACL paths (`xattr.rs`).
+    // First reader: the get-path bloom arm and the ACL channel
+    // (T-026 S06/S08; the S04 predicate receives the value as a
+    // parameter). Transitional expect — remove when the first reader
+    // lands.
+    #[expect(dead_code)]
+    pub(in crate::fs::fs_impls::erofs) name_filter: u32,
+    /// The shared-xattr id array, read once at the lazy init (one
+    /// bare `u32` per `h_shared_count`); `len()` IS the C
+    /// `xattr_shared_count` (S01-D3: no separate count field).
+    // First reader: the shared-entry walk (T-026 S03). Transitional
+    // expect — remove when that reader lands.
+    #[expect(dead_code)]
+    pub(in crate::fs::fs_impls::erofs) shared_ids: Vec<u32>,
+}
+
 /// An in-memory erofs inode.
 ///
 /// Final assembly shape (T-024 S01, `docs/T-013/analysis.md` §1.1):
 /// the nid, the decoded descriptor, the type-specific payload, the
-/// weak filesystem back-pointer, and the VFS extension slot — all
-/// immutable after construction (read-only filesystem, no atime
-/// updates; see the module-level `# Locking` section). The weak
+/// weak filesystem back-pointer, the VFS extension slot, and — since
+/// T-026 S01 — the xattr once-cell (the one interior-mutable field;
+/// see the module-level `# Locking` section). The weak
 /// back-pointer discipline: `self_ref` is the only link back to the
 /// filesystem handle (strong reference cycles are forbidden
 /// family-wide) and the upgrade path carries an `EIO` guard that is
@@ -153,6 +201,13 @@ pub struct Inode {
     payload: InodePayload,
     self_ref: Weak<Erofs>,
     extension: Extension,
+    /// The lazily populated per-inode xattr state (`InodeXattrState`
+    /// above): vacant at construction, filled by the first xattr
+    /// access through `xattr_state` (`xattr.rs`); initialization
+    /// failures leave it vacant so the next access retries (F3).
+    // Read by `xattr_state` (`xattr.rs`, dead-code root until the
+    // entry chains land) — live through that root; no expect needed.
+    pub(in crate::fs::fs_impls::erofs) xattrs: Once<InodeXattrState>,
 }
 
 impl Inode {
@@ -204,6 +259,12 @@ impl Inode {
             payload,
             self_ref: fs.self_ref().clone(),
             extension: Extension::new(),
+            // Vacant at construction — zero xattr I/O inside the iget
+            // critical section (the lazy-host decision: an X1-shaped
+            // inode still igets Ok and serves stat/open; only the
+            // xattr syscalls replay the init error). First access
+            // fills it via `xattr_state` (`xattr.rs`).
+            xattrs: Once::new(),
         }))
     }
 
@@ -1985,6 +2046,9 @@ fn ktest_inode_from_desc(fs: &Erofs, nid: ErofsNid, desc: InodeDesc) -> Arc<Inod
         payload,
         self_ref: fs.self_ref().clone(),
         extension: Extension::new(),
+        // Same vacant-at-construction cell as the production
+        // constructor above (T-026 S01).
+        xattrs: Once::new(),
     })
 }
 
