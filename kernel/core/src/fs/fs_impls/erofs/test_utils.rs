@@ -1094,7 +1094,9 @@ pub(super) fn healthy_fixture() -> ErofsFixture {
 /// checksum is exactly what the V5 forms must preserve stale).
 fn staged_super_block_record(disk: &ErofsMemoryDisk) -> [u8; 128] {
     let mut record = [0u8; 128];
-    disk.segment().read_bytes(SUPER_OFFSET, &mut record).unwrap();
+    disk.segment()
+        .read_bytes(SUPER_OFFSET, &mut record)
+        .unwrap();
     record
 }
 
@@ -1214,7 +1216,8 @@ pub(super) fn fx_sb_bad_checksum() -> ErofsFixture {
     rewritten_chassis(|disk| {
         let mut sb = staged_super_block_record(disk);
         let inos_off = offset_of!(RawSuperBlock, inos);
-        put_le_u64(&mut sb, inos_off, get_le_u64(&sb, inos_off) ^ 0xFF);
+        let inos = get_le_u64(&sb, inos_off);
+        put_le_u64(&mut sb, inos_off, inos ^ 0xFF);
         write_super_block_raw(disk, &sb);
     })
 }
@@ -1226,7 +1229,8 @@ pub(super) fn fx_sb_unknown_incompat_bit() -> ErofsFixture {
     rewritten_chassis(|disk| {
         let mut sb = staged_super_block_record(disk);
         let off = offset_of!(RawSuperBlock, feature_incompat);
-        put_le_u32(&mut sb, off, get_le_u32(&sb, off) | unknown_incompat_bit());
+        let bits = get_le_u32(&sb, off);
+        put_le_u32(&mut sb, off, bits | unknown_incompat_bit());
         write_super_block(disk, &sb);
     })
 }
@@ -1273,7 +1277,8 @@ pub(super) fn fx_sb_bad_checksum_and_unknown_incompat() -> ErofsFixture {
     rewritten_chassis(|disk| {
         let mut sb = staged_super_block_record(disk);
         let off = offset_of!(RawSuperBlock, feature_incompat);
-        put_le_u32(&mut sb, off, get_le_u32(&sb, off) | unknown_incompat_bit());
+        let bits = get_le_u32(&sb, off);
+        put_le_u32(&mut sb, off, bits | unknown_incompat_bit());
         write_super_block_raw(disk, &sb);
     })
 }
@@ -1358,12 +1363,17 @@ pub(super) fn fx_sb_packed_compressed_payload() -> ErofsFixture {
 
         let mut sb = staged_super_block_record(disk);
         let incompat_off = offset_of!(RawSuperBlock, feature_incompat);
+        let incompat = get_le_u32(&sb, incompat_off);
         put_le_u32(
             &mut sb,
             incompat_off,
-            get_le_u32(&sb, incompat_off) | FeatureIncompatSet::FRAGMENTS.bits(),
+            incompat | FeatureIncompatSet::FRAGMENTS.bits(),
         );
-        put_le_u64(&mut sb, offset_of!(RawSuperBlock, packed_nid), CHASSIS_PACKED_NID);
+        put_le_u64(
+            &mut sb,
+            offset_of!(RawSuperBlock, packed_nid),
+            CHASSIS_PACKED_NID,
+        );
         write_super_block(disk, &sb);
     })
 }

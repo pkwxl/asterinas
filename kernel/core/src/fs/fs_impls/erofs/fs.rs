@@ -1233,12 +1233,12 @@ mod tests {
 
     use super::*;
     use crate::fs::fs_impls::erofs::test_utils::{
-        assert_errno, fx_sb_bad_checksum, fx_sb_bad_checksum_and_unknown_incompat,
-        fx_sb_bad_magic, fx_sb_blkszbits_above_supported, fx_sb_blkszbits_below_min,
-        fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
-        fx_sb_extslots_past_page_boundary, fx_sb_packed_compressed_payload,
-        fx_sb_root_compressed, fx_sb_root_nid_out_of_device, fx_sb_root_not_dir,
-        fx_sb_unknown_incompat_bit, fx_sb_volume_name_without_nul, healthy_fixture,
+        assert_errno, fx_sb_bad_checksum, fx_sb_bad_checksum_and_unknown_incompat, fx_sb_bad_magic,
+        fx_sb_blkszbits_above_supported, fx_sb_blkszbits_below_min, fx_sb_dirblkbits_nonzero,
+        fx_sb_extslots_at_page_boundary, fx_sb_extslots_past_page_boundary,
+        fx_sb_packed_compressed_payload, fx_sb_root_compressed, fx_sb_root_nid_out_of_device,
+        fx_sb_root_not_dir, fx_sb_unknown_incompat_bit, fx_sb_volume_name_without_nul,
+        healthy_fixture,
     };
 
     /// fold vectors (the design's §7 fold family). The all-zero
@@ -1365,7 +1365,11 @@ mod tests {
     /// T-027 S04 (FX-SB V4): dirblkbits = 1 fails EINVAL.
     #[ktest]
     fn mount_rejects_nonzero_dirblkbits() {
-        assert_errno!(fx_sb_dirblkbits_nonzero().open, Errno::EINVAL, "V4 dirblkbits door");
+        assert_errno!(
+            fx_sb_dirblkbits_nonzero().open,
+            Errno::EINVAL,
+            "V4 dirblkbits door"
+        );
     }
 
     /// T-027 S04 (FX-SB V5 and the V5+V6 order cross, matrix §2.2 /
@@ -1376,7 +1380,11 @@ mod tests {
     /// suite red.
     #[ktest]
     fn mount_rejects_bad_checksum() {
-        assert_errno!(fx_sb_bad_checksum().open, Errno::EBADMSG, "V5 checksum door");
+        assert_errno!(
+            fx_sb_bad_checksum().open,
+            Errno::EBADMSG,
+            "V5 checksum door"
+        );
         assert_errno!(
             fx_sb_bad_checksum_and_unknown_incompat().open,
             Errno::EBADMSG,
@@ -1409,7 +1417,8 @@ mod tests {
     fn mount_extslots_page_boundary() {
         let fs = fx_sb_extslots_at_page_boundary().mounted();
         assert_eq!(
-            fs.super_block().sb_extslots, 184,
+            fs.super_block().sb_extslots,
+            184,
             "the boundary form mounts with its extslots intact"
         );
         assert_eq!(
