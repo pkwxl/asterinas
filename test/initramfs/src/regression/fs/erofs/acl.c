@@ -297,8 +297,8 @@ FN_TEST(acl_symlink_own_gate)
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
 
-	TEST_ERRNO(lgetxattr(EROFS_INIT_MNT "/symlink/to_file_short",
-			     AC_ACCESS, buf, sizeof(buf)),
+	TEST_ERRNO(lgetxattr(EROFS_INIT_MNT "/symlink/to_file_short", AC_ACCESS,
+			     buf, sizeof(buf)),
 		   EOPNOTSUPP);
 	TEST_ERRNO(lgetxattr(EROFS_INIT_MNT "/symlink/to_file_short",
 			     AC_DEFAULT, buf, sizeof(buf)),
