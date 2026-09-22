@@ -1526,16 +1526,23 @@ impl Inode {
 /// Returns `None` → skip silently: no error, and the entry is NOT
 /// counted in the total (C `prefix == NULL → return 0`, xattr.c:226).
 ///
-/// The full visibility matrix factorizes over three independent
+/// The full visibility matrix factorizes over two independent
 /// inputs — the caller's cap state (carried by `namespace`, W-X02
-/// state B), `user_xattr`, and `posix_acl` (S07 §2.1's 8-combination
-/// exhaustive table): user rows read `user_xattr` only, the acl rows
-/// read `posix_acl` only, the trusted row reads the cap signal only,
-/// security is always visible, dead indexes never — disjoint
-/// predicates, so the factorization IS the exhaustion. Consequence
-/// (X34): the size=0 total varies with the visible set — root and
-/// non-root answer different totals on the same inode (the trusted
-/// row modulates it).
+/// state B) and `user_xattr`: user rows read `user_xattr` only, the
+/// trusted row reads the cap signal only, security is always
+/// visible, and the acl rows are STRUCTURALLY ABSENT — W-X02
+/// state B leaves the single-namespace list face with no System
+/// enumeration channel (the syscall selector passes User/Trusted
+/// only), so the system.* rows never list regardless of
+/// `posix_acl`; S07 §2.1's 8-combination table thus collapses on
+/// the acl axis — that option gates the get half only (X43② in
+/// `get_system_xattr`) — the state-B registered divergence from
+/// Linux, which lists the precise acl names under IS_POSIXACL
+/// (frozen expectation, xattr.c's list-side cell). Dead indexes
+/// never list — disjoint predicates, so the factorization IS the
+/// exhaustion. Consequence (X34): the size=0 total varies with the
+/// visible set — root and non-root answer different totals on the
+/// same inode (the trusted row modulates it).
 fn list_base_prefix(
     fs: &Erofs,
     namespace: XattrNamespace,
@@ -1550,25 +1557,21 @@ fn list_base_prefix(
             fs.mount_options.read().user_xattr().then_some(b"user.")
         }
         XATTR_INDEX_POSIX_ACL_ACCESS => {
-            // X43's list half: noacl → SKIP (the get half answers
-            // EOPNOTSUPP — again one option, two codes, XAT-33②).
-            // The row's output segment is the FULL access-acl name —
-            // F17: no trailing dot (the nop acl handlers carry
-            // `.name`, not `.prefix`; the ext2 trailing-dot form is
-            // the B4 drift cell #3).
-            fs.mount_options
-                .read()
-                .posix_acl()
-                .then_some(b"system.posix_acl_access")
+            // W-X02 state B (T-020 frozen expectation): aster's
+            // single-namespace list face has no System enumeration
+            // channel, so this row resolves to None unconditionally.
+            // The `posix_acl()` gate (X43's noacl half) is get-side
+            // only — never consulted here. Linux lists the FULL
+            // access-acl name (F17: no trailing dot) under
+            // IS_POSIXACL; that divergence is registered in
+            // xattr.c's list-side cell.
+            None
         }
         XATTR_INDEX_POSIX_ACL_DEFAULT => {
-            // Rows 2/3 share the gate predicate (IS_POSIXACL ←
-            // SB_POSIXACL ← the parsed `acl`/`noacl` option) and
-            // differ only in the emitted full name.
-            fs.mount_options
-                .read()
-                .posix_acl()
-                .then_some(b"system.posix_acl_default")
+            // Same state-B channel absence as the access row; the
+            // F17 full-name form and the shared IS_POSIXACL
+            // predicate live on the get half only.
+            None
         }
         XATTR_INDEX_TRUSTED => {
             // X5 (xattr.c:131-134): per-entry capable(CAP_SYS_ADMIN) —
@@ -1741,10 +1744,11 @@ impl Inode {
     /// caller's credentials; the rest of this method is unaffected.
     // Live since T-026 S09: the trait forward in `impl_for_vfs`
     // calls it; through it the list chain above stays live
-    // (list_base_prefix, ListCtx, list_foreach_body, the ACL index
-    // constants, and the posix_acl accessor they consume). The
-    // bridging `expect` of S07–S08 was removed when the forward
-    // landed.
+    // (list_base_prefix, ListCtx, list_foreach_body). The ACL index
+    // constants and the posix_acl accessor stay live through the get
+    // half (`get_system_xattr`, since S08) — the list acl rows
+    // resolve to None unconditionally (W-X02 state B). The bridging
+    // `expect` of S07–S08 was removed when the forward landed.
     pub(in crate::fs::fs_impls::erofs) fn list_xattr(
         &self,
         namespace: XattrNamespace,
