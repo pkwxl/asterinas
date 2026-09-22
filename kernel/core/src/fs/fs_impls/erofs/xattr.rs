@@ -1425,7 +1425,12 @@ impl Inode {
         //    denies the acl query all the same — the empty suffix is
         //    NOT an exempt input (XAT-45). A denial answers ENODATA
         //    with zero walk construction and zero walk I/O.
-        if xattr_filter_denies(fs.super_block(), state.name_filter, query.index, query.suffix) {
+        if xattr_filter_denies(
+            fs.super_block(),
+            state.name_filter,
+            query.index,
+            query.suffix,
+        ) {
             return_errno_with_message!(Errno::ENODATA, "bloom filter: absent");
         }
         // (X21's suffix-length gate: an empty suffix is ≤ NAME_LEN
@@ -1898,9 +1903,9 @@ fn acl_find_value(
 // S05 is the same precedent).
 #[repr(C)]
 struct PosixAclEntry {
-    e_tag: u16, // @0  __le16
+    e_tag: u16,  // @0  __le16
     e_perm: u16, // @2  __le16
-    e_id: u32, // @4  __le32
+    e_id: u32,   // @4  __le32
 }
 
 // Layout triple and per-field offsets (A1), anchored to
@@ -1946,7 +1951,7 @@ fn parse_posix_acl(value: &[u8]) -> Result<Option<Vec<PosixAclEntry>>> {
     // :748-750 — posix_acl_xattr_count's negative case: the remainder
     // must be a whole number of 8-byte records.
     let rest = value.len() - size_of::<u32>();
-    if rest % size_of::<PosixAclEntry>() != 0 {
+    if !rest.is_multiple_of(size_of::<PosixAclEntry>()) {
         return_errno_with_message!(Errno::EINVAL, "acl size misaligned");
     }
     let count = rest / size_of::<PosixAclEntry>();
@@ -1958,7 +1963,13 @@ fn parse_posix_acl(value: &[u8]) -> Result<Option<Vec<PosixAclEntry>>> {
     // count ≤ (65535 − 4) / 8 = 8188 records ≤ 64 KiB; X2: no ENOMEM
     // arm (G-M21).
     let mut entries = Vec::with_capacity(count);
-    for rec in value[size_of::<u32>()..].chunks_exact(size_of::<PosixAclEntry>()) {
+    // The alignment check above already pins the remainder to zero, so
+    // `as_chunks().0` walks exactly the records `chunks_exact` would
+    // (the erofs utils.rs xxh32 stripe ladder is the same precedent).
+    for rec in value[size_of::<u32>()..]
+        .as_chunks::<{ size_of::<PosixAclEntry>() }>()
+        .0
+    {
         // Field offsets 0/2/4 are the const_assert anchors above.
         let e_tag = u16::from_le_bytes(rec[..2].try_into().unwrap());
         let e_perm = u16::from_le_bytes(rec[2..4].try_into().unwrap()); // unvalidated
@@ -1984,7 +1995,11 @@ fn parse_posix_acl(value: &[u8]) -> Result<Option<Vec<PosixAclEntry>>> {
             // entry (e_tag outside {0x01,0x02,0x04,0x08,0x10,0x20}).
             _ => return_errno_with_message!(Errno::EINVAL, "acl unknown tag"),
         }
-        entries.push(PosixAclEntry { e_tag, e_perm, e_id });
+        entries.push(PosixAclEntry {
+            e_tag,
+            e_perm,
+            e_id,
+        });
     }
     Ok(Some(entries))
 }
@@ -2001,7 +2016,7 @@ fn parse_posix_acl(value: &[u8]) -> Result<Option<Vec<PosixAclEntry>>> {
 /// XAT-47 is the anti-passthrough lock (a verbatim-copy
 /// implementation passes XAT-40 and fails exactly there).
 fn serialize_posix_acl(entries: &[PosixAclEntry]) -> Vec<u8> {
-    let cap = size_of::<u32>() + entries.len() * size_of::<PosixAclEntry>();
+    let cap = size_of::<u32>() + size_of_val(entries);
     let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(&POSIX_ACL_XATTR_VERSION.to_le_bytes());
     for e in entries {
