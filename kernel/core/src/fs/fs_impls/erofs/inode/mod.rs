@@ -1272,24 +1272,27 @@ impl DataLayout {
 // transcribed as the module-private host — no framework-wide host
 // exists: `InodeType` carries its own local `TYPE_MASK`, and its
 // `from_raw_mode` is the rejected precedent documented on `FileKind`).
-// S_IFMT/S_IFREG/S_IFLNK/S_IFIFO additionally carry `pub(in …erofs)` for
-// the cfg(ktest) fixture face (the T-027 FX mode patches in test_utils.rs reach
-// them as `inode::{S_IFMT, …}` through this declaration visibility alone).
+// S_IFMT/S_IFREG/S_IFLNK/S_IFIFO/S_IFCHR/S_IFBLK/S_IFSOCK additionally
+// carry `pub(in …erofs)` for the cfg(ktest) fixture face (the T-027 FX
+// mode patches in test_utils.rs reach them as `inode::{S_IFMT, …}`
+// through this declaration visibility alone).
 // AUTO-DECISION: no re-export `use` here — a `use self::{S_IFMT, …}`
 // would collide with these very declarations (E0255, the S04 first-run
 // lesson); and only the names with consumers today carry the widened
 // visibility (S_IFMT/S_IFREG since T-027 S04, S_IFLNK with the S06 FX-NAME
 // symlink-target builder, S_IFIFO with the S08 FX-INODE FIFO×CHUNK
-// acceptance-cross builder), later FX slices widen more as their consumers
-// land. The rest stay private.
+// acceptance-cross builder, S_IFCHR/S_IFBLK/S_IFSOCK with the S11 FX-COMP
+// compressed-special builder), later FX slices widen more as their
+// consumers land. S_IFDIR stays private (the S08/S11 DIR legs keep the
+// seed's own segment — no fixture consumer reaches for it).
 pub(in crate::fs::fs_impls::erofs) const S_IFMT: u16 = 0o170000;
 pub(in crate::fs::fs_impls::erofs) const S_IFIFO: u16 = 0o010000;
-const S_IFCHR: u16 = 0o020000;
+pub(in crate::fs::fs_impls::erofs) const S_IFCHR: u16 = 0o020000;
 const S_IFDIR: u16 = 0o040000;
-const S_IFBLK: u16 = 0o060000;
+pub(in crate::fs::fs_impls::erofs) const S_IFBLK: u16 = 0o060000;
 pub(in crate::fs::fs_impls::erofs) const S_IFREG: u16 = 0o100000;
 pub(in crate::fs::fs_impls::erofs) const S_IFLNK: u16 = 0o120000;
-const S_IFSOCK: u16 = 0o140000;
+pub(in crate::fs::fs::fs_impls::erofs) const S_IFSOCK: u16 = 0o140000;
 
 /// The S_IFMT type segment of `i_mode`, typed (T-001 §9.7.4 full
 /// form; the parity of the source switch, inode.c:138-155).
@@ -2087,6 +2090,7 @@ mod tests {
     use crate::{
         fs::fs_impls::erofs::test_utils::{
             BioRequest, ErofsMemoryDisk, RD1_CROSS_BLOCK_NID, RD1_EXACT_BOUNDARY_NID, assert_errno,
+            fx_comp_compressed_reg_dir_lnk, fx_comp_compressed_special_files,
             fx_inode_bogus_mode, fx_inode_chunk_format, fx_inode_cross_block_slot,
             fx_inode_datalayout_reserved, fx_inode_exact_boundary_slot, fx_inode_ifmt_high_bits,
             fx_inode_kind_layout_cross, fx_inode_negative_size, fx_time_compact_ctime,
@@ -2962,5 +2966,75 @@ mod tests {
             inode.metadata().last_modify_at,
             Duration::new(1_600_000_000, 0)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // T-027 S11: the FX-COMP iget-half suite (S06 §5.7 rows 4/5; matrix
+    // §5.1 ⑦⑧ + the §5.2 G-Z02 dual-caliber accounting). Both forms
+    // mount Ok (no mount gate reads a child slot): the rejection fires
+    // at `InodePayload::new`'s I12 arm-head gate, the accounting at the
+    // decode — asserted here through `iget` and `metadata()`, the
+    // statx single source (`nr_sectors_allocated` takes the decoded
+    // `nr_sectors` verbatim, X10/G-Z02).
+    // ------------------------------------------------------------------
+
+    /// Row 4 (matrix §5.1⑦): the three iget-gated kinds over the
+    /// algs=0 chassis — REG/CompressedFull, DIR/CompressedCompact,
+    /// LNK/CompressedFull — each iget failing EOPNOTSUPP at the I12
+    /// arm-head gate. This is the errno-SOURCE assertion: through the
+    /// upper layers the same failure surfaces as an ENOENT/EIO-class
+    /// error; the row pins the source itself (uncached, replayed on
+    /// every call).
+    #[ktest]
+    fn compressed_reg_dir_lnk_iget_rejects_with_eopnotsupp() {
+        let fixture = fx_comp_compressed_reg_dir_lnk();
+        let fs = fixture.mounted();
+        assert_errno!(fs.iget(2), Errno::EOPNOTSUPP);
+        assert_errno!(fs.iget(4), Errno::EOPNOTSUPP);
+        assert_errno!(fs.iget(6), Errno::EOPNOTSUPP);
+    }
+
+    /// Row 5 (matrix §5.1⑧ + §5.2 G-Z02; the S06 §5.2
+    /// compressed-special row): the special arms never touch the I12
+    /// gate, so every compressed special igets Ok with its payload
+    /// assembled — and st_blocks (`nr_sectors_allocated`, the statx
+    /// single source) follows the COMPRESSED caliber
+    /// `nblks << (blkszbits - 9)` (blkszbits 12 → << 3), never the
+    /// ext2-style round_up(i_size) caliber. Every leg's nblks/size
+    /// pair makes the two calibers disagree, in both directions:
+    /// 5→40 vs 0, 9→72 vs 8, 1→8 vs 16, 3→24 vs 0. The nblks=0 corner
+    /// (nid 10) falls back to the generic round_up caliber —
+    /// round_up(5000, 4096) >> 9 = 16 — the row's own 边角. The
+    /// W-N01 stx_attributes face is the initramfs-side registered
+    /// difference, not re-asserted here.
+    #[ktest]
+    fn compressed_special_files_iget_ok_compressed_blocks_caliber() {
+        let fixture = fx_comp_compressed_special_files();
+        let fs = fixture.mounted();
+
+        let chr = fs.iget(2).unwrap();
+        assert_eq!(chr.kind(), FileKind::Chr);
+        assert!(matches!(chr.payload, InodePayload::Device { .. }));
+        assert_eq!(chr.metadata().nr_sectors_allocated, 40);
+
+        let blk = fs.iget(4).unwrap();
+        assert_eq!(blk.kind(), FileKind::Blk);
+        assert!(matches!(blk.payload, InodePayload::Device { .. }));
+        assert_eq!(blk.metadata().nr_sectors_allocated, 72);
+
+        let fifo = fs.iget(6).unwrap();
+        assert_eq!(fifo.kind(), FileKind::Fifo);
+        assert!(matches!(fifo.payload, InodePayload::Fifo { .. }));
+        assert_eq!(fifo.metadata().nr_sectors_allocated, 8);
+
+        let sock = fs.iget(8).unwrap();
+        assert_eq!(sock.kind(), FileKind::Sock);
+        assert!(matches!(sock.payload, InodePayload::NoPayload));
+        assert_eq!(sock.metadata().nr_sectors_allocated, 24);
+
+        // The nblks=0 corner: the generic caliber takes over.
+        let corner = fs.iget(10).unwrap();
+        assert_eq!(corner.kind(), FileKind::Fifo);
+        assert_eq!(corner.metadata().nr_sectors_allocated, 16);
     }
 }

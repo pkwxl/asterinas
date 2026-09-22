@@ -136,6 +136,18 @@
 //!   S04, 断言 S10 复用). The iget half (rows 4/5/7) is S11's, over
 //!   the same chassis.
 //!
+//! * **T-027 S11, the FX-COMP iget-half family**: three more named
+//!   constructors over the S10 `comp_chassis` single source — the
+//!   compressed REG/DIR/LNK rejection trio (row 4, the I12 errno
+//!   source; suite in `inode/mod.rs`), the compressed special files
+//!   with the G-Z02 dual-caliber st_blocks accounting and its
+//!   nblks=0 fallback corner (row 5 + §5.2; suite in `inode/mod.rs`),
+//!   and the dual-malformed mount-Ok form — FRAGMENTS plus a packed
+//!   NON-compressed payload (row 7, G-Z05's counterpart direction,
+//!   never tightened; suite in `fs.rs`). Three inode-mode constants
+//!   widen their declaration visibility for the special-file legs
+//!   (the S04/S06/S08 precedent, `inode/mod.rs`).
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -169,8 +181,8 @@ use super::{
     inode::{
         AddrState, CHUNK_FORMAT_ALL, CHUNK_FORMAT_INDEXES, ChunkGeometry, DataGeometry, DataLayout,
         FileKind, I_ALL, I_DATALAYOUT_BIT, I_VERSION_BIT, INODE_DATALAYOUT_MAX, ISLOT_BITS,
-        InodeDesc, InodeVersion, RawDirent, RawInodeCompact, RawInodeExtended, S_IFIFO, S_IFLNK,
-        S_IFMT, S_IFREG, inode_location,
+        InodeDesc, InodeVersion, RawDirent, RawInodeCompact, RawInodeExtended, S_IFBLK, S_IFCHR,
+        S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, inode_location,
     },
     prelude::*,
     super_block::{
@@ -2713,6 +2725,160 @@ pub(super) fn fx_comp_incompat_ztailpacking() -> ErofsFixture {
 /// leg pins only the V6 acceptance. Expected mount Ok.
 pub(super) fn fx_comp_incompat_fragments() -> ErofsFixture {
     comp_chassis(FeatureIncompatSet::FRAGMENTS, |_| {})
+}
+
+// ===========================================================================
+// T-027 S11: the FX-COMP iget-half family (S06 §5.7 rows 4/5/7; matrix
+// §5.1 ⑦⑧⑥ + the §5.2 G-Z02 dual-caliber accounting + the S06 §5.2
+// compressed-special row). Rows 4/5 lay compressed-datalayout children
+// over the row-2 algs=0 chassis (`comp_chassis(COMPR_CFGS, …)` — the
+// S10 single-source contract: "S11's iget-half builders re-consume
+// this constructor"); the iget assertions live in `inode/mod.rs` (the
+// D1 host rule — I12 fires at `InodePayload::new`, the st_blocks
+// accounting at the decode). Row 7 (the dual-malformed mount-Ok form)
+// lays its packed inode over the FRAGMENTS chassis; the mount-Ok
+// assertion lives in `fs.rs` (the Step-4 F10 door is `Erofs::open`
+// business).
+//
+// AUTO-DECISION: rows 4/5 ride the COMPR_CFGS leg of the algs=0
+// chassis. Neither the I12 gate nor the nblks accounting consults any
+// superblock bit, so any u1=0 chassis realizes the two rows;
+// COMPR_CFGS is §5.7's own spelling of "algs=0 畸形底盘" and the S10
+// §5 fact pinned the iget half to this exact constructor. Rejected:
+// the plain incompat=0 chassis (u1=0 ∧ no bit is not the §5.7 chassis
+// form, and it would fork the single source); the FRAGMENTS chassis
+// (that bit is row 7's own identity).
+//
+// AUTO-DECISION: the compressed datalayout value spans {1, 3} across
+// the legs — row 4's DIR leg and row 5's SOCK leg carry
+// CompressedCompact, the rest CompressedFull. `is_data_compressed()`
+// treats the pair identically, so spanning both keeps each row
+// self-contained without extra children. Rejected: one value for all
+// legs (leaves 3 unexercised inside the family); the full {1,3} ×
+// kind matrix (8+ cells — beyond the rows' face, 加严).
+//
+// AUTO-DECISION: row 5's nblks/size pairs are picked so every leg's
+// compressed caliber DIFFERS from its round_up(i_size) fallback, in
+// both directions (5→40 vs 0, 9→72 vs 8, 1→8 vs 16, 3→24 vs 0) — the
+// caliber distinction IS the §5.2 assertion ("非 round_up(i_size)
+// 口径, 防沿用 ext2 样板口径漂移"); the nblks=0 corner rides the
+// same image (the fx_inode_bogus_mode two-corners-in-one-image
+// precedent). Rejected: a separate builder for the corner (the row's
+// own 边角; the S06 form list stays 3).
+// ===========================================================================
+
+/// Switches an extended seed record into a COMPRESSED child — the
+/// datalayout word rewritten, the S_IFMT segment optionally switched
+/// (`None` keeps the seed's DIR segment, the `patch_chunk_child`
+/// shape) — leaving i_size/i_u at the seed bytes: the row-4 rejection
+/// forms need no more (the I12 arm-head gate fires before any payload
+/// consumption, the S04 packed-material discipline).
+fn patch_compressed_child(record: &mut [u8; 64], layout: DataLayout, type_segment: Option<u16>) {
+    put_le_u16(
+        record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, layout),
+    );
+    if let Some(segment) = type_segment {
+        let mode_off = offset_of!(RawInodeExtended, i_mode);
+        let mode = get_le_u16(record, mode_off);
+        put_le_u16(record, mode_off, (mode & !S_IFMT) | segment);
+    }
+}
+
+/// The row-5 staging face: a compressed special-file child with
+/// explicit accounting knobs — `nblks` lands in `i_u` (the D9 second
+/// reading; the CHR/BLK rdev decode reads the SAME word — the i_u
+/// double-read the acceptance row pins) and `size` in `i_size` (the
+/// round_up fallback caliber's input).
+fn patch_compressed_special(
+    record: &mut [u8; 64],
+    layout: DataLayout,
+    type_segment: u16,
+    size: u64,
+    nblks: u32,
+) {
+    patch_compressed_child(record, layout, Some(type_segment));
+    put_le_u64(record, offset_of!(RawInodeExtended, i_size), size);
+    put_le_u32(record, offset_of!(RawInodeExtended, i_u), nblks);
+    put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
+}
+
+/// Row 4 (§5.1⑦) — the three iget-gated kinds over the algs=0
+/// chassis: REG (nid 2, CompressedFull), DIR (nid 4, CompressedCompact,
+/// the seed's own DIR segment kept), LNK (nid 6, CompressedFull),
+/// i_size/i_u left at the seed bytes. Every iget fails at the I12
+/// arm-head gate — the errno-SOURCE face (matrix ⑦: through the upper
+/// layers the same failure surfaces as an ENOENT/EIO-class error; the
+/// row pins the source itself). Suite: `inode/mod.rs`.
+pub(super) fn fx_comp_compressed_reg_dir_lnk() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::COMPR_CFGS, |disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            patch_compressed_child(record, DataLayout::CompressedFull, Some(S_IFREG));
+        });
+        lay_extended_child_at(disk, 4, |record| {
+            patch_compressed_child(record, DataLayout::CompressedCompact, None);
+        });
+        lay_extended_child_at(disk, 6, |record| {
+            patch_compressed_child(record, DataLayout::CompressedFull, Some(S_IFLNK));
+        });
+    })
+}
+
+/// Row 5 (§5.1⑧ + §5.2 G-Z02; the S06 §5.2 compressed-special row) —
+/// four compressed special children plus the nblks=0 corner, one
+/// image: CHR nid 2 (nblks 5, size 0), BLK nid 4 (9, 100), FIFO nid 6
+/// (1, 5000 — the inverted corner: the compressed caliber lands BELOW
+/// the fallback), SOCK nid 8 (CompressedCompact, 3, 0), and FIFO nid
+/// 10 (nblks 0, size 5000 — the generic-caliber corner). iget
+/// succeeds on every slot (the special arms never touch I12), and
+/// st_blocks follows the compressed caliber. Suite: `inode/mod.rs`
+/// (the W-N01 stx_attributes face is the initramfs-side registered
+/// difference, not re-asserted there).
+pub(super) fn fx_comp_compressed_special_files() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::COMPR_CFGS, |disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            patch_compressed_special(record, DataLayout::CompressedFull, S_IFCHR, 0, 5);
+        });
+        lay_extended_child_at(disk, 4, |record| {
+            patch_compressed_special(record, DataLayout::CompressedFull, S_IFBLK, 100, 9);
+        });
+        lay_extended_child_at(disk, 6, |record| {
+            patch_compressed_special(record, DataLayout::CompressedFull, S_IFIFO, 5_000, 1);
+        });
+        lay_extended_child_at(disk, 8, |record| {
+            patch_compressed_special(record, DataLayout::CompressedCompact, S_IFSOCK, 0, 3);
+        });
+        lay_extended_child_at(disk, 10, |record| {
+            patch_compressed_special(record, DataLayout::CompressedFull, S_IFIFO, 5_000, 0);
+        });
+    })
+}
+
+/// Row 7 (§5.1⑥) — the dual-malformed mount-Ok form: algs=0 +
+/// FRAGMENTS + packed_nid addressing a NON-compressed payload (a
+/// fully healthy FLAT_PLAIN REG over block 9, the
+/// `patch_rd1_reg_record` shape — unlike the S04 compressed material,
+/// whose seed bytes hid behind the I12 gate, this record must iget Ok
+/// at the Step-4 F10 door). Expected mount Ok: F10 checks only for a
+/// compressed payload; a "packed must be compressed" cross-check does
+/// not exist and must not be added (G-Z05, 不得顺手加严). Suite:
+/// `fs.rs`.
+pub(super) fn fx_comp_packed_uncompressed_payload() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::FRAGMENTS, |disk| {
+        // The packed inode first — `write_inode_at` addresses through
+        // the still-healthy staged superblock.
+        lay_extended_child_at(disk, CHASSIS_PACKED_NID, |record| {
+            patch_rd1_reg_record(record, 100, 0);
+        });
+        let mut sb = staged_super_block_record(disk);
+        put_le_u64(
+            &mut sb,
+            offset_of!(RawSuperBlock, packed_nid),
+            CHASSIS_PACKED_NID,
+        );
+        write_super_block(disk, &sb);
+    })
 }
 
 // ===========================================================================

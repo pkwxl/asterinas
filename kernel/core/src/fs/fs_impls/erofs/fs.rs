@@ -1235,9 +1235,10 @@ mod tests {
     use crate::fs::fs_impls::erofs::test_utils::{
         ErofsFixture, assert_errno, fx_comp_algs_unknown_bit, fx_comp_algs_zero_with_cfgs,
         fx_comp_incompat_device_table, fx_comp_incompat_fragments, fx_comp_incompat_zero_padding,
-        fx_comp_incompat_ztailpacking, fx_comp_u1_without_cfgs, fx_sb_bad_checksum,
-        fx_sb_bad_checksum_and_unknown_incompat, fx_sb_bad_magic, fx_sb_blkszbits_above_supported,
-        fx_sb_blkszbits_below_min, fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
+        fx_comp_incompat_ztailpacking, fx_comp_packed_uncompressed_payload,
+        fx_comp_u1_without_cfgs, fx_sb_bad_checksum, fx_sb_bad_checksum_and_unknown_incompat,
+        fx_sb_bad_magic, fx_sb_blkszbits_above_supported, fx_sb_blkszbits_below_min,
+        fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
         fx_sb_extslots_past_page_boundary, fx_sb_packed_compressed_payload, fx_sb_root_compressed,
         fx_sb_root_nid_out_of_device, fx_sb_root_not_dir, fx_sb_unknown_incompat_bit,
         fx_sb_volume_name_without_nul, healthy_fixture,
@@ -1606,5 +1607,25 @@ mod tests {
             Errno::EOPNOTSUPP,
             "§5.1⑤: layer 1 passes (u1 = 0), F10 iget -> I12"
         );
+    }
+
+    /// T-027 S11 (FX-COMP row 7, matrix §5.1⑥ — G-Z05's counterpart
+    /// direction): the dual-malformed form — algs=0 + FRAGMENTS +
+    /// packed_nid addressing a NON-compressed REG — mounts Ok. The
+    /// Step-4 F10 iget checks only for a compressed payload; a
+    /// "packed must be compressed" cross-check does not exist and
+    /// must not be added (不得顺手加严 — this row IS the negative
+    /// confirmation). Mirror locks: exactly the FRAGMENTS bit, and
+    /// packed_nid at the laid slot (literals independent of the
+    /// staging constants, the S03 drift-alarm discipline).
+    #[ktest]
+    fn mount_accepts_packed_uncompressed_payload() {
+        let fs = fx_comp_packed_uncompressed_payload().mounted();
+        assert_eq!(
+            fs.super_block().feature_incompat,
+            FeatureIncompatSet::FRAGMENTS.bits(),
+            "exactly the FRAGMENTS bit landed"
+        );
+        assert_eq!(fs.super_block().packed_nid, 2, "the laid packed slot");
     }
 }
