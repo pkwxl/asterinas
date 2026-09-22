@@ -136,6 +136,21 @@ use self::data::{ChunkGeometry, DataGeometry};
 // same declaration/re-export split as `DataBackend` above.
 #[cfg(ktest)]
 pub(super) use self::dir::RawDirent;
+// The ktest fixture face of the mode constants: the T-027 FX builders
+// switch an inode's S_IFMT type segment (FX-SB's REG root, the
+// FX-COMP special files, FX-NAME's LNK forms) through the same
+// constants the decode consumes — a spelled 0o100000 would be a
+// second truth of a structural on-disk value. cfg-gated for the same
+// reason as the geometry re-export above; the declarations
+// accordingly carry `pub(in crate::fs::fs_impls::erofs)` — a
+// `pub(super) use` cannot re-export a module-private item beyond
+// `inode` (E0365), the same declaration/re-export split as
+// `RawDirent`. AUTO-DECISION: only the two names with consumers today
+// are re-exported (S_IFMT/S_IFREG, T-027 S04); later FX slices append
+// their names as their consumers land — an unconsumed name here
+// trips `unused_imports` (the S02 assert_errno lesson).
+#[cfg(ktest)]
+pub(super) use self::{S_IFMT, S_IFREG};
 use self::{
     data::RawInodeChunkIndex,
     symlink::{is_fast_symlink, read_inline_target},
@@ -1272,12 +1287,14 @@ impl DataLayout {
 // transcribed as the module-private host — no framework-wide host
 // exists: `InodeType` carries its own local `TYPE_MASK`, and its
 // `from_raw_mode` is the rejected precedent documented on `FileKind`).
-const S_IFMT: u16 = 0o170000;
+// S_IFMT/S_IFREG additionally carry `pub(in …erofs)` for the cfg(ktest)
+// re-export above (the T-027 FX mode patches); the rest stay private.
+pub(in crate::fs::fs_impls::erofs) const S_IFMT: u16 = 0o170000;
 const S_IFIFO: u16 = 0o010000;
 const S_IFCHR: u16 = 0o020000;
 const S_IFDIR: u16 = 0o040000;
 const S_IFBLK: u16 = 0o060000;
-const S_IFREG: u16 = 0o100000;
+pub(in crate::fs::fs_impls::erofs) const S_IFREG: u16 = 0o100000;
 const S_IFLNK: u16 = 0o120000;
 const S_IFSOCK: u16 = 0o140000;
 

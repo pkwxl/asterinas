@@ -54,6 +54,15 @@
 //!   bytes lives in `fs.rs` (`healthy_fixture_mounts`); the FX-*
 //!   malformed builders (S04+) are local rewrites of this chassis.
 //!
+//! * **T-027 S04, the FX-SB builder family**: fourteen named
+//!   constructors (`fx_sb_*`), each a local rewrite of the healthy
+//!   chassis per S06 §5.1 — the V2–V8 superblock doors, the V5+V6
+//!   order cross, and the G-M15 root/packed mount doors. The
+//!   mount-assertion suite lives in `fs.rs` (the D1 host rule); the
+//!   G-M10 truncated-disk form is S14's (its assertion value is a
+//!   registered drift finalized there). Later slices append the
+//!   FX-DIRENT/NAME/TIME/INODE/COMP/XATTR families the same way.
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -87,12 +96,12 @@ use super::{
     inode::{
         AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, I_DATALAYOUT_BIT,
         I_VERSION_BIT, ISLOT_BITS, InodeDesc, InodeVersion, RawDirent, RawInodeCompact,
-        RawInodeExtended, inode_location,
+        RawInodeExtended, S_IFMT, S_IFREG, inode_location,
     },
     prelude::*,
     super_block::{
-        FeatureCompatSet, RawSuperBlock, SUPER_OFFSET, SUPPORTED_BLKSZBITS, SuperBlock,
-        verify_superblock_checksum,
+        BLKSZBITS_MIN, FeatureCompatSet, FeatureIncompatSet, RawSuperBlock, SUPER_MAGIC_V1,
+        SUPER_OFFSET, SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
     utils::crc32c,
 };
@@ -1052,6 +1061,311 @@ pub(super) fn healthy_fixture() -> ErofsFixture {
         root_nid: CHASSIS_ROOT_NID,
         meta_blkaddr: u64::from(CHASSIS_META_BLKADDR),
     }
+}
+
+// ===========================================================================
+// T-027 S04: the FX-SB builder family (S06 §5.1; matrix §1.6 label row
+// IMG-CRAFT-SB serving the §2.2 crafted rows). Fourteen named
+// constructors, each a LOCAL rewrite of the healthy chassis — a healthy
+// mkfs produces no malformed form, so the fixture口径 stays "minimal
+// patches over staged bytes". Superblock field patches go through
+// `write_super_block` (the §3.4 checksummed finish); the V5-family
+// forms alone stage through `write_super_block_raw`, the single
+// explicit skip channel, so the chassis checksum goes stale on
+// purpose. The mount-assertion suite lives in `fs.rs` (the D1 host
+// rule — the V1–V10 order authority is `Erofs::open`); the G-M10
+// truncated-DISK form is S14's and is not built here.
+//
+// AUTO-DECISION: the V-door values are derived, not spelled — bad
+// magic = SUPER_MAGIC_V1 ^ 0x0100_0000 (the §5.1 one-bit diff), the
+// blkszbits pair = BLKSZBITS_MIN − 1 / SUPPORTED_BLKSZBITS + 1, the
+// unknown incompat bit = next_power_of_two(known union). Only the
+// extslots 184/185 pair is spelled (the forms' identity, per §5.1's
+// own spelling), with the exactness of 184 cross-locked in the fs.rs
+// suite against the production `sb_size()` == SUPER_REGION_MAX.
+// Rejected: literals everywhere (a second truth per value; §5.1's
+// "不抄字面" note names the incompat bit — the same discipline covers
+// the rest of the family).
+// ===========================================================================
+
+/// Reads the currently staged 128-byte superblock record — the raw
+/// byte view the `fx_sb_*` patches consume (the decoded mirror of
+/// `staged_super_block` cannot carry the checksum field, and the
+/// checksum is exactly what the V5 forms must preserve stale).
+fn staged_super_block_record(disk: &ErofsMemoryDisk) -> [u8; 128] {
+    let mut record = [0u8; 128];
+    disk.segment().read_bytes(SUPER_OFFSET, &mut record).unwrap();
+    record
+}
+
+/// Stages the healthy chassis, applies the local `rewrite`, then
+/// attempts the production mount — the shared shape of every `fx_sb_*`
+/// builder below (the S06 §4.3 fixture form: one value carrying both
+/// the staged disk and the `Erofs::open` result).
+fn rewritten_chassis(rewrite: impl FnOnce(&ErofsMemoryDisk)) -> ErofsFixture {
+    let disk = Arc::new(ErofsMemoryDisk::new(
+        CHASSIS_NR_BLOCKS as usize * CHASSIS_BLOCK_SIZE,
+    ));
+    stage_healthy_chassis(&disk);
+    rewrite(&disk);
+    let open = Erofs::open(disk.clone() as Arc<dyn BlockDevice>, FsFlags::empty(), None);
+    ErofsFixture {
+        disk,
+        open,
+        root_nid: CHASSIS_ROOT_NID,
+        meta_blkaddr: u64::from(CHASSIS_META_BLKADDR),
+    }
+}
+
+/// Reads the chassis root inode record, applies `patch`, and re-stages
+/// it at the same slot. The G-M15 root-door rewrites touch exactly one
+/// field each (i_format / i_mode); everything else stays the staged
+/// chassis bytes.
+// AUTO-DECISION: the G-M15 root forms patch the staged record in
+// place (read → patch one field → re-stage) rather than re-laying it
+// from the template — the minimal-rewrite口径 made literal: one field
+// differs from the healthy chassis, the other 62 bytes are provably
+// untouched. Rejected: template re-lay (re-stages 63 unchanged bytes
+// and couples the form to seed values it does not consume).
+fn patch_root_inode(disk: &ErofsMemoryDisk, patch: impl FnOnce(&mut [u8; 64])) {
+    let iloc = inode_location(&staged_super_block(disk), CHASSIS_ROOT_NID) as usize;
+    let mut record = [0u8; 64];
+    disk.segment().read_bytes(iloc, &mut record).unwrap();
+    patch(&mut record);
+    write_inode_at(disk, CHASSIS_ROOT_NID, &record);
+}
+
+/// The lowest `feature_incompat` bit outside the known-bit union
+/// (0x7F → 0x80), derived from the production flag set — S06 §5.1's
+/// "位集引 T-010 §3.2 FeatureIncompatSet 常量,不抄字面" made code.
+/// `next_power_of_two` of the union is strictly above it, hence
+/// outside it, and tracks any future known-bit addition automatically.
+fn unknown_incompat_bit() -> u32 {
+    FeatureIncompatSet::all().bits().next_power_of_two()
+}
+
+// The V7 boundary forms (S06 §5.1): sb_size = 128 + 16 × extslots must
+// stay within SUPER_REGION_MAX (= PAGE_SIZE − SUPER_OFFSET = 3072), so
+// extslots = 184 is the exact page-boundary pass form (128 + 16 × 184
+// = 3072) and 185 the first reject (3088 > 3072). The 16 is
+// SB_EXTSLOT_SIZE, module-private in `super_block.rs` — the pair is
+// spelled as the forms' identity (§5.1's own spelling), and the fs.rs
+// suite cross-locks 184's exactness against the production `sb_size()`
+// consuming SUPER_REGION_MAX (the PAGE-derived criterion the matrix
+// §2.2 row forbids rewriting as a block-size bound).
+const SB_EXTSLOTS_PAGE_BOUNDARY: u8 = 184;
+const SB_EXTSLOTS_PAST_BOUNDARY: u8 = 185;
+
+/// V2 — bad magic: the chassis magic with exactly one bit flipped
+/// (0xE0F5E1E2 → 0xE1F5E1E2, the §5.1 one-bit diff, derived from the
+/// production constant). Expected EINVAL at the V2 door (matrix §2.2
+/// crafted row).
+pub(super) fn fx_sb_bad_magic() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        put_le_u32(
+            &mut sb,
+            offset_of!(RawSuperBlock, magic),
+            SUPER_MAGIC_V1 ^ 0x0100_0000,
+        );
+        write_super_block(disk, &sb);
+    })
+}
+
+/// V3 lower arm — blkszbits one below `BLKSZBITS_MIN` (= 8). Expected
+/// EINVAL (matrix §2.2 crafted row: the range rejection face of
+/// G-M08, not the healthy sub-4k image face — that is the initramfs
+/// BS-ALT family, never a fixture).
+pub(super) fn fx_sb_blkszbits_below_min() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        sb[offset_of!(RawSuperBlock, blkszbits)] = BLKSZBITS_MIN - 1;
+        write_super_block(disk, &sb);
+    })
+}
+
+/// V3 upper arm — blkszbits one above the supported 4k (= 13, past
+/// `BLKSZBITS_MAX`). Expected EINVAL. The disk geometry stays 4k: an
+/// FX-SB V3 rewrite is a field patch, not a geometry change (S06 §3.2
+/// "主列 fixture 物理块恒 4096B").
+pub(super) fn fx_sb_blkszbits_above_supported() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        sb[offset_of!(RawSuperBlock, blkszbits)] = SUPPORTED_BLKSZBITS + 1;
+        write_super_block(disk, &sb);
+    })
+}
+
+/// V4 — non-zero dirblkbits (= 1). Expected EINVAL.
+pub(super) fn fx_sb_dirblkbits_nonzero() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        sb[offset_of!(RawSuperBlock, dirblkbits)] = 1;
+        write_super_block(disk, &sb);
+    })
+}
+
+/// V5 — bad superblock checksum: one byte of the gate-inert `inos`
+/// field flipped (inos feeds only the statfs ffree arithmetic, so the
+/// stale checksum is the ONLY broken invariant), staged through
+/// `write_super_block_raw` — the single explicit skip of the §3.4
+/// recompute. Expected EBADMSG (matrix §2.2 / the G-M09 bad half).
+pub(super) fn fx_sb_bad_checksum() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        let inos_off = offset_of!(RawSuperBlock, inos);
+        put_le_u64(&mut sb, inos_off, get_le_u64(&sb, inos_off) ^ 0xFF);
+        write_super_block_raw(disk, &sb);
+    })
+}
+
+/// V6 — an unknown incompat bit (checksummed staging: V5 passes, the
+/// unknown-bit door fires). Expected EINVAL; the known bits' mount-Ok
+/// acceptance face is the FX-COMP per-bit family (S10), not here.
+pub(super) fn fx_sb_unknown_incompat_bit() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        let off = offset_of!(RawSuperBlock, feature_incompat);
+        put_le_u32(&mut sb, off, get_le_u32(&sb, off) | unknown_incompat_bit());
+        write_super_block(disk, &sb);
+    })
+}
+
+/// V7 pass form — sb_extslots = 184, the exact page boundary (sb_size
+/// = SUPER_REGION_MAX = 3072). Expected mount Ok; the fs.rs suite
+/// cross-locks `sb_size() == SUPER_REGION_MAX` on the mounted mirror.
+pub(super) fn fx_sb_extslots_at_page_boundary() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        sb[offset_of!(RawSuperBlock, sb_extslots)] = SB_EXTSLOTS_PAGE_BOUNDARY;
+        write_super_block(disk, &sb);
+    })
+}
+
+/// V7 reject form — sb_extslots = 185, one slot past the page boundary
+/// (sb_size = 3088 > 3072). Expected EINVAL.
+pub(super) fn fx_sb_extslots_past_page_boundary() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        sb[offset_of!(RawSuperBlock, sb_extslots)] = SB_EXTSLOTS_PAST_BOUNDARY;
+        write_super_block(disk, &sb);
+    })
+}
+
+/// V8 — volume_name with no NUL byte in its 16 bytes (all 0x41).
+/// Expected EUCLEAN (the EFSCORRUPTED mapping).
+pub(super) fn fx_sb_volume_name_without_nul() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        let off = offset_of!(RawSuperBlock, volume_name);
+        sb[off..off + size_of::<[u8; 16]>()].fill(0x41);
+        write_super_block(disk, &sb);
+    })
+}
+
+/// The V5+V6 order cross — both failures in one image: an unknown
+/// incompat bit AND a stale checksum (raw staging, the V5 skip
+/// channel). The mount must fail EBADMSG: the V5 door runs before the
+/// V6 door, and a reorder of `read_superblock` would surface EINVAL
+/// here instead (matrix §2.2: the errno priority chain IS the
+/// assertion surface).
+pub(super) fn fx_sb_bad_checksum_and_unknown_incompat() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        let off = offset_of!(RawSuperBlock, feature_incompat);
+        put_le_u32(&mut sb, off, get_le_u32(&sb, off) | unknown_incompat_bit());
+        write_super_block_raw(disk, &sb);
+    })
+}
+
+/// G-M10 root door — root_nid = 0xFFFF (le16 max): the iloc formula
+/// sends the Step-5 iget's inode read some 2 MB past the 128 KiB
+/// device, and the framework byte-channel bound fails it before the
+/// device is reached. Expected EINVAL — the registered drift value
+/// (matrix §2.2 G-M10: Linux's metabuf read fails EIO; aster EINVAL
+/// per the T-014 §4.4 byte-channel ledger). The truncated-DISK
+/// sibling of this family is S14's (R1, value finalized there).
+pub(super) fn fx_sb_root_nid_out_of_device() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        put_le_u16(&mut sb, offset_of!(RawSuperBlock, root_nid), u16::MAX);
+        write_super_block(disk, &sb);
+    })
+}
+
+/// G-M15 root door, compressed half — the chassis root's datalayout
+/// switched to CompressedFull (i_format only; the DIR mode stays).
+/// The Step-5 iget fails at the I12 arm-head gate, ahead of the F12
+/// type judgement. Expected EOPNOTSUPP — the errno-distinguishable
+/// negative control of the F12 EINVAL below (matrix §2.2 G-M15 row:
+/// "root 压缩目录 → EOPNOTSUPP 非 F12 的 EINVAL").
+pub(super) fn fx_sb_root_compressed() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_root_inode(disk, |root| {
+            put_le_u16(
+                root,
+                offset_of!(RawInodeExtended, i_format),
+                chassis_i_format(InodeVersion::Extended, DataLayout::CompressedFull),
+            );
+        })
+    })
+}
+
+/// G-M15 root door, type half — the chassis root's S_IFMT segment
+/// switched DIR → REG (the 0755 permission bits stay). The iget
+/// SUCCEEDS (a healthy REG decodes and assembles fine), then the F12
+/// type gate rejects. Expected EINVAL (matrix §2.2 G-M15: "root 是
+/// REG 读成功后类型判 → EINVAL,与 i_format 非法 EOPNOTSUPP 可区分"
+/// — iget-before-type is the order face).
+pub(super) fn fx_sb_root_not_dir() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_root_inode(disk, |root| {
+            let mode_off = offset_of!(RawInodeExtended, i_mode);
+            let mode = get_le_u16(root, mode_off);
+            put_le_u16(root, mode_off, (mode & !S_IFMT) | S_IFREG);
+        })
+    })
+}
+
+/// The nid the FX-SB G-M15 packed-payload form lays its compressed
+/// inode at: the first free even slot behind the extended root
+/// (uniform-extended — the root record holds slots 0/1, so nid 2 is
+/// next; the chassis parity convention, not a C10-measured value).
+const CHASSIS_PACKED_NID: u64 = 2;
+
+/// G-M15 packed door — FRAGMENTS set plus packed_nid addressing a
+/// freshly-laid compressed REG inode (the extended seed with the type
+/// segment switched to REG and the datalayout to CompressedFull;
+/// i_u/i_size stay seed bytes — the I12 gate fires before any payload
+/// consumption). The Step-4 F10 iget fails at I12. Expected EOPNOTSUPP
+/// (mount failure; matrix §2.2 G-M15 / T-004 §7.7 ⑤ — the same
+/// material the FX-COMP family re-consumes, S06 §5.7's "同素材双消费"
+/// note; the u1≠0 and per-bit acceptance comp forms are S10's).
+pub(super) fn fx_sb_packed_compressed_payload() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        // The packed inode first — `write_inode_at` addresses through
+        // the still-healthy staged superblock.
+        let mut packed = INODE_EXT_TEMPLATE;
+        put_le_u16(
+            &mut packed,
+            offset_of!(RawInodeExtended, i_format),
+            chassis_i_format(InodeVersion::Extended, DataLayout::CompressedFull),
+        );
+        let mode_off = offset_of!(RawInodeExtended, i_mode);
+        let mode = get_le_u16(&packed, mode_off);
+        put_le_u16(&mut packed, mode_off, (mode & !S_IFMT) | S_IFREG);
+        write_inode_at(disk, CHASSIS_PACKED_NID, &packed);
+
+        let mut sb = staged_super_block_record(disk);
+        let incompat_off = offset_of!(RawSuperBlock, feature_incompat);
+        put_le_u32(
+            &mut sb,
+            incompat_off,
+            get_le_u32(&sb, incompat_off) | FeatureIncompatSet::FRAGMENTS.bits(),
+        );
+        put_le_u64(&mut sb, offset_of!(RawSuperBlock, packed_nid), CHASSIS_PACKED_NID);
+        write_super_block(disk, &sb);
+    })
 }
 
 // ===========================================================================

@@ -1232,7 +1232,14 @@ mod tests {
     use ostd::prelude::*;
 
     use super::*;
-    use crate::fs::fs_impls::erofs::test_utils::healthy_fixture;
+    use crate::fs::fs_impls::erofs::test_utils::{
+        assert_errno, fx_sb_bad_checksum, fx_sb_bad_checksum_and_unknown_incompat,
+        fx_sb_bad_magic, fx_sb_blkszbits_above_supported, fx_sb_blkszbits_below_min,
+        fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
+        fx_sb_extslots_past_page_boundary, fx_sb_packed_compressed_payload,
+        fx_sb_root_compressed, fx_sb_root_nid_out_of_device, fx_sb_root_not_dir,
+        fx_sb_unknown_incompat_bit, fx_sb_volume_name_without_nul, healthy_fixture,
+    };
 
     /// fold vectors (the design's §7 fold family). The all-zero
     /// input actually takes the SF9 branch at runtime and never
@@ -1326,5 +1333,149 @@ mod tests {
         assert!(Arc::ptr_eq(&dot, &root));
         let dot_dot = root.lookup("..").unwrap();
         assert!(Arc::ptr_eq(&dot_dot, &root));
+    }
+
+    /// T-027 S04 (FX-SB V2, matrix §2.2 crafted row): a one-bit magic
+    /// diff fails the mount with EINVAL — the first door, before any
+    /// other field is looked at.
+    #[ktest]
+    fn mount_rejects_bad_magic() {
+        assert_errno!(fx_sb_bad_magic().open, Errno::EINVAL, "V2 magic door");
+    }
+
+    /// T-027 S04 (FX-SB V3): blkszbits outside the supported range
+    /// fails EINVAL — both arms covered, one below `BLKSZBITS_MIN`
+    /// (= 8) and one above the supported 4k (= 13, past
+    /// `BLKSZBITS_MAX`). This is G-M08's rejection face; the healthy
+    /// sub-4k images are the initramfs BS-ALT family, never fixtures.
+    #[ktest]
+    fn mount_rejects_unsupported_blkszbits() {
+        assert_errno!(
+            fx_sb_blkszbits_below_min().open,
+            Errno::EINVAL,
+            "V3 lower arm: blkszbits 8 < 9"
+        );
+        assert_errno!(
+            fx_sb_blkszbits_above_supported().open,
+            Errno::EINVAL,
+            "V3 upper arm: blkszbits 13 > 12"
+        );
+    }
+
+    /// T-027 S04 (FX-SB V4): dirblkbits = 1 fails EINVAL.
+    #[ktest]
+    fn mount_rejects_nonzero_dirblkbits() {
+        assert_errno!(fx_sb_dirblkbits_nonzero().open, Errno::EINVAL, "V4 dirblkbits door");
+    }
+
+    /// T-027 S04 (FX-SB V5 and the V5+V6 order cross, matrix §2.2 /
+    /// the G-M09 bad half): a stale checksum fails EBADMSG, and when
+    /// the same image ALSO carries an unknown incompat bit the errno
+    /// stays EBADMSG — the V5 door runs before the V6 door; a reorder
+    /// of `read_superblock` would surface EINVAL here and turn this
+    /// suite red.
+    #[ktest]
+    fn mount_rejects_bad_checksum() {
+        assert_errno!(fx_sb_bad_checksum().open, Errno::EBADMSG, "V5 checksum door");
+        assert_errno!(
+            fx_sb_bad_checksum_and_unknown_incompat().open,
+            Errno::EBADMSG,
+            "V5 must fire before V6 (the order cross)"
+        );
+    }
+
+    /// T-027 S04 (FX-SB V6): a feature_incompat bit outside the
+    /// known union (0x7F | 0x80) fails EINVAL — the union is not
+    /// shrinkable (G3). The known bits' mount-Ok acceptance face is
+    /// the FX-COMP per-bit family (S10).
+    #[ktest]
+    fn mount_rejects_unknown_incompat_bit() {
+        assert_errno!(
+            fx_sb_unknown_incompat_bit().open,
+            Errno::EINVAL,
+            "V6 unknown incompat door"
+        );
+    }
+
+    /// T-027 S04 (FX-SB V7): the sb_extslots page boundary. 184 —
+    /// sb_size exactly SUPER_REGION_MAX (3072), cross-locked here
+    /// against the production `sb_size()` on the mounted mirror (the
+    /// assertion literals are deliberately independent of the staging
+    /// constants, the S03 drift-alarm discipline) — mounts Ok; 185
+    /// (sb_size 3088) fails EINVAL. The boundary criterion is
+    /// PAGE-derived on both sides (the matrix §2.2 hard requirement:
+    /// never rewrite it as a block-size bound).
+    #[ktest]
+    fn mount_extslots_page_boundary() {
+        let fs = fx_sb_extslots_at_page_boundary().mounted();
+        assert_eq!(
+            fs.super_block().sb_extslots, 184,
+            "the boundary form mounts with its extslots intact"
+        );
+        assert_eq!(
+            fs.super_block().sb_size(),
+            SUPER_REGION_MAX,
+            "184 is the exact page boundary: 128 + 16 x 184 = 3072"
+        );
+
+        assert_errno!(
+            fx_sb_extslots_past_page_boundary().open,
+            Errno::EINVAL,
+            "V7: sb_size 3088 > SUPER_REGION_MAX 3072"
+        );
+    }
+
+    /// T-027 S04 (FX-SB V8): a volume_name with no NUL byte in its 16
+    /// bytes fails EUCLEAN (the EFSCORRUPTED mapping) — after the
+    /// checksum and incompat doors, before the u1 guard.
+    #[ktest]
+    fn mount_rejects_unterminated_volume_name() {
+        assert_errno!(
+            fx_sb_volume_name_without_nul().open,
+            Errno::EUCLEAN,
+            "V8 volume_name NIL door"
+        );
+    }
+
+    /// T-027 S04 (FX-SB G-M10 root door, matrix §2.2 G-M10): root_nid
+    /// 0xFFFF sends the Step-5 iget's inode read far past the device
+    /// end; the framework byte-channel bound fails it. Registered
+    /// drift asserted as-is: aster EINVAL where Linux's metabuf read
+    /// fails EIO (the T-014 §4.4 ledger). The truncated-DISK sibling
+    /// of this family is S14's.
+    #[ktest]
+    fn mount_rejects_root_nid_out_of_device() {
+        assert_errno!(
+            fx_sb_root_nid_out_of_device().open,
+            Errno::EINVAL,
+            "G-M10 root out-of-device (registered drift: Linux EIO)"
+        );
+    }
+
+    /// T-027 S04 (FX-SB G-M15 root/packed doors, matrix §2.2 G-M15):
+    /// the three mount-time inode doors, errno-distinguishable — a
+    /// compressed root fails EOPNOTSUPP at the Step-5 iget (the I12
+    /// arm-head gate, ahead of the type judgement); a healthy REG
+    /// root igets fine and then fails the F12 type gate with EINVAL
+    /// (iget-before-type is the order face); a FRAGMENTS image whose
+    /// packed_nid addresses a compressed REG fails EOPNOTSUPP at the
+    /// Step-4 F10 iget.
+    #[ktest]
+    fn mount_root_inode_doors() {
+        assert_errno!(
+            fx_sb_root_compressed().open,
+            Errno::EOPNOTSUPP,
+            "G-M15: compressed root (I12), not F12's EINVAL"
+        );
+        assert_errno!(
+            fx_sb_root_not_dir().open,
+            Errno::EINVAL,
+            "G-M15: healthy REG root reads, then the F12 type gate"
+        );
+        assert_errno!(
+            fx_sb_packed_compressed_payload().open,
+            Errno::EOPNOTSUPP,
+            "G-M15: compressed packed payload (F10 -> I12)"
+        );
     }
 }
