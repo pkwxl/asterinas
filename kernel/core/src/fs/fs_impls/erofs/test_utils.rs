@@ -63,6 +63,18 @@
 //!   registered drift finalized there). Later slices append the
 //!   FX-DIRENT/NAME/TIME/INODE/COMP/XATTR families the same way.
 //!
+//! * **T-027 S05, the FX-DIRENT builder family**: fifteen named
+//!   constructors (`fx_dirent_*`), each a local rewrite of the
+//!   chassis root directory block — the child forms also lay child
+//!   directory inodes — per S06 §5.3: the nameoff high-bit /
+//!   non-multiple / inverted chain, the out-of-order binary-search
+//!   playground, the missing-`..` root/child pair, the wrong-nid /
+//!   directory-cycle / d_type / zero-nid forms, the embedded-NUL
+//!   half, and the R5/R10 corner builders. The lookup/readdir
+//!   assertion suite lives in `inode/dir.rs` (the D1 host rule) —
+//!   the two-strictness-domains pin there finally gets its executed
+//!   R5 column over real malformed images.
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -100,8 +112,8 @@ use super::{
     },
     prelude::*,
     super_block::{
-        BLKSZBITS_MIN, FeatureCompatSet, FeatureIncompatSet, RawSuperBlock, SUPER_MAGIC_V1,
-        SUPER_OFFSET, SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
+        BLKSZBITS_MIN, FeatureCompatSet, FeatureIncompatSet, NAME_LEN, RawSuperBlock,
+        SUPER_MAGIC_V1, SUPER_OFFSET, SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
     utils::crc32c,
 };
@@ -908,15 +920,26 @@ fn chassis_i_format(version: InodeVersion, datalayout: DataLayout) -> u16 {
     ((version as u16) << I_VERSION_BIT) | ((datalayout as u16) << I_DATALAYOUT_BIT)
 }
 
-/// One 12-byte dirent record from the T-DIRENT seed: `nid` and
-/// `nameoff` patched through `offset_of!`; the seed's file_type 2
-/// (DT_DIR) and reserved 0 stay — every chassis entry is a
-/// directory.
-fn chassis_dirent(nid: u64, nameoff: u16) -> [u8; 12] {
+/// One 12-byte dirent record: `nid`, `nameoff`, AND `file_type`
+/// patched through `offset_of!` — the general form the S05 FX-DIRENT
+/// builders lay child entries with (their file types include the
+/// out-of-range bytes and non-DIR values the chassis never uses).
+/// The raw-u8 spelling of `file_type` is the T-011 §2.2 discipline
+/// (no enum-ization of the disk field).
+fn dirent_record(nid: u64, nameoff: u16, file_type: u8) -> [u8; 12] {
     let mut entry = DIRENT_TEMPLATE;
     put_le_u64(&mut entry, offset_of!(RawDirent, nid), nid);
     put_le_u16(&mut entry, offset_of!(RawDirent, nameoff), nameoff);
+    entry[offset_of!(RawDirent, file_type)] = file_type;
     entry
+}
+
+/// One 12-byte dirent record from the T-DIRENT seed: `nid` and
+/// `nameoff` patched through `offset_of!`; the seed's file_type 2
+/// (DT_DIR) and reserved 0 stay — every chassis entry is a
+/// directory. Delegates to [`dirent_record`].
+fn chassis_dirent(nid: u64, nameoff: u16) -> [u8; 12] {
+    dirent_record(nid, nameoff, 2) // 2 = DT_DIR, the seed's value
 }
 
 /// Stages the healthy chassis onto `disk` (S06 §3.2) — the minimal
@@ -1375,6 +1398,414 @@ pub(super) fn fx_sb_packed_compressed_payload() -> ErofsFixture {
             CHASSIS_PACKED_NID,
         );
         write_super_block(disk, &sb);
+    })
+}
+
+// ===========================================================================
+// T-027 S05: the FX-DIRENT builder family (S06 §5.3; matrix §1.6 label
+// row IMG-CRAFT-DIRENT serving the §3.4 lookup rows — mask tolerance,
+// out-of-order binary search, missing `..`/wrong nid, directory cycle,
+// d_type ≥ 8, nid = 0 — and the §3.5 rows: the R5/R10 bound-check family
+// and the W-N05/W-N06/W-N07 embedded-NUL half). Fifteen named
+// constructors, each a LOCAL rewrite of the chassis root directory block
+// (the child forms also lay healthy child directory inodes); field
+// semantics and bound-check behavior are NOT re-derived here — the
+// single sources are the T-013 dir册 and the matrix §3.4/§3.5 rows, and
+// the assertion values live in the `inode/dir.rs` suite (the D1 host
+// rule; the two-strictness-domains contract's executed R5 column).
+//
+// AUTO-DECISION: the S06 §5.3 table's 11 rows land as 15 constructors.
+// The two splits are the rows' own text: 「缺 `..`(根与子目录各一
+// 形态)」 becomes the root/child pair, and the R5/R10 family row becomes
+// four corner builders (R5 nameoff==0; R10 empty name / name over
+// NAME_LEN / name beyond maxsize) — the fourth R10 sub-form, the
+// inverted-chain wrap-huge namelen, is already the inverted builder's
+// readdir half. d_type 8/255 share one image (both entries patched) and
+// the wrong-nid row keeps ONE form patching `..` — the matrix row's own
+// 「`..` 指错 nid 照显」 example, the mechanism being shared. Rejected:
+// strict one-constructor-per-row (leaves the R10 sub-forms
+// unmaterialized); finer splits (two d_type images or a `.`-nid twin add
+// no assertion surface).
+// ===========================================================================
+
+/// Reads the chassis root directory block's dirent slot `index`,
+/// applies `patch`, and re-stages it in place — the G-M15
+/// `patch_root_inode` discipline (read → patch one field → re-stage)
+/// for the 12-byte records: the patched fields differ from the
+/// healthy chassis, the neighboring bytes are provably untouched.
+fn patch_root_dirent(disk: &ErofsMemoryDisk, index: usize, patch: impl FnOnce(&mut [u8; 12])) {
+    let base = CHASSIS_ROOT_DATA_BLK as usize * CHASSIS_BLOCK_SIZE + index * size_of::<RawDirent>();
+    let mut record = [0u8; 12];
+    disk.segment().read_bytes(base, &mut record).unwrap();
+    patch(&mut record);
+    disk.stage_bytes(base, &record);
+}
+
+/// Re-lays the whole root directory block from typed records plus a
+/// packed name area, aligning the root i_size to the laid bytes (the
+/// multi-entry FX-DIRENT forms' staging face). The first record's
+/// `nameoff` must equal `records.len() * 12` — the `write_dirents`
+/// first-nameoff contract.
+fn lay_root_dirents(disk: &ErofsMemoryDisk, records: &[[u8; 12]], names: &[u8]) {
+    let entries = records.concat();
+    write_dirents(disk, CHASSIS_ROOT_DATA_BLK as u64, &entries, names);
+    let dir_size = (entries.len() + names.len()) as u64;
+    patch_root_inode(disk, |root| {
+        put_le_u64(root, offset_of!(RawInodeExtended, i_size), dir_size);
+    });
+}
+
+/// Lays a healthy EMPTY child directory inode at `nid` — the extended
+/// seed switched to FLAT_PLAIN with size 0 and raw_blkaddr 0 (a legal
+/// empty directory; no data block, the N4 lookup gate answers ENOENT
+/// before any read). The lookup-hit assertions of the FX-DIRENT forms
+/// iget these targets. nlink is gate-inert; 1 is the self-consistent
+/// spelling for a dotless empty directory.
+fn lay_empty_dir_at(disk: &ErofsMemoryDisk, nid: u64) {
+    let mut record = INODE_EXT_TEMPLATE;
+    put_le_u16(
+        &mut record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
+    );
+    put_le_u64(&mut record, offset_of!(RawInodeExtended, i_size), 0);
+    put_le_u32(&mut record, offset_of!(RawInodeExtended, i_u), 0);
+    put_le_u32(&mut record, offset_of!(RawInodeExtended, i_nlink), 1);
+    write_inode_at(disk, nid, &record);
+}
+
+/// Lays a healthy child directory at `nid` whose data lives at `blk`,
+/// carrying `records`/`names` (i_size aligned; `..` points where the
+/// records say) — the subdirectory level of the child forms. nlink 2 =
+/// self + parent, the dot-bearing spelling.
+fn lay_dir_with_block(
+    disk: &ErofsMemoryDisk,
+    nid: u64,
+    blk: u32,
+    records: &[[u8; 12]],
+    names: &[u8],
+) {
+    let entries = records.concat();
+    write_dirents(disk, blk as u64, &entries, names);
+    let mut record = INODE_EXT_TEMPLATE;
+    put_le_u16(
+        &mut record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
+    );
+    put_le_u64(
+        &mut record,
+        offset_of!(RawInodeExtended, i_size),
+        (entries.len() + names.len()) as u64,
+    );
+    put_le_u32(&mut record, offset_of!(RawInodeExtended, i_u), blk);
+    put_le_u32(&mut record, offset_of!(RawInodeExtended, i_nlink), 2);
+    write_inode_at(disk, nid, &record);
+}
+
+/// The chassis root dirent-array end (= the first name's nameoff):
+/// 2 × 12 = 24 — the base the nameoff corner rewrites derive from.
+const CHASSIS_ROOT_ARRAY_END: usize = CHASSIS_ROOT_NDIRENTS * size_of::<RawDirent>();
+
+/// Row 1, nameoff high bits — the first dirent's nameoff carries the
+/// block-out-of-bounds value 4096 + 24: the lookup side masks it into
+/// [0, bs) (silent fold, both dot names still resolve) while the
+/// iteration side rejects the RAW value ≥ bs (R5 EUCLEAN) — the
+/// visible-divergence row of the two-strictness-domains contract
+/// (matrix §3.4 mask-tolerance row).
+pub(super) fn fx_dirent_nameoff_high_bits() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let high = (CHASSIS_BLOCK_SIZE + CHASSIS_ROOT_ARRAY_END) as u16;
+        patch_root_dirent(disk, 0, |de| {
+            put_le_u16(de, offset_of!(RawDirent, nameoff), high);
+        });
+    })
+}
+
+/// Row 2, nameoff not a multiple of 12 — 13 (one byte into the
+/// second record's nid field): the value lands inside the dirent
+/// array area. Lookup consumes it silently (fold 13 → ndirents 1;
+/// the NUL-led region compares Greater for every name — the
+/// drift-preserving miss), readdir rejects (R5 non-multiple).
+pub(super) fn fx_dirent_nameoff_not_multiple() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let not_multiple = (size_of::<RawDirent>() + 1) as u16;
+        patch_root_dirent(disk, 0, |de| {
+            put_le_u16(de, offset_of!(RawDirent, nameoff), not_multiple);
+        });
+    })
+}
+
+/// Row 3, inverted nameoff chain — the successor's nameoff (20) is
+/// four bytes BELOW the predecessor's (24). Lookup reads an inverted
+/// (empty) name region and drifts silently (namei.c:22-27); readdir
+/// derives a wrap-huge namelen (20 − 24 as u32) and hits the R10
+/// bogus-dirent door.
+pub(super) fn fx_dirent_nameoff_inverted() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let inverted = (CHASSIS_ROOT_ARRAY_END - 4) as u16;
+        patch_root_dirent(disk, 1, |de| {
+            put_le_u16(de, offset_of!(RawDirent, nameoff), inverted);
+        });
+    })
+}
+
+// AUTO-DECISION: the out-of-order playground replaces the whole root
+// directory data with FIVE single-entry blocks (4..=8) whose head names
+// are deliberately unsorted — "aa", "bb", "abz", "cc", "dd" — with no
+// `.`/`..` entries. The block-level probe trajectory that exposes the
+// prefix-carry drift (probe b:6 "abz" Less, then b:4 "aa" Greater, then
+// b:5 "bb" Equal-with-carry — the FALSE HIT) needs exactly this
+// geometry: five blocks for the mid-point sequence, single-entry blocks
+// so the in-block layer stays out of the trajectory, and the head slots
+// free of dot names (dots would occupy the probed de0 positions). The
+// form IS the crafted 乱序目录 (a healthy mkfs never emits unsorted
+// names), so dropping the dots stays inside the fixture口径. Rejected:
+// a subdirectory playground (an extra tree level for no added face);
+// in-block-slot disorder (the in-block search resets the carry — no
+// drift surface there).
+//
+// The head-name/probe-nid table (the form's identity, §5.3's 「乱序
+// 二分」row; even nids per the chassis convention):
+const UNSORTED_HEADS: [(&[u8], u64); 5] =
+    [(b"aa", 2), (b"bb", 4), (b"abz", 6), (b"cc", 8), (b"dd", 10)];
+
+/// Row 4, out-of-order binary search (matrix §3.4: lookup misses and
+/// false hits are Linux-identical PRESERVED drift; the implementation
+/// must stay a binary search — a linear scan would find "bb"). The
+/// `inode/dir.rs` suite pins the trajectory pointwise: "ab" FALSE-HITS
+/// the "bb" inode, "bb" itself MISSES, and readdir emits everything in
+/// slot order with no alphabetical check.
+pub(super) fn fx_dirent_unsorted_binary_search() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        for (i, &(name, nid)) in UNSORTED_HEADS.iter().enumerate() {
+            let blk = CHASSIS_ROOT_DATA_BLK + i as u32;
+            write_dirents(
+                disk,
+                blk as u64,
+                &dirent_record(nid, size_of::<RawDirent>() as u16, 2),
+                name,
+            );
+            lay_empty_dir_at(disk, nid);
+        }
+        // Root size: four full blocks plus the last block's array +
+        // 2-byte name ("dd").
+        let size = 4 * CHASSIS_BLOCK_SIZE + size_of::<RawDirent>() + UNSORTED_HEADS[4].0.len();
+        patch_root_inode(disk, |root| {
+            put_le_u64(root, offset_of!(RawInodeExtended, i_size), size as u64);
+        });
+    })
+}
+
+/// Row 5, root form — the root directory block carries `.` and one
+/// child entry, no `..` (matrix §3.4: getdents emits the `..`-less
+/// row set; the dcache-tree `..` walk is unaffected by on-disk
+/// forms — that face is the initramfs layer's). The child at nid 2
+/// is laid so the surviving entry resolves.
+pub(super) fn fx_dirent_missing_dotdot_root() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_empty_dir_at(disk, 2);
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, CHASSIS_ROOT_ARRAY_END as u16, 2),
+                dirent_record(2, (CHASSIS_ROOT_ARRAY_END + 1) as u16, 2),
+            ],
+            b".a",
+        );
+    })
+}
+
+/// Row 5, child form — the ROOT keeps its healthy `.`/`..` plus the
+/// child entry "a" → nid 2; the CHILD's own block (block 5) carries
+/// `.` and a grandchild entry, no `..`. Both levels' negative and
+/// positive faces live in the dir.rs suite.
+pub(super) fn fx_dirent_missing_dotdot_child() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_empty_dir_at(disk, 4);
+        lay_dir_with_block(
+            disk,
+            2,
+            CHASSIS_ROOT_DATA_BLK + 1,
+            &[
+                dirent_record(2, CHASSIS_ROOT_ARRAY_END as u16, 2),
+                dirent_record(4, (CHASSIS_ROOT_ARRAY_END + 1) as u16, 2),
+            ],
+            b".g",
+        );
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, 36, 2),
+                dirent_record(CHASSIS_ROOT_NID, 37, 2),
+                dirent_record(2, 39, 2),
+            ],
+            b"...a",
+        );
+    })
+}
+
+// AUTO-DECISION: the wrong-nid form patches `..` to nid 2 and LAYS a
+// real (empty-directory) target inode at nid 2 — no dangling pointer.
+// With a laid target, the assertions read "consumed as-is" end to end:
+// getdents displays nid 2 and lookup("..") igets the child instead of
+// the root. A dangling target (nid never laid) would conflate the
+// namei hit with the iget failure (EUCLEAN), hiding the very
+// no-cross-check face the row asserts. Rejected: patching `.` instead
+// (same mechanism, and the matrix row names the `..` example); laying
+// a REG target (the DIR/DIR mismatch adds nothing — d_type
+// non-cross-check is the dtype form's face).
+pub(super) fn fx_dirent_dotdot_wrong_nid() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_empty_dir_at(disk, 2);
+        patch_root_dirent(disk, 1, |de| {
+            put_le_u64(de, offset_of!(RawDirent, nid), 2);
+        });
+    })
+}
+
+/// Row 7, directory cycle — the root's "loop" entry and the child's
+/// "loop" entry point at each other's directories (nid 2 ↔ nid 0):
+/// two dirents forming a cycle, the W-N08 material. The dir.rs suite
+/// pins the FS-level legs (each single-step lookup resolves; the
+/// child's "loop" returns the ROOT identity — the walk can continue
+/// forever). The PATH_MAX exhaustion face (registered drift
+/// ELOOP vs ENAMETOOLONG) belongs to the VFS path resolver, which no
+/// dir.rs ktest reaches; this image is the material it would loop on.
+pub(super) fn fx_dirent_directory_cycle() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_dir_with_block(
+            disk,
+            2,
+            CHASSIS_ROOT_DATA_BLK + 1,
+            &[
+                dirent_record(2, 36, 2),
+                dirent_record(CHASSIS_ROOT_NID, 37, 2),
+                dirent_record(CHASSIS_ROOT_NID, 39, 2),
+            ],
+            b"...loop",
+        );
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, 36, 2),
+                dirent_record(CHASSIS_ROOT_NID, 37, 2),
+                dirent_record(2, 39, 2),
+            ],
+            b"...loop",
+        );
+    })
+}
+
+/// Row 8, d_type ≥ 8 — file_type 8 on `.` and 255 on `..`: readdir
+/// degrades both to DT_UNKNOWN SILENTLY (R8: conversion from the
+/// dirent byte only, no cross-check, no error). Lookup never reads
+/// the field, so the walk is unaffected.
+pub(super) fn fx_dirent_dtype_out_of_range() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_root_dirent(disk, 0, |de| {
+            de[offset_of!(RawDirent, file_type)] = 8;
+        });
+        patch_root_dirent(disk, 1, |de| {
+            de[offset_of!(RawDirent, file_type)] = 255;
+        });
+    })
+}
+
+/// Row 9, zero nid — a third entry "zero" whose nid is 0 (the root's
+/// own nid): readdir emits the row with ino 0 as-is (no validation,
+/// R1) and d_type from the dirent byte (FT_REG 1) with no cross-check
+/// against the DIR it resolves to; lookup("zero") follows the nid
+/// just as uncritically — to the root itself.
+pub(super) fn fx_dirent_zero_nid_entry() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, 36, 2),
+                dirent_record(CHASSIS_ROOT_NID, 37, 2),
+                dirent_record(0, 39, 1),
+            ],
+            b"...zero",
+        );
+    })
+}
+
+/// Row 10, embedded NUL names (the NUL half; the name-family half is
+/// S06's) — two child entries: non-trailing "a\0b" and trailing
+/// "t\0u". The iteration side emits the non-trailing name VERBATIM at
+/// full nameoff-derived length (the NUL rides along; strnlen applies
+/// only to the trailing entry) and truncates the trailing name at the
+/// NUL; the getdents syscall faces (W-N05/W-N06/W-N07: buffer and
+/// stickiness semantics) are the framework layer's. The lookup half
+/// truncates on-disk names at the NUL inside dirnamecmp (namei.c).
+pub(super) fn fx_dirent_embedded_nul_names() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_empty_dir_at(disk, 2);
+        lay_empty_dir_at(disk, 4);
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, 48, 2),
+                dirent_record(CHASSIS_ROOT_NID, 49, 2),
+                dirent_record(2, 51, 1),
+                dirent_record(4, 54, 1),
+            ],
+            b"...a\0bt\0u",
+        );
+    })
+}
+
+/// Row 11 (R5 corner), nameoff == 0 on the first dirent — BOTH
+/// domains reject with EUCLEAN through different mechanisms: lookup
+/// folds 0 → ndirents 0 → the N8 "corrupted dir block" door; readdir
+/// fails the raw == 0 check. The matrix §3.4 same-errno-different-
+/// mechanism family, executed on one image.
+pub(super) fn fx_dirent_nameoff_zero() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_root_dirent(disk, 0, |de| {
+            put_le_u16(de, offset_of!(RawDirent, nameoff), 0);
+        });
+    })
+}
+
+/// Row 11 (R10 corner), empty name — the successor's nameoff EQUALS
+/// the predecessor's (24 == 24): the non-trailing namelen derives as
+/// zero, and the !(1..=NAME_LEN) door fires EUCLEAN. Lookup reads the
+/// inverted-empty region and drifts silently (ENOENT — no error from
+/// the lookup side).
+pub(super) fn fx_dirent_empty_name() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_root_dirent(disk, 1, |de| {
+            put_le_u16(de, offset_of!(RawDirent, nameoff), CHASSIS_ROOT_ARRAY_END as u16);
+        });
+    })
+}
+
+/// Row 11 (R10 corner), name over NAME_LEN — the successor's nameoff
+/// (324 = 24 + 255 + 45) derives a 300-byte namelen for the first
+/// entry: > NAME_LEN → EUCLEAN. Lookup stays silent (the NUL-truncated
+/// region compares Less for "." — ENOENT via the drift path).
+pub(super) fn fx_dirent_name_over_255() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let nameoff = (CHASSIS_ROOT_ARRAY_END + NAME_LEN + 45) as u16;
+        patch_root_dirent(disk, 1, |de| {
+            put_le_u16(de, offset_of!(RawDirent, nameoff), nameoff);
+        });
+    })
+}
+
+/// Row 11 (R10 corner), name beyond maxsize — the successor's nameoff
+/// (26) is only two past its own 24, but the i_size-27 window makes
+/// the derived 2-byte name end at 28 > maxsize 27 → EUCLEAN. Lookup
+/// consumes silently: the [24, 26) region happens to read "..", so
+/// lookup("..") still resolves (to the root, via the block head).
+pub(super) fn fx_dirent_name_beyond_maxsize() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let nameoff = (CHASSIS_ROOT_ARRAY_END + 2) as u16;
+        patch_root_dirent(disk, 1, |de| {
+            put_le_u16(de, offset_of!(RawDirent, nameoff), nameoff);
+        });
     })
 }
 

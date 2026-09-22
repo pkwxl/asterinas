@@ -615,6 +615,14 @@ mod tests {
 
     use super::*;
     use crate::fs::file::InodeType;
+    use crate::fs::fs_impls::erofs::test_utils::{
+        assert_errno, fx_dirent_directory_cycle, fx_dirent_dotdot_wrong_nid,
+        fx_dirent_dtype_out_of_range, fx_dirent_embedded_nul_names, fx_dirent_empty_name,
+        fx_dirent_missing_dotdot_child, fx_dirent_missing_dotdot_root,
+        fx_dirent_name_beyond_maxsize, fx_dirent_name_over_255, fx_dirent_nameoff_high_bits,
+        fx_dirent_nameoff_inverted, fx_dirent_nameoff_not_multiple, fx_dirent_nameoff_zero,
+        fx_dirent_unsorted_binary_search, fx_dirent_zero_nid_entry, healthy_fixture,
+    };
 
     /// Pointwise comparison-semantics table (LKP-11, `docs/T-013/S05/
     /// index.md` §9): NUL truncation, inverted/empty regions, query
@@ -749,5 +757,387 @@ mod tests {
         for ft in 8u8..=255 {
             assert_eq!(file_type_to_dtype(ft), InodeType::Unknown, "ft = {}", ft);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // T-027 S05: the FX-DIRENT fixture suites. Builders live in
+    // `test_utils.rs` (the D1 host rule); assertion values cite the
+    // matrix §3.4/§3.5 rows per test (registered drifts asserted at
+    // their aster-side values). This is the executed R5/R10 column the
+    // two-domains pin above promised to "T-027".
+    // ------------------------------------------------------------------
+
+    /// Records every readdir row verbatim — name BYTES (an embedded
+    /// NUL rides along), nid, d_type, and the visit offset.
+    #[derive(Default)]
+    struct RecordingVisitor {
+        rows: Vec<(Vec<u8>, u64, InodeType, usize)>,
+    }
+
+    impl DirentVisitor for RecordingVisitor {
+        fn visit(&mut self, name: &str, ino: u64, type_: InodeType, offset: usize) -> Result<()> {
+            self.rows.push((name.as_bytes().to_vec(), ino, type_, offset));
+            Ok(())
+        }
+    }
+
+    /// Reads a whole directory through `readdir_at(0, ..)` and returns
+    /// the rows — panics on error (the healthy/mount-Ok forms' face;
+    /// the rejection forms spell their own visitor).
+    fn readdir_rows(inode: &Inode) -> Vec<(Vec<u8>, u64, InodeType, usize)> {
+        let mut visitor = RecordingVisitor::default();
+        inode.readdir_at(0, &mut visitor).unwrap();
+        visitor.rows
+    }
+
+    /// The healthy-chassis baseline (matrix §3.5 R1 basics): the
+    /// `.`/`..` rows in slot order with their nids, d_type from the
+    /// dirent byte, and the F18 visit offsets (next-slot basis; the
+    /// trailing entry's offset folds to the window end = i_size 27 —
+    /// deliberately literal, independent of the staging constants).
+    /// A walk starting at/past i_size advances 0 and visits nothing;
+    /// a lookup miss answers ENOENT.
+    #[ktest]
+    fn readdir_healthy_chassis_baseline() {
+        let fixture = healthy_fixture();
+        let root = fixture.mounted().root_inode().unwrap();
+
+        let mut visitor = RecordingVisitor::default();
+        let advance = root.readdir_at(0, &mut visitor).unwrap();
+        assert_eq!(advance, 27, "the advance folds to i_size at EOF");
+        assert_eq!(
+            visitor.rows,
+            [
+                (b".".to_vec(), 0, InodeType::Dir, 12),
+                (b"..".to_vec(), 0, InodeType::Dir, 27),
+            ]
+        );
+
+        // At and past the end: 0 rows, 0 advance (R1/R14).
+        let mut eof = RecordingVisitor::default();
+        assert_eq!(root.readdir_at(27, &mut eof).unwrap(), 0);
+        assert_eq!(root.readdir_at(100, &mut eof).unwrap(), 0);
+        assert!(eof.rows.is_empty());
+
+        assert_errno!(root.lookup("zz"), Errno::ENOENT, "N10/N11 miss");
+    }
+
+    /// The two-strictness-domains VISIBLE DIVERGENCE, executed end to
+    /// end on real malformed images (matrix §3.4 mask-tolerance row;
+    /// the fold-level pin above stays the mechanical carrier). High
+    /// bits: lookup folds [0, bs) and both dot names resolve (mask
+    /// tolerance, N8 off) while readdir rejects the RAW value ≥ bs
+    /// (R5). Non-multiple inside the dirent array: lookup consumes
+    /// silently — fold 13 → ndirents 1, the NUL-led garbage region
+    /// compares Greater for every name, the drift-preserving miss —
+    /// while readdir rejects the non-multiple (R5).
+    #[ktest]
+    fn nameoff_two_domains_divergence() {
+        let fixture = fx_dirent_nameoff_high_bits();
+        let root = fixture.mounted().root_inode().unwrap();
+        let dot = root.lookup(".").unwrap();
+        assert!(Arc::ptr_eq(&dot, &root), "the folded nameoff still resolves .");
+        let dot_dot = root.lookup("..").unwrap();
+        assert!(Arc::ptr_eq(&dot_dot, &root), "... and ..");
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EUCLEAN,
+            "R5: raw nameoff0 >= bs rejects the whole window"
+        );
+        assert!(visitor.rows.is_empty(), "no row is emitted before the R5 door");
+
+        let fixture = fx_dirent_nameoff_not_multiple();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_errno!(
+            root.lookup("."),
+            Errno::ENOENT,
+            "silent fold consumption — never EUCLEAN from the lookup side"
+        );
+        assert_errno!(root.lookup(".."), Errno::ENOENT, "the drift-preserving miss");
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EUCLEAN,
+            "R5: nameoff0 not a multiple of 12"
+        );
+        assert!(visitor.rows.is_empty());
+    }
+
+    /// nameoff == 0: BOTH domains reject EUCLEAN through different
+    /// mechanisms (matrix §3.4 same-errno-different-row family) —
+    /// lookup folds to ndirents 0 and fires the N8 "corrupted dir
+    /// block" door; readdir fails the raw == 0 check.
+    #[ktest]
+    fn nameoff_zero_rejects_in_both_domains() {
+        let fixture = fx_dirent_nameoff_zero();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_errno!(
+            root.lookup("."),
+            Errno::EUCLEAN,
+            "lookup: fold 0 -> ndirents 0 -> the N8 door"
+        );
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EUCLEAN,
+            "readdir: raw nameoff0 == 0 -> the R5 door"
+        );
+    }
+
+    /// The R10 bogus-dirent family (matrix §3.5 bound-check row): the
+    /// inverted chain (wrap-huge namelen), the empty name (equal
+    /// nameoff chain → zero namelen), the name over NAME_LEN, and the
+    /// name ending beyond the i_size window — each rejects the walk
+    /// EUCLEAN at the FIRST entry (no partial emit), while the lookup
+    /// side of the same images stays silent (the drift-preserving
+    /// empty/garbage-region reads — ENOENT, never EUCLEAN).
+    #[ktest]
+    fn readdir_r10_bogus_dirent_family() {
+        // Inverted chain: 20 < 24 -> namelen wraps huge.
+        let fixture = fx_dirent_nameoff_inverted();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_errno!(root.lookup("."), Errno::ENOENT, "inverted region reads empty");
+        assert_errno!(root.lookup(".."), Errno::ENOENT, "... silently for both dots");
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EUCLEAN,
+            "R10: wrap-huge namelen"
+        );
+        assert!(visitor.rows.is_empty());
+
+        // Empty name: 24 == 24 -> namelen 0. (The fixture binding
+        // stays alive for the whole block: `Inode` holds only a
+        // `Weak<Erofs>`, so a chained temporary would drop the
+        // filesystem right after this statement.)
+        let fixture = fx_dirent_empty_name();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_errno!(root.lookup("."), Errno::ENOENT, "the empty region drifts silently");
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(root.readdir_at(0, &mut visitor), Errno::EUCLEAN, "R10: zero namelen");
+        assert!(visitor.rows.is_empty());
+
+        // Name over NAME_LEN: namelen 300 > 255.
+        let fixture = fx_dirent_name_over_255();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_errno!(root.lookup("."), Errno::ENOENT, "the NUL-truncated region reads Less");
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EUCLEAN,
+            "R10: namelen > NAME_LEN"
+        );
+        assert!(visitor.rows.is_empty());
+
+        // Name beyond maxsize: nameoff 26 + namelen 2 = 28 > 27 —
+        // lookup stays silent AND ".." still resolves through the
+        // block head (the [24, 26) region happens to read "..":
+        // consumption as-is).
+        let fixture = fx_dirent_name_beyond_maxsize();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_errno!(root.lookup("."), Errno::ENOENT, "silent for the shorter dot name");
+        let dot_dot = root.lookup("..").unwrap();
+        assert!(Arc::ptr_eq(&dot_dot, &root), "the coincidental hit resolves as-is");
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EUCLEAN,
+            "R10: nameoff + namelen > maxsize"
+        );
+        assert!(visitor.rows.is_empty());
+    }
+
+    /// The out-of-order image, binary-search semantics pointwise
+    /// (matrix §3.4 乱序二分 row: misses and false hits are
+    /// Linux-identical PRESERVED drift; a linear scan would disagree).
+    /// The probe trajectory for "ab": block 6 "abz" (Less, endprfx 2)
+    /// → block 4 "aa" (Greater, startprfx 1) → block 5 "bb" with
+    /// carry 1 — index 0 never compared, the query exhausts inside
+    /// the region → Equal: the FALSE HIT on the "bb" inode. "bb"
+    /// itself is MISSED (the candidate retention lands the in-block
+    /// search on the single-entry "abz" block). Readdir emits every
+    /// row in slot order — "bb" before "abz", no alphabetical check.
+    #[ktest]
+    fn lookup_unsorted_binary_search_drift() {
+        let fixture = fx_dirent_unsorted_binary_search();
+        let root = fixture.mounted().root_inode().unwrap();
+
+        // Sanity hits: the sorted-looking probes still find their own.
+        assert_eq!(root.lookup("aa").unwrap().ino(), 2);
+        assert_eq!(root.lookup("abz").unwrap().ino(), 6);
+        assert_eq!(root.lookup("dd").unwrap().ino(), 10);
+
+        // The prefix-carry FALSE HIT: "ab" resolves to the "bb" inode.
+        assert_eq!(
+            root.lookup("ab").unwrap().ino(),
+            4,
+            "the false hit lands on the bb entry (nid 4)"
+        );
+
+        // The MISS: "bb" is on the image but the binary search never
+        // returns to its block — a linear scan would find it.
+        assert_errno!(root.lookup("bb"), Errno::ENOENT, "the binary-search miss");
+
+        // Slot-order emit (R1: no reorder, no dedup, no sort check).
+        assert_eq!(
+            readdir_rows(&root),
+            [
+                (b"aa".to_vec(), 2, InodeType::Dir, 4096),
+                (b"bb".to_vec(), 4, InodeType::Dir, 8192),
+                (b"abz".to_vec(), 6, InodeType::Dir, 12288),
+                (b"cc".to_vec(), 8, InodeType::Dir, 16384),
+                (b"dd".to_vec(), 10, InodeType::Dir, 16398),
+            ]
+        );
+    }
+
+    /// Missing `..`, root and child forms (matrix §3.4 `./..` row):
+    /// getdents emits the `..`-less row sets (少一行 — the dcache-tree
+    /// `..` walk face is the initramfs layer's), lookup("..") answers
+    /// ENOENT as for any missing name, and the surviving entries
+    /// resolve normally.
+    #[ktest]
+    fn missing_dotdot_root_and_child_forms() {
+        // Root form: the root block carries "." + "a", no "..".
+        let fixture = fx_dirent_missing_dotdot_root();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_eq!(
+            readdir_rows(&root),
+            [
+                (b".".to_vec(), 0, InodeType::Dir, 12),
+                (b"a".to_vec(), 2, InodeType::Dir, 26),
+            ]
+        );
+        let dot = root.lookup(".").unwrap();
+        assert!(Arc::ptr_eq(&dot, &root));
+        assert_errno!(root.lookup(".."), Errno::ENOENT, "no on-disk .. entry");
+        assert_eq!(root.lookup("a").unwrap().ino(), 2);
+
+        // Child form: the root keeps its dots; the CHILD's block
+        // (nid 2, block 5) carries "." + "g", no "..".
+        let fixture = fx_dirent_missing_dotdot_child();
+        let root = fixture.mounted().root_inode().unwrap();
+        let child = root.lookup("a").unwrap();
+        assert_eq!(child.ino(), 2);
+        assert_eq!(
+            readdir_rows(&child),
+            [
+                (b".".to_vec(), 2, InodeType::Dir, 12),
+                (b"g".to_vec(), 4, InodeType::Dir, 26),
+            ]
+        );
+        assert!(Arc::ptr_eq(&child.lookup(".").unwrap(), &child));
+        assert_errno!(child.lookup(".."), Errno::ENOENT, "the child's .. is equally absent");
+        assert_eq!(child.lookup("g").unwrap().ino(), 4);
+    }
+
+    /// Wrong `..` nid, consumed as-is (matrix §3.4: `..` 指错 nid 照显
+    /// — no cross-check anywhere): the readdir row displays nid 2, and
+    /// lookup("..") igets the child instead of the root. The laid
+    /// target being an EMPTY directory also pins the N4 gate: its own
+    /// lookup answers ENOENT before any block read.
+    #[ktest]
+    fn dotdot_wrong_nid_consumed_as_is() {
+        let fixture = fx_dirent_dotdot_wrong_nid();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_eq!(
+            readdir_rows(&root),
+            [
+                (b".".to_vec(), 0, InodeType::Dir, 12),
+                (b"..".to_vec(), 2, InodeType::Dir, 27),
+            ]
+        );
+        let dot_dot = root.lookup("..").unwrap();
+        assert_eq!(dot_dot.ino(), 2, "the wrong target is igeted uncritically");
+        assert!(!Arc::ptr_eq(&dot_dot, &root));
+        assert_errno!(dot_dot.lookup("x"), Errno::ENOENT, "N4: the empty directory gates early");
+    }
+
+    /// The directory cycle's FS-level legs (matrix §3.4 W-N08: the
+    /// PATH_MAX exhaustion face — registered drift ELOOP vs
+    /// ENAMETOOLONG — belongs to the VFS resolver, which no dir.rs
+    /// ktest reaches; this pins the material it would loop on): each
+    /// single-step lookup resolves, and the child's "loop" returns
+    /// the ROOT identity — the walk can continue forever.
+    #[ktest]
+    fn directory_cycle_fs_legs() {
+        let fixture = fx_dirent_directory_cycle();
+        let root = fixture.mounted().root_inode().unwrap();
+        let child = root.lookup("loop").unwrap();
+        assert_eq!(child.ino(), 2);
+        let back = child.lookup("loop").unwrap();
+        assert!(Arc::ptr_eq(&back, &root), "the cycle leg closes on the root identity");
+        assert_eq!(
+            readdir_rows(&child),
+            [
+                (b".".to_vec(), 2, InodeType::Dir, 12),
+                (b"..".to_vec(), 0, InodeType::Dir, 24),
+                (b"loop".to_vec(), 0, InodeType::Dir, 43),
+            ]
+        );
+    }
+
+    /// d_type out of range, silent degradation (matrix §3.5 R1/R8):
+    /// file_type 8 and 255 both emit DT_UNKNOWN — no error, no
+    /// cross-check; the walk itself is unaffected.
+    #[ktest]
+    fn dtype_out_of_range_degrades_to_unknown() {
+        let fixture = fx_dirent_dtype_out_of_range();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_eq!(
+            readdir_rows(&root),
+            [
+                (b".".to_vec(), 0, InodeType::Unknown, 12),
+                (b"..".to_vec(), 0, InodeType::Unknown, 27),
+            ]
+        );
+    }
+
+    /// A zero-nid entry, emitted and followed as-is (matrix §3.5 R1:
+    /// nid=0 照 emit 不校验): the "zero" row carries ino 0 and the
+    /// FT_REG d_type with no cross-check against the DIR it resolves
+    /// to — which is the root itself.
+    #[ktest]
+    fn zero_nid_entry_emitted_and_resolves_to_root() {
+        let fixture = fx_dirent_zero_nid_entry();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_eq!(
+            readdir_rows(&root),
+            [
+                (b".".to_vec(), 0, InodeType::Dir, 12),
+                (b"..".to_vec(), 0, InodeType::Dir, 24),
+                (b"zero".to_vec(), 0, InodeType::File, 43),
+            ]
+        );
+        let zero = root.lookup("zero").unwrap();
+        assert!(Arc::ptr_eq(&zero, &root), "nid 0 is the root — followed uncritically");
+    }
+
+    /// Embedded-NUL names, the NUL half (matrix §3.5 W-N05/W-N06/W-N07
+    /// row; the getdents syscall faces are the framework layer's):
+    /// the NON-TRAILING "a\0b" is emitted verbatim at full
+    /// nameoff-derived length — the iteration side strnlens only the
+    /// trailing entry, whose "t\0u" truncates to "t". The lookup half
+    /// truncates on-disk names at the NUL inside dirnamecmp: "a" and
+    /// "t" reach their entries; the post-NUL tail is unreachable.
+    #[ktest]
+    fn embedded_nul_names_pass_through_and_truncate() {
+        let fixture = fx_dirent_embedded_nul_names();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_eq!(
+            readdir_rows(&root),
+            [
+                (b".".to_vec(), 0, InodeType::Dir, 12),
+                (b"..".to_vec(), 0, InodeType::Dir, 24),
+                // The NUL rides along in the emitted name bytes.
+                (b"a\0b".to_vec(), 2, InodeType::File, 36),
+                // The trailing entry: strnlen truncates at the NUL.
+                (b"t".to_vec(), 4, InodeType::File, 57),
+            ]
+        );
+        assert_eq!(root.lookup("a").unwrap().ino(), 2, "the NUL-truncated name hit");
+        assert_eq!(root.lookup("t").unwrap().ino(), 4, "... for both embedded-NUL entries");
+        assert_errno!(root.lookup("b"), Errno::ENOENT, "the post-NUL tail is unreachable");
     }
 }
