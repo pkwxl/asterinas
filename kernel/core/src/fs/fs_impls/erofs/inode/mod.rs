@@ -125,6 +125,14 @@ pub(super) use self::data::DataBackend;
 pub(super) use self::data::{ChunkGeometry, DataGeometry};
 #[cfg(not(ktest))]
 use self::data::{ChunkGeometry, DataGeometry};
+// The ktest fixture face of the dirent record: the T-027 chassis
+// and the FX-DIRENT/FX-NAME builders patch the `DIRENT_TEMPLATE`
+// seed through `offset_of!` on the raw record (the zero-hand-
+// copied-offset discipline), which needs the type nameable at
+// erofs scope. cfg-gated for the same reason as the geometry
+// re-export above.
+#[cfg(ktest)]
+pub(super) use self::dir::RawDirent;
 use self::{
     data::RawInodeChunkIndex,
     symlink::{is_fast_symlink, read_inline_target},

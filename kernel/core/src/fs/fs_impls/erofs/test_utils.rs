@@ -45,10 +45,14 @@
 //!   form — the S02 sections slot in without renumbering
 //!   (increment, not refactor).
 //!
-//! The `ErofsFixture` chassis and the FX-* builder family land
-//! with S03+; until then no ktest walks `Erofs::open` over a
-//! staged image (S03 is the first — handles are still assembled
-//! directly via `ktest_new`/`ktest_fs_on`).
+//! * **T-027 S03, chassis + fixture**: `ErofsFixture` — the staged
+//!   memory disk plus the `Erofs::open` mount-attempt result — and
+//!   `healthy_fixture()` over the S06 §3.2 healthy chassis: T-SB
+//!   with the four geometry patches, the T-EXT64 root switched to
+//!   FLAT_PLAIN at block 4, and the `.`/`..` directory block. The
+//!   first ktest walking the full `Erofs::open` chain over staged
+//!   bytes lives in `fs.rs` (`healthy_fixture_mounts`); the FX-*
+//!   malformed builders (S04+) are local rewrites of this chassis.
 //!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
@@ -81,8 +85,9 @@ use super::{
     Erofs,
     fs::DeviceTable,
     inode::{
-        AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, ISLOT_BITS, InodeDesc,
-        InodeVersion, inode_location,
+        AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, ISLOT_BITS,
+        I_DATALAYOUT_BIT, I_VERSION_BIT, InodeDesc, InodeVersion, RawDirent, RawInodeCompact,
+        RawInodeExtended, inode_location,
     },
     prelude::*,
     super_block::{
@@ -91,6 +96,7 @@ use super::{
     },
     utils::crc32c,
 };
+use crate::fs::vfs::file_system::FsFlags;
 
 // ===========================================================================
 // Layer 0: devices — the null device, then the in-memory disk
@@ -682,12 +688,11 @@ const INODE_EXT_TEMPLATE: [u8; 64] = [
 /// root inode @ iloc 1216. No time fields: compact ctime is
 /// synthesized from the superblock build_time (both zeroed on the
 /// chassis).
-// The S02 layout smoke walks the other four templates only (compact
-// chassis geometry arrives with the S07 FX-TIME / S08+ compact-inode
-// suites, the first consumers). When one of them starts patching
-// this seed, remove the expectation — an unfulfilled `expect` fails
-// the build, so the removal cannot be silently forgotten.
-#[expect(dead_code)]
+// First consumer since T-027 S03: the `chassis_staging_shape`
+// smoke cross-locks the seed's i_format word against the compose
+// helper (the S02-era `#[expect(dead_code)]` came off with it).
+// Compact chassis staging itself arrives with the S07 FX-TIME
+// suites.
 const INODE_CPT_TEMPLATE: [u8; 32] = [
     0x04, 0x00, 0x00, 0x00, 0xed, 0x41, 0x07,
     0x00, // i_format@0 = 0x0004 (version=0 compact, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_nlink@6 = 7 (le16)
@@ -814,8 +819,204 @@ pub(super) fn write_meta_bytes(disk: &ErofsMemoryDisk, blk: u64, off: usize, byt
 }
 
 // ===========================================================================
-// Layer 4: fixture self-smoke (T-025 S02; the T-027 S02 smokes of the
-// builder foundations join at the tail)
+// T-027 S03: ErofsFixture — the healthy chassis (S06 §3.2) and the
+// mount-attempt fixture (S06 §4.3). Every FX-* builder (S04+) is a
+// local rewrite of this chassis (the fixture口径: a healthy template,
+// minimally patched — a healthy mkfs produces no malformed form).
+// ===========================================================================
+
+/// The chassis disk capacity in blocks (S06 §3.2): room for the
+/// superblock, the meta area, the root directory data, the shared
+/// xattr area (block 8+), and the out-of-device rewrite margins.
+const CHASSIS_NR_BLOCKS: u32 = 32;
+
+/// The inode-slot area base, in blocks (S06 §3.2): blocks [1, 4)
+/// hold the chassis inode slots — nid 0..=383 at 32 bytes per slot,
+/// so the RD1 corners (nid 127 cross-block, nid 126 exact-boundary)
+/// land inside the area.
+const CHASSIS_META_BLKADDR: u32 = 1;
+
+/// The chassis `inos` value: the slot capacity of the meta area
+/// (3 blocks x 128 slots). No mount gate consumes the field (only
+/// the statfs ffree arithmetic reads it), so the capacity reading
+/// is the self-consistent chassis spelling.
+// AUTO-DECISION: inos = the meta-area slot capacity (384) rather
+// than a file count — the field is gate-inert, and "slots the
+// chassis geometry actually holds" is the value a healthy mkfs of
+// this exact image could defend. A child count would change with
+// every FX form's per-builder inode additions and drift per fixture.
+const CHASSIS_INO_SLOTS: u64 = 384;
+
+/// The root nid of the chassis (S06 §3.2): uniform-extended, so the
+/// extended root record occupies slots 0 and 1; child inodes take
+/// the even nids 2/4/6... from there (per-builder, S04+).
+const CHASSIS_ROOT_NID: u64 = 0;
+
+/// The root directory data block.
+// AUTO-DECISION (T-027 risk 1): the chassis root is FLAT_PLAIN with
+// raw_blkaddr = block 4, not the FlatInline form of the C1 seed
+// (whose directory bytes sit inside the inode record). This matches
+// the S06 §3.2 chassis table ("root 目录数据 块 4 起"), decouples the
+// directory data from the inode record (the FX-INODE rewrite family
+// patches slot bytes without dragging the directory along, and the
+// RD1 corner rewrites stay pure inode-slot forms), and hands the
+// FX-DIRENT/FX-NAME suites a whole-block playground. Rejected: the
+// FlatInline chassis (couples record and data; multi-block dirent
+// forms would need inline-tail arithmetic instead of plain blocks).
+const CHASSIS_ROOT_DATA_BLK: u32 = 4;
+
+/// The number of dirents in the chassis root directory: `.` and `..`
+/// only.
+// AUTO-DECISION: the base chassis carries a childless root even
+// though the S06 §3.2 table spells the healthy dirent set as
+// "./../child entries" — child inodes are per-builder (§5 "child
+// inodes are laid per builder"), and a base-chassis child dirent
+// would dangle (an un-laid slot igets as a bogus-mode inode,
+// EUCLEAN), which a healthy mkfs never produces. The S04+ builders
+// lay each child inode together with its dirent entry, so every
+// fixture stays a self-consistent healthy image before its own
+// patch.
+const CHASSIS_ROOT_NDIRENTS: usize = 2;
+
+/// The packed name area of the chassis root block: "." then ".."
+/// (three 0x2E bytes — no separators; the nameoff chain carries the
+/// lengths, the block tail beyond i_size stays zero).
+const CHASSIS_ROOT_NAMES: &[u8] = &[b'.', b'.', b'.'];
+
+/// The root directory byte size: the dirent array plus the packed
+/// names (write_dirents lays the names right behind the array).
+const CHASSIS_ROOT_DIR_SIZE: u64 =
+    (CHASSIS_ROOT_NDIRENTS * size_of::<RawDirent>() + CHASSIS_ROOT_NAMES.len()) as u64;
+
+/// Composes an on-disk `i_format` word from the typed pair — the
+/// inverse of the production decode (`parse_i_format`,
+/// inode/mod.rs), assembled from the same bit-family constants
+/// (`I_VERSION_BIT`/`I_DATALAYOUT_BIT`) and the same enum
+/// discriminants the decode extracts, so no on-disk bit layout is
+/// restated here. Cross-locked against both template seeds by the
+/// `chassis_staging_shape` smoke below.
+fn chassis_i_format(version: InodeVersion, datalayout: DataLayout) -> u16 {
+    ((version as u16) << I_VERSION_BIT) | ((datalayout as u16) << I_DATALAYOUT_BIT)
+}
+
+/// One 12-byte dirent record from the T-DIRENT seed: `nid` and
+/// `nameoff` patched through `offset_of!`; the seed's file_type 2
+/// (DT_DIR) and reserved 0 stay — every chassis entry is a
+/// directory.
+fn chassis_dirent(nid: u64, nameoff: u16) -> [u8; 12] {
+    let mut entry = DIRENT_TEMPLATE;
+    put_le_u64(&mut entry, offset_of!(RawDirent, nid), nid);
+    put_le_u16(&mut entry, offset_of!(RawDirent, nameoff), nameoff);
+    entry
+}
+
+/// Stages the healthy chassis onto `disk` (S06 §3.2) — the minimal
+/// healthy image every FX form rewrites:
+///
+/// * superblock: T-SB with the four chassis geometry patches
+///   (root_nid 0 / inos = slot capacity / blocks 32 / meta_blkaddr
+///   1), staged through `write_super_block` so the §3.4 checksum
+///   finish runs;
+/// * root inode: T-EXT64 switched to Extended|FLAT_PLAIN with
+///   raw_blkaddr = the root data block (the FlatInline seed values
+///   — datalayout 2, i_u 0xFFFFFFFF — are chassis rewrites);
+/// * root data block: the `.`/`..` dirent pair, both pointing at
+///   the root nid (T-DIRENT x 2, nameoff chain 24/25).
+///
+/// Block 0 before `SUPER_OFFSET` stays zero — the disk allocates
+/// zeroed pages, and the [0,1024) reservation is those staged
+/// zeros themselves.
+fn stage_healthy_chassis(disk: &ErofsMemoryDisk) {
+    // Superblock first — `write_inode_at` addresses through the
+    // staged record (meta_blkaddr = 1 lands here).
+    let mut sb = SB_TEMPLATE;
+    put_le_u16(&mut sb, offset_of!(RawSuperBlock, root_nid), CHASSIS_ROOT_NID as u16);
+    put_le_u64(&mut sb, offset_of!(RawSuperBlock, inos), CHASSIS_INO_SLOTS);
+    put_le_u32(&mut sb, offset_of!(RawSuperBlock, blocks), CHASSIS_NR_BLOCKS);
+    put_le_u32(&mut sb, offset_of!(RawSuperBlock, meta_blkaddr), CHASSIS_META_BLKADDR);
+    write_super_block(disk, &sb);
+
+    // Root inode at nid 0 -> iloc 4096: FLAT_PLAIN over the root
+    // data block; size/nlink consistent with the `.`/`..`-only
+    // directory below (nlink 2 = self + parent reference).
+    let mut root = INODE_EXT_TEMPLATE;
+    put_le_u16(
+        &mut root,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
+    );
+    put_le_u64(&mut root, offset_of!(RawInodeExtended, i_size), CHASSIS_ROOT_DIR_SIZE);
+    put_le_u32(&mut root, offset_of!(RawInodeExtended, i_u), CHASSIS_ROOT_DATA_BLK);
+    put_le_u32(&mut root, offset_of!(RawInodeExtended, i_nlink), 2);
+    write_inode_at(disk, CHASSIS_ROOT_NID, &root);
+
+    // Root directory data: the dirent array at the block base, the
+    // packed names right behind it (the `write_dirents` first-
+    // nameoff contract: entries.len()); `..` starts one byte in,
+    // right behind the one-byte `.`.
+    let array_len = CHASSIS_ROOT_NDIRENTS * size_of::<RawDirent>();
+    let dot = chassis_dirent(CHASSIS_ROOT_NID, array_len as u16);
+    let dot_dot = chassis_dirent(CHASSIS_ROOT_NID, array_len as u16 + 1);
+    let entries = [dot, dot_dot].concat();
+    write_dirents(disk, CHASSIS_ROOT_DATA_BLK as u64, &entries, CHASSIS_ROOT_NAMES);
+}
+
+/// A staged image plus its mount attempt (S06 §4.3): the FX-*
+/// builder family (S04+) hands its host one value carrying both the
+/// disk (for inspection and post-mount rewrites) and the
+/// `Erofs::open` result — mount-Ok forms unwrap through
+/// [`ErofsFixture::mounted`], rejection forms assert `open` with
+/// `assert_errno!`.
+pub(super) struct ErofsFixture {
+    /// The staged memory disk.
+    pub(super) disk: Arc<ErofsMemoryDisk>,
+    /// The mount attempt over the staged image — the S06 §4.3
+    /// spelling `Erofs::open(disk, FsFlags::empty(), None)` (the
+    /// `device=` semantics half belongs to initramfs; `open` itself
+    /// forces RDONLY, so the empty flags are the fixture form).
+    pub(super) open: Result<Arc<Erofs>>,
+    /// Rewrite-navigation field (S06 §4.3): the chassis root nid.
+    pub(super) root_nid: u64,
+    /// Rewrite-navigation field (S06 §4.3): the chassis meta-area
+    /// base, in blocks.
+    pub(super) meta_blkaddr: u64,
+}
+
+impl ErofsFixture {
+    /// The mounted handle — panics on an Err mount (the healthy and
+    /// mount-Ok forms' consumer face; rejection forms never call
+    /// here).
+    pub(super) fn mounted(&self) -> Arc<Erofs> {
+        self.open
+            .as_ref()
+            .expect("fixture must have mounted")
+            .clone()
+    }
+}
+
+/// The untouched healthy chassis, mounted (the S06 Layer-5
+/// convenience entry): a fresh 32-block disk staged with
+/// [`stage_healthy_chassis`] and opened through the production
+/// `Erofs::open` — the full mount chain the `fs.rs` suite asserts
+/// (`healthy_fixture_mounts`).
+pub(super) fn healthy_fixture() -> ErofsFixture {
+    let disk = Arc::new(ErofsMemoryDisk::new(
+        CHASSIS_NR_BLOCKS as usize * CHASSIS_BLOCK_SIZE,
+    ));
+    stage_healthy_chassis(&disk);
+    let open = Erofs::open(disk.clone() as Arc<dyn BlockDevice>, FsFlags::empty(), None);
+    ErofsFixture {
+        open,
+        disk,
+        root_nid: CHASSIS_ROOT_NID,
+        meta_blkaddr: u64::from(CHASSIS_META_BLKADDR),
+    }
+}
+
+// ===========================================================================
+// Layer 4: fixture self-smoke (T-025 S02; the T-027 S02 builder
+// foundations smokes and the T-027 S03 chassis shape smoke join at
+// the tail)
 // ===========================================================================
 
 mod tests {
@@ -1261,5 +1462,78 @@ mod tests {
             .read_bytes(6 * SECTOR_SIZE, &mut back)
             .unwrap();
         assert_eq!(back, [0xAA, 0xBB]);
+    }
+
+    /// The chassis staging shape, pinned without mounting — the
+    /// diagnostic complement of `healthy_fixture_mounts` (fs.rs):
+    /// if the mount ever fails, this smoke separates a staging bug
+    /// from a mount-path regression. Four faces: the i_format
+    /// compose helper cross-locks against BOTH template seeds (it
+    /// must reproduce the C1/C2-measured words 0x0005/0x0004
+    /// bit-for-bit — its inverse is the production `parse_i_format`
+    /// decode); the staged superblock decodes with exactly the four
+    /// chassis patches and the untouched bloom-gate compat; the
+    /// root record lands at the iloc formula position carrying the
+    /// FLAT_PLAIN switch; the `.`/`..` block carries the nameoff
+    /// chain at the `write_dirents` contract with both nids at the
+    /// root.
+    #[ktest]
+    fn chassis_staging_shape() {
+        // Compose-helper cross-lock against the measured seeds: the
+        // inverse extraction of the production decode must
+        // reproduce each seed's on-disk word exactly.
+        assert_eq!(
+            chassis_i_format(InodeVersion::Extended, DataLayout::FlatInline),
+            get_le_u16(&INODE_EXT_TEMPLATE, offset_of!(RawInodeExtended, i_format)),
+            "the helper must reproduce the C1 extended seed word"
+        );
+        assert_eq!(
+            chassis_i_format(InodeVersion::Compact, DataLayout::FlatInline),
+            get_le_u16(&INODE_CPT_TEMPLATE, offset_of!(RawInodeCompact, i_format)),
+            "the helper must reproduce the C2 compact seed word"
+        );
+
+        let disk = ErofsMemoryDisk::new(CHASSIS_NR_BLOCKS as usize * CHASSIS_BLOCK_SIZE);
+        stage_healthy_chassis(&disk);
+
+        // The staged superblock through the production From decode:
+        // the four patch fields plus untouched template facts (the
+        // bloom-gate compat 0x7, the zero incompat).
+        let sb = staged_super_block(&disk);
+        assert_eq!(u64::from(sb.root_nid), CHASSIS_ROOT_NID);
+        assert_eq!(sb.inos, CHASSIS_INO_SLOTS);
+        assert_eq!(sb.blocks, CHASSIS_NR_BLOCKS);
+        assert_eq!(sb.meta_blkaddr, CHASSIS_META_BLKADDR);
+        assert_eq!(sb.feature_compat().bits(), 0x7);
+        assert_eq!(sb.feature_incompat, 0);
+
+        // The root record at the iloc formula position (meta 1,
+        // nid 0 -> block boundary), carrying the FLAT_PLAIN switch.
+        let iloc = inode_location(&sb, CHASSIS_ROOT_NID) as usize;
+        assert_eq!(iloc, CHASSIS_BLOCK_SIZE);
+        let mut root = [0u8; 64];
+        disk.segment().read_bytes(iloc, &mut root).unwrap();
+        assert_eq!(
+            get_le_u16(&root, offset_of!(RawInodeExtended, i_format)),
+            chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain)
+        );
+        assert_eq!(get_le_u64(&root, offset_of!(RawInodeExtended, i_size)), CHASSIS_ROOT_DIR_SIZE);
+        assert_eq!(get_le_u32(&root, offset_of!(RawInodeExtended, i_u)), CHASSIS_ROOT_DATA_BLK);
+        assert_eq!(get_le_u32(&root, offset_of!(RawInodeExtended, i_nlink)), 2);
+
+        // The `.`/`..` block: both nids at the root, the nameoff
+        // chain at the write_dirents contract (array end, array
+        // end + 1), the packed names right behind the array.
+        let base = CHASSIS_ROOT_DATA_BLK as usize * CHASSIS_BLOCK_SIZE;
+        let array_end = CHASSIS_ROOT_NDIRENTS * size_of::<RawDirent>();
+        let dot: RawDirent = disk.segment().read_val(base).unwrap();
+        let dot_dot: RawDirent = disk.segment().read_val(base + size_of::<RawDirent>()).unwrap();
+        assert_eq!(u64::from_le(dot.nid), CHASSIS_ROOT_NID);
+        assert_eq!(u64::from_le(dot_dot.nid), CHASSIS_ROOT_NID);
+        assert_eq!(u16::from_le(dot.nameoff) as usize, array_end);
+        assert_eq!(u16::from_le(dot_dot.nameoff) as usize, array_end + 1);
+        let mut names = [0u8; CHASSIS_ROOT_NAMES.len()];
+        disk.segment().read_bytes(base + array_end, &mut names).unwrap();
+        assert_eq!(&names, CHASSIS_ROOT_NAMES);
     }
 }

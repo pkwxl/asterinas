@@ -1232,6 +1232,7 @@ mod tests {
     use ostd::prelude::*;
 
     use super::*;
+    use crate::fs::fs_impls::erofs::test_utils::healthy_fixture;
 
     /// fold vectors (the design's §7 fold family). The all-zero
     /// input actually takes the SF9 branch at runtime and never
@@ -1282,5 +1283,48 @@ mod tests {
         assert_eq!(new_encode_dev(dev(8, 16)), 0x810);
         assert_eq!(new_encode_dev(dev(1, 0xFFFFF)), 0xFFF0_01FF);
         assert_eq!(new_encode_dev(dev(0xFFF, 0)), 0xFFF00);
+    }
+
+    /// T-027 S03 — the healthy chassis fixture, mounted through the
+    /// production `Erofs::open`: the first ktest walking the full
+    /// mount chain over a staged image (option parse -> V1–V10
+    /// superblock validation -> handle -> F10 skip -> F11/F12 root
+    /// door -> F15 empty-prefix load). Beyond `Ok`: the mirror
+    /// carries the chassis geometry (the literal S06 §3.2 contract
+    /// values — independent of the staging constants, so a staging
+    /// typo fails here too), the V10 single-device scan folds
+    /// `total_blocks` from `sb.blocks`, the root igets as a
+    /// directory at nid 0, and the `.`/`..` walk over the staged
+    /// block-4 directory resolves back to the SAME cached identity
+    /// the F11 read inserted (namei + iget-cache hit, Arc identity).
+    #[ktest]
+    fn healthy_fixture_mounts() {
+        let fixture = healthy_fixture();
+        let fs = fixture.mounted();
+
+        // The chassis geometry survived the V1–V10 decode.
+        let sb = fs.super_block();
+        assert_eq!(sb.blkszbits, SUPPORTED_BLKSZBITS);
+        assert_eq!(sb.root_nid, 0);
+        assert_eq!(sb.blocks, 32);
+        assert_eq!(sb.meta_blkaddr, 1);
+
+        // The V10 face: the single-device table folds
+        // total_blocks = sb.blocks (no flatdev slots on the chassis).
+        assert_eq!(fs.device_table().total_blocks(), 32);
+
+        // The F11/F12 face: the root igets as a directory at nid 0.
+        let root = fs.root_inode().unwrap();
+        assert!(root.is_dir());
+        assert_eq!(root.ino(), 0);
+
+        // The namei walk over the staged `.`/`..` block: both dot
+        // names resolve to the root nid and hit the same cached
+        // identity F11 inserted (Arc identity, not just nid
+        // equality).
+        let dot = root.lookup(".").unwrap();
+        assert!(Arc::ptr_eq(&dot, &root));
+        let dot_dot = root.lookup("..").unwrap();
+        assert!(Arc::ptr_eq(&dot_dot, &root));
     }
 }
