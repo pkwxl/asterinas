@@ -1292,7 +1292,7 @@ const S_IFDIR: u16 = 0o040000;
 pub(in crate::fs::fs_impls::erofs) const S_IFBLK: u16 = 0o060000;
 pub(in crate::fs::fs_impls::erofs) const S_IFREG: u16 = 0o100000;
 pub(in crate::fs::fs_impls::erofs) const S_IFLNK: u16 = 0o120000;
-pub(in crate::fs::fs::fs_impls::erofs) const S_IFSOCK: u16 = 0o140000;
+pub(in crate::fs::fs_impls::erofs) const S_IFSOCK: u16 = 0o140000;
 
 /// The S_IFMT type segment of `i_mode`, typed (T-001 §9.7.4 full
 /// form; the parity of the source switch, inode.c:138-155).
@@ -2090,12 +2090,12 @@ mod tests {
     use crate::{
         fs::fs_impls::erofs::test_utils::{
             BioRequest, ErofsMemoryDisk, RD1_CROSS_BLOCK_NID, RD1_EXACT_BOUNDARY_NID, assert_errno,
-            fx_comp_compressed_reg_dir_lnk, fx_comp_compressed_special_files,
-            fx_inode_bogus_mode, fx_inode_chunk_format, fx_inode_cross_block_slot,
-            fx_inode_datalayout_reserved, fx_inode_exact_boundary_slot, fx_inode_ifmt_high_bits,
-            fx_inode_kind_layout_cross, fx_inode_negative_size, fx_time_compact_ctime,
-            fx_time_giant_nsec, fx_time_giant_seconds, ktest_bio_trio, ktest_flat_geometry,
-            ktest_fs_on, ktest_single_device_table, ktest_super_block,
+            fx_comp_compressed_reg_dir_lnk, fx_comp_compressed_special_files, fx_inode_bogus_mode,
+            fx_inode_chunk_format, fx_inode_cross_block_slot, fx_inode_datalayout_reserved,
+            fx_inode_exact_boundary_slot, fx_inode_ifmt_high_bits, fx_inode_kind_layout_cross,
+            fx_inode_negative_size, fx_time_compact_ctime, fx_time_giant_nsec,
+            fx_time_giant_seconds, ktest_bio_trio, ktest_flat_geometry, ktest_fs_on,
+            ktest_single_device_table, ktest_super_block,
         },
         vm::page_cache::BlockAsPageCacheBackend,
     };
