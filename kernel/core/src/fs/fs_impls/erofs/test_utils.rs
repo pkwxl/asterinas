@@ -163,6 +163,19 @@
 //!   visibility in `xattr.rs` for the builders (the S04 S_IF*
 //!   precedent).
 //!
+//! * **T-027 S13, the FX-XATTR mechanism family**: the remaining
+//!   §5.6 rows 1–5 over the S12 laying helpers — the out-of-bounds
+//!   shared-id trio plus the X24 masking order over a shared area at
+//!   block 8 (`xattr_blkaddr` patch), the contradictory bloom bitmap
+//!   (the hashbit computed with the production `FILTER_SEED`), the
+//!   prefix-record length domain (257/0 rejected vs 256 mounted Ok —
+//!   mount faces in `fs.rs`), the XATTR_PREFIXES flag/count negative
+//!   pair with the X27 empty-table consumption, and the prefix-table
+//!   meta form (packed_nid 0, records in the meta area — XAT-18's
+//!   same-byte-family pass; the out-of-device start corner mounts
+//!   EINVAL). `FILTER_SEED` and `XATTR_LONG_PREFIX` widen their
+//!   visibility in `xattr.rs` for the builders (the same precedent).
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -204,10 +217,11 @@ use super::{
         BLKSZBITS_MIN, FeatureCompatSet, FeatureIncompatSet, NAME_LEN, RawSuperBlock,
         SUPER_MAGIC_V1, SUPER_OFFSET, SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
-    utils::crc32c,
+    utils::{crc32c, xxh32},
     xattr::{
-        RawXattrEntry, RawXattrIbodyHeader, XATTR_INDEX_POSIX_ACL_ACCESS,
-        XATTR_INDEX_POSIX_ACL_DEFAULT, XATTR_INDEX_TRUSTED, XATTR_INDEX_USER,
+        FILTER_SEED, LONG_PREFIX_FIXED_LEN, RawXattrEntry, RawXattrIbodyHeader,
+        XATTR_INDEX_POSIX_ACL_ACCESS, XATTR_INDEX_POSIX_ACL_DEFAULT, XATTR_INDEX_TRUSTED,
+        XATTR_INDEX_USER, XATTR_LONG_PREFIX,
     },
 };
 use crate::fs::vfs::file_system::FsFlags;
@@ -3293,6 +3307,324 @@ pub(super) fn fx_xattr_symlink_host_user() -> ErofsFixture {
         let inline_start =
             inode_location(&sb, 2) + size_of::<RawInodeExtended>() as u64 + ibody.len() as u64;
         disk.stage_bytes(inline_start as usize, target);
+    })
+}
+
+// ===========================================================================
+// T-027 S13: the FX-XATTR mechanism family (S06 §5.6 rows 1–5 — the
+// matrix §1.6 IMG-CRAFT-XATTR mechanism rows plus the prefix-table meta
+// half, serving §6.5 G-X01/G-X02/G-X03/G-X04/G-X05/G-X06 via the
+// T-015 §10.1 XAT-09/14/16/18/19/22 hand-off faces). Every form is a
+// local rewrite over the S12 laying helpers (`lay_xattr_reg_child_at`
+// & co.); the shared entries and the prefix records stage through
+// `write_meta_bytes` into block 8, and every superblock rewrite
+// (`xattr_blkaddr`, the prefix count/start, the XATTR_PREFIXES bit,
+// the XAT-16 compat/reserved pair) goes through the §3.4 checksummed
+// finish via `patch_chassis_sb` below.
+//
+// AUTO-DECISION: the five table rows split into seven named
+// constructors, two of them parameterized (`fx_xattr_prefix_len_
+// garbage(len)`, `fx_xattr_prefix_table_meta(prefixes_bit)`). A
+// mount-rejection row can carry only ONE first-bad record per image
+// (the loader stops at the first failure), and the flag-shape pair
+// needs two distinct superblock spellings, so a strict
+// one-constructor-per-row split cannot carry the row sets (the
+// fx_comp_ 10-for-8-rows S10/S11 precedent). The 257/0 length claims
+// are spelled as the forms' identity (the S04 extslots 184/185
+// precedent), with the boundary value 256 derived from NAME_LEN +
+// LONG_PREFIX_FIXED_LEN everywhere else. Rejected: squeezing the len
+// trio into one image (the first bad record shadows the rest);
+// separate 257/0-len constructors (the two images differ only in the
+// staged length claim — the parameter IS the form).
+// ===========================================================================
+
+/// The shared-xattr / prefix-record meta area block (S06 §3.2 "共享
+/// xattr 区 块 8 起"): the mechanism forms stage their shared entries
+/// and prefix records here, and the shared family patches
+/// `xattr_blkaddr` to it. The two uses are builder-exclusive (no form
+/// carries both a shared area and a prefix table), so one block
+/// number serves both families.
+const CHASSIS_XATTR_AREA_BLK: u32 = 8;
+
+/// Reads the chassis superblock record, applies `patch`, and re-stages
+/// it through the §3.4 checksummed finish — the FX-XATTR superblock
+/// rewrite channel (the S06 §3.3 whitelist's FX-XATTR columns:
+/// `xattr_blkaddr`, the prefix count/start, the XATTR_PREFIXES bit,
+/// and the XAT-16 compat/reserved gate-breaking pair).
+// AUTO-DECISION: extracted as the shared preamble of the S13
+// superblock rewrites (four builders plus the two in-test XAT-16
+// re-mount legs) instead of per-site read-patch-write spells — the
+// checksummed finish must stay the only door (XAT-16's own recipe
+// carries the csum-recompute obligation, T-015 S04 §5). Rejected:
+// re-exporting `staged_super_block_record` itself (the raw record
+// tempts a checksum-less write path).
+pub(super) fn patch_chassis_sb(disk: &ErofsMemoryDisk, patch: impl FnOnce(&mut [u8; 128])) {
+    let mut sb = staged_super_block_record(disk);
+    patch(&mut sb);
+    write_super_block(disk, &sb);
+}
+
+/// The bloom hashbit of (index, suffix) — the S04 §5 XAT-14 recipe
+/// (`xxh32(suffix, FILTER_SEED + index) & 31`) computed with the
+/// production seed and the production xxh32, so the fixture's
+/// contradictory bit and the gate's denial bit cannot drift apart
+/// (the `utils.rs` reference-vector suite is the correctness lock
+/// behind both — S06 §6's linkage clause).
+fn bloom_bit_of(index: u8, suffix: &[u8]) -> u32 {
+    xxh32(suffix, FILTER_SEED.wrapping_add(u32::from(index))) & 31
+}
+
+/// Stages one prefix record at the meta-area base: the le16 `len`
+/// claim followed by `body` bytes. The loader consumes `len` bytes
+/// off the disk regardless of what is staged — the 0-claim form
+/// stages no body and lets the 65536-byte read ride the disk's zeros.
+fn lay_prefix_record(disk: &ErofsMemoryDisk, len: u16, body: &[u8]) {
+    let mut record = len.to_le_bytes().to_vec();
+    record.extend_from_slice(body);
+    write_meta_bytes(disk, CHASSIS_XATTR_AREA_BLK as u64, 0, &record);
+}
+
+/// Patches the prefix-table knobs — the shared preamble of every
+/// prefix builder: `count`, and `start` addressing the block-8
+/// meta-area base (byte offset >> 2; the loader's `start << 2`
+/// 4-byte unit). The XATTR_PREFIXES bit stays the caller's (the
+/// flag-shape forms own it).
+fn patch_prefix_knobs(sb: &mut [u8; 128], count: u8) {
+    sb[offset_of!(RawSuperBlock, xattr_prefix_count)] = count;
+    put_le_u32(
+        sb,
+        offset_of!(RawSuperBlock, xattr_prefix_start),
+        (CHASSIS_XATTR_AREA_BLK as usize * CHASSIS_BLOCK_SIZE / 4) as u32,
+    );
+}
+
+/// Row 1 (§6.5 G-X01/G-X06) — the out-of-bounds shared-id trio plus
+/// the X24 masking order, one image: `xattr_blkaddr` patched to block
+/// 8, one healthy shared entry at the area base, and three children —
+///
+/// * nid 2, the ① out-of-device shape: the unbound-checked header read
+///   at `base + 4 × id` crosses the device end (aster EINVAL, the
+///   RD2② registered drift from Linux's typical bread EIO; no bound
+///   check exists or may be added — the X25 negative fact);
+/// * nid 6, the orchestration child: an inline "in" entry plus shared
+///   id 0 (the block-8 entry itself) — get("user.in") stops at the
+///   inline hit (success stops), get("user.sh") falls through inline
+///   exhaustion onto the shared hit (③ the coincidentally parseable
+///   entry — bytes from another area copied verbatim), a miss answers
+///   ENODATA (② the in-area mismatch iterates on, X28), and list
+///   emits both rows (X37's unconditional shared continuation);
+/// * nid 10, the XAT-09 masking form: an inline entry BEYOND remaining
+///   named exactly like the shared one — the get/list chains answer
+///   the inline EUCLEAN and the shared copy never emits.
+///
+/// Suite: `xattr.rs`.
+pub(super) fn fx_xattr_shared_id_bounds() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_chassis_sb(disk, |sb| {
+            put_le_u32(
+                sb,
+                offset_of!(RawSuperBlock, xattr_blkaddr),
+                CHASSIS_XATTR_AREA_BLK,
+            );
+        });
+        // The shared area's one healthy entry at the block-8 base.
+        write_meta_bytes(
+            disk,
+            CHASSIS_XATTR_AREA_BLK as u64,
+            0,
+            &xattr_entry_bytes(XATTR_INDEX_USER, b"sh", b"sv"),
+        );
+        // nid 2: the smallest id whose 4-byte header read lands past
+        // the device end — "越设备大值" made geometry-derived (the S04
+        // derived-not-spelled discipline).
+        let disk_bytes = CHASSIS_NR_BLOCKS as usize * CHASSIS_BLOCK_SIZE;
+        let shared_base = CHASSIS_XATTR_AREA_BLK as usize * CHASSIS_BLOCK_SIZE;
+        let oob_id = ((disk_bytes - shared_base) / 4 + 1) as u32;
+        let mut ibody = ibody_header(0, 1).to_vec();
+        ibody.extend_from_slice(&oob_id.to_le_bytes());
+        lay_xattr_reg_child_at(disk, 2, &ibody);
+        // nid 6: the inline "in" entry + shared id 0.
+        let mut ibody = ibody_header(0, 1).to_vec();
+        ibody.extend_from_slice(&0u32.to_le_bytes());
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"in", b"iv"));
+        lay_xattr_reg_child_at(disk, 6, &ibody);
+        // nid 10: the X24-masked inline entry (name "sh", a 20-byte
+        // claimed value) + shared id 0 pointing at the same-named
+        // healthy entry. icount 8 → isize 40 < 44 staged bytes: the
+        // entry area (24 bytes) cannot hold the 28-byte entry — the
+        // geometry mismatch is the form.
+        let mut ibody = ibody_header(0, 1).to_vec();
+        ibody.extend_from_slice(&0u32.to_le_bytes());
+        ibody.extend_from_slice(&xattr_entry_bytes(
+            XATTR_INDEX_USER,
+            b"sh",
+            &[0xA5; 20], // the claimed size overruns; the bytes are never read
+        ));
+        lay_xattr_child_at(disk, 10, 8, patch_reg_record, &ibody);
+    })
+}
+
+/// Row 2 (§6.5 G-X05; XAT-14 + the acl channel's gate + the XAT-16
+/// pair's base image) — the contradictory bloom bitmap: nid 2 carries
+/// two PRESENT user entries, "probe" (its hashbit SET in
+/// `h_name_filter` — the bitmap asserts absent while the entry
+/// demonstrably exists) and the "ok" control (bit cleared). The acl
+/// child at nid 6 repeats the shape on the acl channel's own gate:
+/// its empty-suffix internal query (index 2, seed SEED + 2) is denied
+/// by the crafted bit while a VALID acl value sits behind it — the
+/// denial is the only ENODATA source on that leg. The XAT-16
+/// gate-breaking pair re-opens this same image with the compat bit
+/// (a) and the reserved byte (b) patched in-test. Suite: `xattr.rs`.
+pub(super) fn fx_xattr_contradictory_bloom() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let probe_bit = bloom_bit_of(XATTR_INDEX_USER, b"probe");
+        let ok_bit = bloom_bit_of(XATTR_INDEX_USER, b"ok");
+        assert!(
+            probe_bit != ok_bit,
+            "the crafted pair must occupy distinct bloom bits"
+        );
+        let mut ibody = ibody_header(1 << probe_bit, 0).to_vec();
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"probe", b"pv"));
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"ok", b"ov"));
+        lay_xattr_reg_child_at(disk, 2, &ibody);
+        // The acl gate leg: version 2 + one ACL_USER_OBJ record — a
+        // fully valid 12-byte acl value an unmolested walk answers
+        // Ok(12) for; only the bloom denial produces ENODATA here.
+        let acl_bit = bloom_bit_of(XATTR_INDEX_POSIX_ACL_ACCESS, b"");
+        let mut acl_body = ibody_header(1 << acl_bit, 0).to_vec();
+        acl_body.extend_from_slice(&xattr_entry_bytes(
+            XATTR_INDEX_POSIX_ACL_ACCESS,
+            b"",
+            &[
+                0x02, 0x00, 0x00, 0x00, // a_version = 2
+                0x01, 0x00, 0x06, 0x00, // ACL_USER_OBJ, rw-
+                0x00, 0x00, 0x00, 0x00, // e_id (unread for USER_OBJ)
+            ],
+        ));
+        lay_xattr_reg_child_at(disk, 6, &acl_body);
+    })
+}
+
+/// Row 3 (rejection half, §6.5 G-X04 — the P4 length domain with P5's
+/// no-short-circuit clause) — the garbage prefix-record length: one
+/// record whose le16 `len` claim lands outside [1, 256]. 257: the
+/// 257-byte read succeeds (the body is staged in-area) and the
+/// POST-READ domain check fails the whole mount with EUCLEAN; 0: the
+/// claim maps to 65536 (the U16_MAX + 1 encoding) and the oversized
+/// read rides the disk's zeros in-area — the rejection force is
+/// entirely the upper bound either way. Suite: `fs.rs` (the D1
+/// mount-rejection rule).
+pub(super) fn fx_xattr_prefix_len_garbage(len_header: u16) -> ErofsFixture {
+    let upper = NAME_LEN + LONG_PREFIX_FIXED_LEN;
+    assert!(
+        len_header == 0 || usize::from(len_header) > upper,
+        "the garbage form needs an out-of-domain length claim"
+    );
+    rewritten_chassis(|disk| {
+        patch_chassis_sb(disk, |sb| patch_prefix_knobs(sb, 1));
+        let body = vec![0xA5u8; usize::from(len_header)]; // 0 → empty
+        lay_prefix_record(disk, len_header, &body);
+    })
+}
+
+/// Row 3 (boundary half) — the maximal legal record: len = 256 =
+/// NAME_LEN + the 1-byte index prefix (1 user index byte + a
+/// 255-byte infix, NAME_LEN exactly). The mount passes — the domain
+/// edge is inclusive — and the table loads; the long-name consumption
+/// faces belong to the meta-form row, so this form asserts the mount
+/// alone. Suite: `fs.rs`.
+pub(super) fn fx_xattr_prefix_len_boundary() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_chassis_sb(disk, |sb| patch_prefix_knobs(sb, 1));
+        let mut body = vec![XATTR_INDEX_USER];
+        body.extend_from_slice(&[b'x'; NAME_LEN]);
+        lay_prefix_record(
+            disk,
+            (NAME_LEN + LONG_PREFIX_FIXED_LEN) as u16,
+            &body,
+        );
+    })
+}
+
+/// Row 4 (a) (§6.5 G-X04, the XAT-19 negative pair; X27's empty-table
+/// face) — the flag set with an empty table: XATTR_PREFIXES on,
+/// count 0 (the chassis value, untouched). The load is the P1 no-op
+/// and the mount passes; the consumption face is X27's explicit
+/// empty-table branch — the child's `0x80 | 3` entry (k past the
+/// table end) resolves to None: get answers ENODATA, list skips the
+/// row uncounted. No bit/count cross-check exists or may be added.
+/// Suite: `xattr.rs`.
+pub(super) fn fx_xattr_prefix_bit_set_count_zero() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_chassis_sb(disk, |sb| {
+            let incompat = get_le_u32(sb, offset_of!(RawSuperBlock, feature_incompat));
+            put_le_u32(
+                sb,
+                offset_of!(RawSuperBlock, feature_incompat),
+                incompat | FeatureIncompatSet::XATTR_PREFIXES.bits(),
+            );
+        });
+        let mut ibody = ibody_header(0, 0).to_vec();
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_LONG_PREFIX | 3, b"s", b"v"));
+        lay_xattr_reg_child_at(disk, 2, &ibody);
+    })
+}
+
+/// Rows 4 (b) + 5 (§6.5 G-X02/G-X03/G-X04; XAT-18/XAT-19) — the
+/// prefix-table META form, the mkfs-unreachable half: packed_nid
+/// stays the chassis 0 and the FRAGMENTS bit stays clear (the
+/// dual-mapping predicate is false), so the records read off the
+/// device byte stream at the absolute `start << 2` offset; count 1,
+/// with the C10 reference byte family (`XATTR_PREFIX_RECORD_REF`:
+/// index user, infix "erofs_test.lpx.") staged in the block-8 meta
+/// area — the same byte family the packed half consumes
+/// (initramfs-side), so the double pass is the "内核不校验一致性"
+/// observability. `prefixes_bit` carries the row pair: `true` = the
+/// enabled spelling (XAT-18's meta-form pass), `false` = the XAT-19
+/// (b) negative — bit clear with count > 0 must not reject and must
+/// still parse. The child carries the matching `0x80 | 0` entry for
+/// the get/list consumption. Suite: `xattr.rs`.
+pub(super) fn fx_xattr_prefix_table_meta(prefixes_bit: bool) -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_chassis_sb(disk, |sb| {
+            let incompat = get_le_u32(sb, offset_of!(RawSuperBlock, feature_incompat));
+            let incompat = if prefixes_bit {
+                incompat | FeatureIncompatSet::XATTR_PREFIXES.bits()
+            } else {
+                incompat & !FeatureIncompatSet::XATTR_PREFIXES.bits()
+            };
+            put_le_u32(sb, offset_of!(RawSuperBlock, feature_incompat), incompat);
+            patch_prefix_knobs(sb, 1);
+        });
+        write_meta_bytes(
+            disk,
+            CHASSIS_XATTR_AREA_BLK as u64,
+            0,
+            &XATTR_PREFIX_RECORD_REF,
+        );
+        let mut ibody = ibody_header(0, 0).to_vec();
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_LONG_PREFIX, b"s", b"pv"));
+        lay_xattr_reg_child_at(disk, 2, &ibody);
+    })
+}
+
+/// Row 5 (rejection corner, XAT-22) — the meta-form start pointing
+/// past the device end: `pos0 = start << 2` lands exactly at the disk
+/// end, and the FIRST record's le16 read crosses the byte-channel
+/// bound — the channel code (aster EINVAL, the RD2② registered drift
+/// from Linux's typical bread EIO) fails the whole mount. No
+/// value-domain pre-check on the start exists or may be added (the
+/// image is trusted). Suite: `fs.rs` (the D1 mount-rejection rule).
+pub(super) fn fx_xattr_prefix_start_out_of_device() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_chassis_sb(disk, |sb| {
+            sb[offset_of!(RawSuperBlock, xattr_prefix_count)] = 1;
+            put_le_u32(
+                sb,
+                offset_of!(RawSuperBlock, xattr_prefix_start),
+                (CHASSIS_NR_BLOCKS as usize * CHASSIS_BLOCK_SIZE / 4) as u32,
+            );
+        });
     })
 }
 

@@ -232,7 +232,12 @@ const XATTR_INDEX_SECURITY: u8 = 6; // erofs_fs.h:217
 // Live since T-026 S06: consumed by the long-prefix hit test of
 // `entry_matches` below. The bridging `expect` was removed when that
 // consumer landed.
-const XATTR_LONG_PREFIX: u8 = 0x80; // erofs_fs.h:223
+// Widened for the ktest fixture consumer since T-027 S13 (the S04/S12
+// consumer-lands-then-widen precedent): the FX-XATTR meta-form builder
+// composes `0x80 | k` entry indexes with it — a LEGAL on-disk encoding,
+// unlike the S12 dead-index malformation values, so the constant is the
+// single source for both faces. Value and semantics unchanged.
+pub(in crate::fs::fs_impls::erofs) const XATTR_LONG_PREFIX: u8 = 0x80; // erofs_fs.h:223
 
 /// The low 7 bits of `e_name_index`: the prefix-table index when the
 /// long-prefix bit is set (`EROFS_XATTR_LONG_PREFIX_MASK`,
@@ -263,7 +268,12 @@ const FILTER_DEFAULT: u32 = u32::MAX; // erofs_fs.h:227
 // Live since T-026 S04: consumed by the bloom denial predicate
 // (`xattr_filter_denies` below) as the xxh32 seed base. The bridging
 // `expect` was removed when the first consumer landed.
-const FILTER_SEED: u32 = 0x25BBE08F; // erofs_fs.h:228
+// Widened for the ktest fixture consumer since T-027 S13 (the S04/S12
+// consumer-lands-then-widen precedent): the contradictory-bloom builder
+// computes the hashbit of a present name with the SAME seed instead of
+// restating the literal (a second truth for the on-disk format
+// contract — F52). Value and semantics unchanged.
+pub(in crate::fs::fs_impls::erofs) const FILTER_SEED: u32 = 0x25BBE08F; // erofs_fs.h:228
 
 /// The xattr entry alignment unit (`EROFS_XATTR_ALIGN`: every entry —
 /// header + name + value — is rounded up to `sizeof(erofs_xattr_entry)`,
@@ -283,7 +293,12 @@ const XATTR_ENTRY_ALIGN: usize = size_of::<RawXattrEntry>();
 // Live since T-026 S05: consumed by the record-domain bounds check of
 // the prefix load below. The bridging `expect` was removed when the
 // first consumer landed.
-const LONG_PREFIX_FIXED_LEN: usize = 1;
+// Widened for the ktest fixture consumer since T-027 S13 (the S04/S12
+// consumer-lands-then-widen precedent): the FX-XATTR prefix-length
+// builders derive their boundary claims (256 / 257) from this single
+// domain source instead of restating literals. Value and semantics
+// unchanged.
+pub(in crate::fs::fs_impls::erofs) const LONG_PREFIX_FIXED_LEN: usize = 1;
 
 /// ACL tag: the file-owner entry (`ACL_USER_OBJ`,
 /// include/uapi/linux/posix_acl.h:28).
@@ -2074,11 +2089,14 @@ mod tests {
 
     use super::*;
     use crate::fs::{
+        fs_impls::erofs::super_block::RawSuperBlock,
         fs_impls::erofs::test_utils::{
-            assert_errno, fx_xattr_acl_value_malformed, fx_xattr_dead_index_entries,
-            fx_xattr_empty_name_entry, fx_xattr_entry_beyond_remaining,
+            assert_errno, fx_xattr_acl_value_malformed, fx_xattr_contradictory_bloom,
+            fx_xattr_dead_index_entries, fx_xattr_empty_name_entry, fx_xattr_entry_beyond_remaining,
             fx_xattr_glued_acl_name_entries, fx_xattr_header_size_overrun, fx_xattr_non_utf8_names,
-            fx_xattr_symlink_host_user,
+            fx_xattr_prefix_bit_set_count_zero, fx_xattr_prefix_table_meta,
+            fx_xattr_shared_id_bounds, fx_xattr_symlink_host_user, get_le_u32, patch_chassis_sb,
+            put_le_u32,
         },
         vfs::file_system::FsFlags,
     };
@@ -2329,5 +2347,241 @@ mod tests {
             Errno::ENODATA,
             "the type gate fires before the nouser_xattr gate"
         );
+    }
+
+    /// T-027 S13 (§6.5 G-X01/G-X06 — the out-of-bounds shared-id trio
+    /// plus the X24 masking order): three children over a shared area
+    /// at block 8 (`xattr_blkaddr` patched). nid 2: the unbound
+    /// checked header read at `base + 4 × id` crosses the device end —
+    /// EINVAL (the RD2② registered drift from Linux's typical bread
+    /// EIO; the X25 negative fact: no bound check exists or may be
+    /// added), and the list shared walk trips the same channel. nid 6
+    /// (the orchestration child): the inline "in" hit stops get
+    /// before the shared walk; the same-named shared entry hits only
+    /// after inline exhaustion (bytes from ANOTHER area copied
+    /// verbatim — the ③ coincidence shape); a miss iterates past the
+    /// in-area mismatch (②, X28) into ENODATA; list emits both rows
+    /// (X37's unconditional shared continuation). nid 10: the inline
+    /// X24 entry named like the shared one — the get/list chains
+    /// answer the inline EUCLEAN and the shared copy never emits
+    /// (XAT-09).
+    #[ktest]
+    fn shared_id_out_of_bounds_three_shapes() {
+        let fixture = fx_xattr_shared_id_bounds();
+        let fs = fixture.mounted();
+
+        // (a) The out-of-device id: the channel code, not a walk
+        // rejection — both consumer faces trip it.
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_errno!(
+            get_attr(&inode, "user.any", &mut buf),
+            Errno::EINVAL,
+            "① the unbound read crosses the device end (RD2②)"
+        );
+        let mut list_buf = [0u8; 16];
+        assert_errno!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf),
+            Errno::EINVAL,
+            "the list shared walk trips the same channel"
+        );
+
+        // (b) The orchestration child: success-stops, the coincident
+        // shared hit, the in-area mismatch, and X37's continuation.
+        let inode = fs.iget(6).unwrap();
+        assert_eq!(get_attr(&inode, "user.in", &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"iv");
+        assert_eq!(
+            get_attr(&inode, "user.sh", &mut buf).unwrap(),
+            2,
+            "③ the coincidentally parseable shared entry"
+        );
+        assert_eq!(&buf[..2], b"sv");
+        assert_errno!(
+            get_attr(&inode, "user.miss", &mut buf),
+            Errno::ENODATA,
+            "② the in-area mismatch iterates on to exhaustion"
+        );
+        let mut list_buf = [0u8; 32];
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            17,
+            "X37: any inline Ok continues onto the shared rows"
+        );
+        assert_eq!(&list_buf[..17], b"user.in\0user.sh\0");
+
+        // (c) The masking order: the inline X24 EUCLEAN preempts the
+        // same-named shared entry on both faces.
+        let inode = fs.iget(10).unwrap();
+        assert_errno!(
+            get_attr(&inode, "user.sh", &mut buf),
+            Errno::EUCLEAN,
+            "XAT-09: the inline corruption masks the shared same-name"
+        );
+        let mut list_buf = [0u8; 16];
+        assert_errno!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf),
+            Errno::EUCLEAN,
+            "the shared names never emit behind the mask"
+        );
+    }
+
+    /// T-027 S13 (§6.5 G-X05, XAT-14/16): the contradictory bloom
+    /// bitmap — the bit SET for a PRESENT name. get("user.probe") is
+    /// denied ENODATA with zero walk I/O (the trusted bitmap), while
+    /// the cleared-bit control passes through and hits (the one-way
+    /// denial face), and the same image's list emits BOTH names (the
+    /// get/list asymmetry — list is structurally bloom-free). The acl
+    /// child: the channel's empty-suffix internal query (seed
+    /// SEED + 2) is denied over a fully VALID value — the denial is
+    /// the only ENODATA source on that leg (the not-an-exempt-channel
+    /// face). The XAT-16 gate-breaking pair then re-opens the SAME
+    /// image twice through `patch_chassis_sb` (the §3.4 checksum
+    /// finish runs inside): (a) compat bit2 cleared → the gate is
+    /// off and the denied name now HITS; (b) compat restored with the
+    /// reserved byte set → the other half down, same pass-through.
+    #[ktest]
+    fn contradictory_bloom_trusted_and_gate_pair() {
+        let fixture = fx_xattr_contradictory_bloom();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_errno!(
+            get_attr(&inode, "user.probe", &mut buf),
+            Errno::ENODATA,
+            "XAT-14: the trusted bitmap denies the PRESENT name"
+        );
+        assert_eq!(
+            get_attr(&inode, "user.ok", &mut buf).unwrap(),
+            2,
+            "the cleared bit passes through (the one-way denial)"
+        );
+        assert_eq!(&buf[..2], b"ov");
+        let mut list_buf = [0u8; 32];
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            20,
+            "the list chain never consults the bloom bitmap"
+        );
+        assert_eq!(&list_buf[..20], b"user.ok\0user.probe\0");
+
+        // The acl channel's own gate: the empty-suffix internal query
+        // over a valid value — only the denial answers ENODATA here.
+        let acl_child = fs.iget(6).unwrap();
+        assert_errno!(
+            get_attr(&acl_child, "system.posix_acl_access", &mut buf),
+            Errno::ENODATA,
+            "the acl internal query is not an exempt channel"
+        );
+
+        // XAT-16 (a): the compat half down — same bitmap, gate off,
+        // the previously denied name walks and hits.
+        patch_chassis_sb(&fixture.disk, |sb| {
+            let compat_off = offset_of!(RawSuperBlock, feature_compat);
+            let compat = get_le_u32(sb, compat_off);
+            put_le_u32(sb, compat_off, compat & !FeatureCompatSet::XATTR_FILTER.bits());
+        });
+        let gate_off = Erofs::open(
+            fixture.disk.clone() as Arc<dyn BlockDevice>,
+            FsFlags::empty(),
+            None,
+        )
+        .unwrap();
+        let inode = gate_off.iget(2).unwrap();
+        assert_eq!(
+            get_attr(&inode, "user.probe", &mut buf).unwrap(),
+            2,
+            "XAT-16 (a): the compat half down, the walk answers"
+        );
+        assert_eq!(&buf[..2], b"pv");
+
+        // XAT-16 (b): compat restored, the reserved byte set — the
+        // other half down, same pass-through.
+        patch_chassis_sb(&fixture.disk, |sb| {
+            let compat_off = offset_of!(RawSuperBlock, feature_compat);
+            let compat = get_le_u32(sb, compat_off);
+            put_le_u32(sb, compat_off, compat | FeatureCompatSet::XATTR_FILTER.bits());
+            sb[offset_of!(RawSuperBlock, xattr_filter_reserved)] = 1;
+        });
+        let reserved_off = Erofs::open(
+            fixture.disk.clone() as Arc<dyn BlockDevice>,
+            FsFlags::empty(),
+            None,
+        )
+        .unwrap();
+        let inode = reserved_off.iget(2).unwrap();
+        assert_eq!(
+            get_attr(&inode, "user.probe", &mut buf).unwrap(),
+            2,
+            "XAT-16 (b): the reserved half down, the walk answers"
+        );
+    }
+
+    /// T-027 S13 (§6.5 G-X04, XAT-19 + X27's empty-table face): the
+    /// flag/count negative pair. (a) XATTR_PREFIXES set with count 0
+    /// mounts as the P1 no-op — and the consumption face is X27's
+    /// explicit empty-table branch: the `0x80 | 3` entry resolves to
+    /// None (the table is empty), get answers ENODATA and list skips
+    /// the row uncounted. (b) The bit CLEAR with count > 0 must not
+    /// reject (no cross-check exists) and must still parse — the same
+    /// meta-loaded table answers the same long name.
+    #[ktest]
+    fn prefix_flag_shapes_and_empty_table() {
+        let fs = fx_xattr_prefix_bit_set_count_zero().mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_errno!(
+            get_attr(&inode, "user.s", &mut buf),
+            Errno::ENODATA,
+            "X27: an out-of-table k never matches (the empty table)"
+        );
+        let mut list_buf = [0u8; 16];
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            0,
+            "X27: the skipped row is not counted"
+        );
+
+        let fs = fx_xattr_prefix_table_meta(false).mounted();
+        let inode = fs.iget(2).unwrap();
+        assert_eq!(
+            get_attr(&inode, "user.erofs_test.lpx.s", &mut buf).unwrap(),
+            2,
+            "XAT-19 (b): the load gates on count alone — no cross-check"
+        );
+    }
+
+    /// T-027 S13 (§6.5 G-X02/G-X03, XAT-18 — the prefix-table META
+    /// form): packed_nid 0 with the records in the meta area, the C10
+    /// reference byte family (index user, infix "erofs_test.lpx.").
+    /// The four-way hit over the meta-loaded table (base_index ∧
+    /// total length ∧ infix `starts_with` ∧ the e_name segment), the
+    /// total-length mismatch iterating on into ENODATA, and the list
+    /// half concatenating prefix + infix + name verbatim — the same
+    /// byte family the packed half consumes, passing the same way
+    /// (内核不校验一致性).
+    #[ktest]
+    fn prefix_meta_table_resolves_long_names() {
+        let fs = fx_xattr_prefix_table_meta(true).mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            get_attr(&inode, "user.erofs_test.lpx.s", &mut buf).unwrap(),
+            2,
+            "XAT-18: the four-way hit over the meta-loaded table"
+        );
+        assert_eq!(&buf[..2], b"pv");
+        assert_errno!(
+            get_attr(&inode, "user.erofs_test.lpx.other", &mut buf),
+            Errno::ENODATA,
+            "the total-length mismatch iterates on"
+        );
+        let mut list_buf = [0u8; 32];
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            22,
+            "the list half concatenates prefix + infix verbatim"
+        );
+        assert_eq!(&list_buf[..22], b"user.erofs_test.lpx.s\0");
     }
 }

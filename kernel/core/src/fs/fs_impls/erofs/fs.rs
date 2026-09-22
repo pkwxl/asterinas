@@ -1241,7 +1241,8 @@ mod tests {
         fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
         fx_sb_extslots_past_page_boundary, fx_sb_packed_compressed_payload, fx_sb_root_compressed,
         fx_sb_root_nid_out_of_device, fx_sb_root_not_dir, fx_sb_unknown_incompat_bit,
-        fx_sb_volume_name_without_nul, healthy_fixture,
+        fx_sb_volume_name_without_nul, fx_xattr_prefix_len_boundary,
+        fx_xattr_prefix_len_garbage, fx_xattr_prefix_start_out_of_device, healthy_fixture,
     };
 
     /// fold vectors (the design's §7 fold family). The all-zero
@@ -1627,5 +1628,64 @@ mod tests {
             "exactly the FRAGMENTS bit landed"
         );
         assert_eq!(fs.super_block().packed_nid, 2, "the laid packed slot");
+    }
+
+    /// T-027 S13 (FX-XATTR row 3 rejection half, matrix §6.5 G-X04 —
+    /// the P4 record-length domain with P5's no-short-circuit
+    /// clause): one meta-area prefix record with an out-of-domain
+    /// le16 length claim. The 257 leg: the 257-byte read succeeds
+    /// in-area and the POST-READ domain check (len ∉ [1, 256], 256 =
+    /// NAME_LEN + the 1-byte index prefix) fails the whole mount with
+    /// EUCLEAN. The 0 leg: the claim maps to 65536 (the U16_MAX + 1
+    /// encoding) and the oversized read rides the disk's zeros
+    /// in-area — the rejection force is entirely the upper bound on
+    /// both legs (a zero-length short-circuit is prohibited; the two
+    /// claims reach the same door, which is why they share one
+    /// assertion face).
+    #[ktest]
+    fn mount_rejects_garbage_xattr_prefix_len() {
+        assert_errno!(
+            fx_xattr_prefix_len_garbage(257).open,
+            Errno::EUCLEAN,
+            "P4: len 257 one past the inclusive edge, read first"
+        );
+        assert_errno!(
+            fx_xattr_prefix_len_garbage(0).open,
+            Errno::EUCLEAN,
+            "P5: len 0 maps to 65536, rejected by the upper bound"
+        );
+    }
+
+    /// T-027 S13 (FX-XATTR row 3 boundary half): the maximal legal
+    /// record — len = 256 = NAME_LEN + the 1-byte index prefix (1
+    /// user index byte + a 255-byte infix). The domain edge is
+    /// inclusive: the mount passes and the table loads (the count
+    /// mirror locks the load happened; the long-name consumption
+    /// faces belong to the meta-form row's `xattr.rs` suite, not
+    /// restated here).
+    #[ktest]
+    fn mount_accepts_boundary_xattr_prefix_len() {
+        let fs = fx_xattr_prefix_len_boundary().mounted();
+        assert_eq!(
+            fs.super_block().xattr_prefix_count, 1,
+            "the boundary record loaded (the count mirror)"
+        );
+    }
+
+    /// T-027 S13 (FX-XATTR row 5 rejection corner, XAT-22): the
+    /// meta-form `xattr_prefix_start` pointing past the device end —
+    /// `pos0 = start << 2` lands exactly at the disk end, and the
+    /// FIRST record's le16 read crosses the byte-channel bound: the
+    /// channel code (aster EINVAL, the RD2② registered drift from
+    /// Linux's typical bread EIO) fails the whole mount. No
+    /// value-domain pre-check on the start exists or may be added
+    /// (the image is trusted).
+    #[ktest]
+    fn mount_rejects_out_of_device_prefix_start() {
+        assert_errno!(
+            fx_xattr_prefix_start_out_of_device().open,
+            Errno::EINVAL,
+            "XAT-22: pos0 at the device end — the first record read crosses the bound (RD2②)"
+        );
     }
 }
