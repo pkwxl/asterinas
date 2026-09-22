@@ -1777,7 +1777,11 @@ pub(super) fn fx_dirent_nameoff_zero() -> ErofsFixture {
 pub(super) fn fx_dirent_empty_name() -> ErofsFixture {
     rewritten_chassis(|disk| {
         patch_root_dirent(disk, 1, |de| {
-            put_le_u16(de, offset_of!(RawDirent, nameoff), CHASSIS_ROOT_ARRAY_END as u16);
+            put_le_u16(
+                de,
+                offset_of!(RawDirent, nameoff),
+                CHASSIS_ROOT_ARRAY_END as u16,
+            );
         });
     })
 }
@@ -1795,14 +1799,19 @@ pub(super) fn fx_dirent_name_over_255() -> ErofsFixture {
     })
 }
 
-/// Row 11 (R10 corner), name beyond maxsize — the successor's nameoff
-/// (26) is only two past its own 24, but the i_size-27 window makes
-/// the derived 2-byte name end at 28 > maxsize 27 → EUCLEAN. Lookup
-/// consumes silently: the [24, 26) region happens to read "..", so
-/// lookup("..") still resolves (to the root, via the block head).
+/// Row 11 (R10 corner), name beyond maxsize — the successor's
+/// nameoff (40) derives a 16-byte name for the FIRST slot
+/// ([24, 40)), whose END crosses the i_size-27 window:
+/// nameoff + namelen = 40 > 27 → EUCLEAN at the first entry. The
+/// trailing slot's OWN name can never craft this (strnlen caps the
+/// scan at maxsize - nameoff, so its end stays ≤ maxsize) — the
+/// beyond-window form is only reachable through a NON-trailing
+/// nameoff chain. Lookup consumes the region as-is: NUL-truncated
+/// [24, 40) reads "..." (bytes [24, 27) are the dot names), so both
+/// dots miss while the coincidental "..." hit resolves to the root.
 pub(super) fn fx_dirent_name_beyond_maxsize() -> ErofsFixture {
     rewritten_chassis(|disk| {
-        let nameoff = (CHASSIS_ROOT_ARRAY_END + 2) as u16;
+        let nameoff = (CHASSIS_ROOT_ARRAY_END + 16) as u16;
         patch_root_dirent(disk, 1, |de| {
             put_le_u16(de, offset_of!(RawDirent, nameoff), nameoff);
         });

@@ -611,17 +611,25 @@ fn file_type_to_dtype(file_type: u8) -> InodeType {
 mod tests {
     use core::{cmp::Ordering, mem::size_of};
 
-    use ostd::prelude::*;
+    // Only the `ktest` attribute macro comes from ostd directly: a
+    // full `ostd::prelude::*` glob would clash with the crate prelude
+    // (re-exported through `use super::*`) on `Result` — the two
+    // preludes define different default-error aliases (E0659 at the
+    // `RecordingVisitor::visit` signature). Same shape as
+    // `sysfs/test.rs`.
+    use ostd::prelude::ktest;
 
     use super::*;
-    use crate::fs::file::InodeType;
-    use crate::fs::fs_impls::erofs::test_utils::{
-        assert_errno, fx_dirent_directory_cycle, fx_dirent_dotdot_wrong_nid,
-        fx_dirent_dtype_out_of_range, fx_dirent_embedded_nul_names, fx_dirent_empty_name,
-        fx_dirent_missing_dotdot_child, fx_dirent_missing_dotdot_root,
-        fx_dirent_name_beyond_maxsize, fx_dirent_name_over_255, fx_dirent_nameoff_high_bits,
-        fx_dirent_nameoff_inverted, fx_dirent_nameoff_not_multiple, fx_dirent_nameoff_zero,
-        fx_dirent_unsorted_binary_search, fx_dirent_zero_nid_entry, healthy_fixture,
+    use crate::fs::{
+        file::InodeType,
+        fs_impls::erofs::test_utils::{
+            assert_errno, fx_dirent_directory_cycle, fx_dirent_dotdot_wrong_nid,
+            fx_dirent_dtype_out_of_range, fx_dirent_embedded_nul_names, fx_dirent_empty_name,
+            fx_dirent_missing_dotdot_child, fx_dirent_missing_dotdot_root,
+            fx_dirent_name_beyond_maxsize, fx_dirent_name_over_255, fx_dirent_nameoff_high_bits,
+            fx_dirent_nameoff_inverted, fx_dirent_nameoff_not_multiple, fx_dirent_nameoff_zero,
+            fx_dirent_unsorted_binary_search, fx_dirent_zero_nid_entry, healthy_fixture,
+        },
     };
 
     /// Pointwise comparison-semantics table (LKP-11, `docs/T-013/S05/
@@ -776,7 +784,8 @@ mod tests {
 
     impl DirentVisitor for RecordingVisitor {
         fn visit(&mut self, name: &str, ino: u64, type_: InodeType, offset: usize) -> Result<()> {
-            self.rows.push((name.as_bytes().to_vec(), ino, type_, offset));
+            self.rows
+                .push((name.as_bytes().to_vec(), ino, type_, offset));
             Ok(())
         }
     }
@@ -836,7 +845,10 @@ mod tests {
         let fixture = fx_dirent_nameoff_high_bits();
         let root = fixture.mounted().root_inode().unwrap();
         let dot = root.lookup(".").unwrap();
-        assert!(Arc::ptr_eq(&dot, &root), "the folded nameoff still resolves .");
+        assert!(
+            Arc::ptr_eq(&dot, &root),
+            "the folded nameoff still resolves ."
+        );
         let dot_dot = root.lookup("..").unwrap();
         assert!(Arc::ptr_eq(&dot_dot, &root), "... and ..");
         let mut visitor = RecordingVisitor::default();
@@ -845,7 +857,10 @@ mod tests {
             Errno::EUCLEAN,
             "R5: raw nameoff0 >= bs rejects the whole window"
         );
-        assert!(visitor.rows.is_empty(), "no row is emitted before the R5 door");
+        assert!(
+            visitor.rows.is_empty(),
+            "no row is emitted before the R5 door"
+        );
 
         let fixture = fx_dirent_nameoff_not_multiple();
         let root = fixture.mounted().root_inode().unwrap();
@@ -854,7 +869,11 @@ mod tests {
             Errno::ENOENT,
             "silent fold consumption — never EUCLEAN from the lookup side"
         );
-        assert_errno!(root.lookup(".."), Errno::ENOENT, "the drift-preserving miss");
+        assert_errno!(
+            root.lookup(".."),
+            Errno::ENOENT,
+            "the drift-preserving miss"
+        );
         let mut visitor = RecordingVisitor::default();
         assert_errno!(
             root.readdir_at(0, &mut visitor),
@@ -897,8 +916,16 @@ mod tests {
         // Inverted chain: 20 < 24 -> namelen wraps huge.
         let fixture = fx_dirent_nameoff_inverted();
         let root = fixture.mounted().root_inode().unwrap();
-        assert_errno!(root.lookup("."), Errno::ENOENT, "inverted region reads empty");
-        assert_errno!(root.lookup(".."), Errno::ENOENT, "... silently for both dots");
+        assert_errno!(
+            root.lookup("."),
+            Errno::ENOENT,
+            "inverted region reads empty"
+        );
+        assert_errno!(
+            root.lookup(".."),
+            Errno::ENOENT,
+            "... silently for both dots"
+        );
         let mut visitor = RecordingVisitor::default();
         assert_errno!(
             root.readdir_at(0, &mut visitor),
@@ -913,15 +940,27 @@ mod tests {
         // filesystem right after this statement.)
         let fixture = fx_dirent_empty_name();
         let root = fixture.mounted().root_inode().unwrap();
-        assert_errno!(root.lookup("."), Errno::ENOENT, "the empty region drifts silently");
+        assert_errno!(
+            root.lookup("."),
+            Errno::ENOENT,
+            "the empty region drifts silently"
+        );
         let mut visitor = RecordingVisitor::default();
-        assert_errno!(root.readdir_at(0, &mut visitor), Errno::EUCLEAN, "R10: zero namelen");
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EUCLEAN,
+            "R10: zero namelen"
+        );
         assert!(visitor.rows.is_empty());
 
         // Name over NAME_LEN: namelen 300 > 255.
         let fixture = fx_dirent_name_over_255();
         let root = fixture.mounted().root_inode().unwrap();
-        assert_errno!(root.lookup("."), Errno::ENOENT, "the NUL-truncated region reads Less");
+        assert_errno!(
+            root.lookup("."),
+            Errno::ENOENT,
+            "the NUL-truncated region reads Less"
+        );
         let mut visitor = RecordingVisitor::default();
         assert_errno!(
             root.readdir_at(0, &mut visitor),
@@ -930,15 +969,31 @@ mod tests {
         );
         assert!(visitor.rows.is_empty());
 
-        // Name beyond maxsize: nameoff 26 + namelen 2 = 28 > 27 —
-        // lookup stays silent AND ".." still resolves through the
-        // block head (the [24, 26) region happens to read "..":
-        // consumption as-is).
+        // Name beyond maxsize: the successor's nameoff (40) derives
+        // a 16-byte name for the FIRST slot — [24, 40) crosses the
+        // i_size-27 window (nameoff + namelen = 40 > 27), and the
+        // strnlen cap makes the trailing slot's own name unable to
+        // cross maxsize (the form is non-trailing-chain-only). Lookup
+        // consumes the region as-is: NUL-truncated to "..." (bytes
+        // [24, 27) are the dot names), so both dots miss while the
+        // coincidental "..." hit resolves to the root.
         let fixture = fx_dirent_name_beyond_maxsize();
         let root = fixture.mounted().root_inode().unwrap();
-        assert_errno!(root.lookup("."), Errno::ENOENT, "silent for the shorter dot name");
-        let dot_dot = root.lookup("..").unwrap();
-        assert!(Arc::ptr_eq(&dot_dot, &root), "the coincidental hit resolves as-is");
+        assert_errno!(
+            root.lookup("."),
+            Errno::ENOENT,
+            "the query exhausts mid-name: Less"
+        );
+        assert_errno!(
+            root.lookup(".."),
+            Errno::ENOENT,
+            "... for both dots against the drifted region"
+        );
+        let dots = root.lookup("...").unwrap();
+        assert!(
+            Arc::ptr_eq(&dots, &root),
+            "the coincidental NUL-truncated hit resolves as-is"
+        );
         let mut visitor = RecordingVisitor::default();
         assert_errno!(
             root.readdir_at(0, &mut visitor),
@@ -1028,7 +1083,11 @@ mod tests {
             ]
         );
         assert!(Arc::ptr_eq(&child.lookup(".").unwrap(), &child));
-        assert_errno!(child.lookup(".."), Errno::ENOENT, "the child's .. is equally absent");
+        assert_errno!(
+            child.lookup(".."),
+            Errno::ENOENT,
+            "the child's .. is equally absent"
+        );
         assert_eq!(child.lookup("g").unwrap().ino(), 4);
     }
 
@@ -1051,7 +1110,11 @@ mod tests {
         let dot_dot = root.lookup("..").unwrap();
         assert_eq!(dot_dot.ino(), 2, "the wrong target is igeted uncritically");
         assert!(!Arc::ptr_eq(&dot_dot, &root));
-        assert_errno!(dot_dot.lookup("x"), Errno::ENOENT, "N4: the empty directory gates early");
+        assert_errno!(
+            dot_dot.lookup("x"),
+            Errno::ENOENT,
+            "N4: the empty directory gates early"
+        );
     }
 
     /// The directory cycle's FS-level legs (matrix §3.4 W-N08: the
@@ -1067,7 +1130,10 @@ mod tests {
         let child = root.lookup("loop").unwrap();
         assert_eq!(child.ino(), 2);
         let back = child.lookup("loop").unwrap();
-        assert!(Arc::ptr_eq(&back, &root), "the cycle leg closes on the root identity");
+        assert!(
+            Arc::ptr_eq(&back, &root),
+            "the cycle leg closes on the root identity"
+        );
         assert_eq!(
             readdir_rows(&child),
             [
@@ -1111,7 +1177,10 @@ mod tests {
             ]
         );
         let zero = root.lookup("zero").unwrap();
-        assert!(Arc::ptr_eq(&zero, &root), "nid 0 is the root — followed uncritically");
+        assert!(
+            Arc::ptr_eq(&zero, &root),
+            "nid 0 is the root — followed uncritically"
+        );
     }
 
     /// Embedded-NUL names, the NUL half (matrix §3.5 W-N05/W-N06/W-N07
@@ -1136,8 +1205,20 @@ mod tests {
                 (b"t".to_vec(), 4, InodeType::File, 57),
             ]
         );
-        assert_eq!(root.lookup("a").unwrap().ino(), 2, "the NUL-truncated name hit");
-        assert_eq!(root.lookup("t").unwrap().ino(), 4, "... for both embedded-NUL entries");
-        assert_errno!(root.lookup("b"), Errno::ENOENT, "the post-NUL tail is unreachable");
+        assert_eq!(
+            root.lookup("a").unwrap().ino(),
+            2,
+            "the NUL-truncated name hit"
+        );
+        assert_eq!(
+            root.lookup("t").unwrap().ino(),
+            4,
+            "... for both embedded-NUL entries"
+        );
+        assert_errno!(
+            root.lookup("b"),
+            Errno::ENOENT,
+            "the post-NUL tail is unreachable"
+        );
     }
 }
