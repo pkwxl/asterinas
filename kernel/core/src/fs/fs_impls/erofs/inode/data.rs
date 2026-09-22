@@ -832,7 +832,7 @@ mod tests {
     use align_ext::AlignExt;
     use aster_block::{SECTOR_SIZE, bio::BioType};
     use io_util::IoError;
-    use ostd::{mm::io::Fallible, prelude::*};
+    use ostd::prelude::*;
 
     use super::*;
     use crate::fs::fs_impls::erofs::{
@@ -1874,7 +1874,11 @@ mod tests {
         for la in [0usize, 5 * PAGE_SIZE] {
             let mut buf = [0u8; PAGE_SIZE];
             let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
-            assert_eq!(inode.read_at(la, &mut writer).unwrap(), PAGE_SIZE, "la {la}");
+            assert_eq!(
+                inode.read_at(la, &mut writer).unwrap(),
+                PAGE_SIZE,
+                "la {la}"
+            );
             for (i, b) in buf.iter().enumerate() {
                 assert_eq!(*b, chassis_nonzero_pattern(i), "la {la} byte {i}");
             }
