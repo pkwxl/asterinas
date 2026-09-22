@@ -159,7 +159,11 @@ const_assert!(offset_of!(RawXattrEntry, e_value_size) == 2); // erofs_fs.h:234
 // the S05/S08 increment rows): on-disk facts transcribed from
 // linux/fs/erofs/erofs_fs.h and include/uapi/linux/posix_acl(_xattr).h,
 // referenced by path at their consumption sites, never forwarded
-// through the prelude. Private to this module; not enum-ized (XA1
+// through the prelude. Private to this module (the four live
+// namespace indexes below, widened to
+// `pub(in crate::fs::fs_impls::erofs)` at T-027 S12 for the FX-XATTR
+// fixture builders in `test_utils.rs` — the S04 S_IFMT/S_IFREG
+// widening precedent; LUSTRE stays private-dead); not enum-ized (XA1
 // value transcription). Liveness closed at S09: every consumable
 // member is live through the entry chains (see the per-member
 // "Live since" notes); the two structurally-unconsumable
@@ -172,29 +176,37 @@ const_assert!(offset_of!(RawXattrEntry, e_value_size) == 2); // erofs_fs.h:234
 /// erofs_fs.h:212).
 // Live since T-026 S06: consumed by `resolve_query_name` below. The
 // bridging `expect` was removed when that consumer landed.
-const XATTR_INDEX_USER: u8 = 1; // erofs_fs.h:212
+// Visibility widened at T-027 S12: the FX-XATTR fixture builders
+// (`test_utils.rs`) stage entry headers with the live namespace
+// indexes — same-day-consumer widening, the S04 S_IF* precedent.
+pub(in crate::fs::fs_impls::erofs) const XATTR_INDEX_USER: u8 = 1; // erofs_fs.h:212
 
 /// Name index of the access-ACL pseudo-name
 /// (`EROFS_XATTR_INDEX_POSIX_ACL_ACCESS`, erofs_fs.h:213).
 // Live since T-026 S07: consumed by the list base-prefix row 2
 // below and, since S08, the acl exact-name dispatch
 // (`get_system_xattr`). The bridging `expect` was removed when the
-// first consumer landed.
-const XATTR_INDEX_POSIX_ACL_ACCESS: u8 = 2; // erofs_fs.h:213
+// first consumer landed. Visibility widened at T-027 S12 (the
+// FX-XATTR fixture builders; the S04 precedent).
+pub(in crate::fs::fs_impls::erofs) const XATTR_INDEX_POSIX_ACL_ACCESS: u8 = 2; // erofs_fs.h:213
 
 /// Name index of the default-ACL pseudo-name
 /// (`EROFS_XATTR_INDEX_POSIX_ACL_DEFAULT`, erofs_fs.h:214).
 // Live since T-026 S07: consumed by the list base-prefix row 3
 // below and, since S08, the acl exact-name dispatch
 // (`get_system_xattr`). The bridging `expect` was removed when the
-// first consumer landed.
-const XATTR_INDEX_POSIX_ACL_DEFAULT: u8 = 3; // erofs_fs.h:214
+// first consumer landed. Visibility widened at T-027 S12 (the
+// FX-XATTR fixture builders; the S04 precedent).
+pub(in crate::fs::fs_impls::erofs) const XATTR_INDEX_POSIX_ACL_DEFAULT: u8 = 3; // erofs_fs.h:214
 
 /// Name index of `trusted.*` attributes (`EROFS_XATTR_INDEX_TRUSTED`,
 /// erofs_fs.h:215).
 // Live since T-026 S06: consumed by `resolve_query_name` below. The
 // bridging `expect` was removed when that consumer landed.
-const XATTR_INDEX_TRUSTED: u8 = 4; // erofs_fs.h:215
+// Visibility widened at T-027 S12: the FX-XATTR fixture builders
+// (`test_utils.rs`) stage entry headers with the live namespace
+// indexes — same-day-consumer widening, the S04 S_IF* precedent.
+pub(in crate::fs::fs_impls::erofs) const XATTR_INDEX_TRUSTED: u8 = 4; // erofs_fs.h:215
 
 /// Name index of the (unmapped) Lustre attributes
 /// (`EROFS_XATTR_INDEX_LUSTRE`, erofs_fs.h:216).
@@ -2040,4 +2052,277 @@ fn serialize_posix_acl(entries: &[PosixAclEntry]) -> Vec<u8> {
         out.extend_from_slice(&e_id.to_le_bytes());
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// T-027 S12: the FX-XATTR entry/layout ktest suite — the FIRST `mod
+// tests` of this file (the D1 host rule: the get/list/acl read chains
+// live here). Every fixture is a mount-Ok crafted child of the
+// `test_utils.rs` FX-XATTR S12 family (S06 §5.6 rows 6–13; assertion
+// values follow the matrix §6.1–§6.3 row groups, never re-derived
+// here); the tests drive the full mounted chain — `Erofs::open` →
+// `iget` → the inherent get/list faces above.
+// ---------------------------------------------------------------------------
+#[cfg(ktest)]
+mod tests {
+    // Only the `ktest` attribute macro comes from ostd directly: a
+    // full `ostd::prelude::*` glob would clash with the crate prelude
+    // (re-exported through `use super::*`) on `Result` — the two
+    // preludes define different default-error aliases (the dir.rs
+    // tests' E0659 note).
+    use ostd::prelude::ktest;
+
+    use super::*;
+    use crate::fs::fs_impls::erofs::test_utils::{
+        assert_errno, fx_xattr_acl_value_malformed, fx_xattr_dead_index_entries,
+        fx_xattr_empty_name_entry, fx_xattr_entry_beyond_remaining, fx_xattr_glued_acl_name_entries,
+        fx_xattr_header_size_overrun, fx_xattr_non_utf8_names, fx_xattr_symlink_host_user,
+    };
+    use crate::fs::vfs::file_system::FsFlags;
+
+    /// get through the inherent face over a kernel buffer — the
+    /// writer conversion every ktest consumer of the chain spells.
+    fn get_attr(inode: &Inode, full_name: &str, buf: &mut [u8]) -> Result<usize> {
+        let name = XattrName::try_from_full_name(full_name)
+            .expect("ktest names carry a known namespace prefix");
+        let mut writer = VmWriter::from(buf).to_fallible();
+        inode.get_xattr(name, &mut writer)
+    }
+
+    /// list through the inherent face; the returned total is also the
+    /// number of bytes staged into `buf` (the single-point terminal
+    /// write of the entry chain).
+    fn list_attr(inode: &Inode, namespace: XattrNamespace, buf: &mut [u8]) -> Result<usize> {
+        let mut writer = VmWriter::from(buf).to_fallible();
+        inode.list_xattr(namespace, &mut writer)
+    }
+
+    /// T-027 S12 (§6.1 W-X03): the bare-prefix EINVAL is a NAME-LAYER
+    /// gate — get("user.") answers EINVAL before any on-disk state is
+    /// touched, and the crafted empty-name entry (e_name_len = 0 with
+    /// a real one-byte value, the marker ≠ 0) matches no legal query:
+    /// its suffix length 0 can never equal a post-strip suffix ≥ 1.
+    /// The healthy control child hits, proving entries exist and the
+    /// walk is healthy — the EINVAL's root is the parse gate (F38),
+    /// not absent entries. The first assertion also cross-locks the
+    /// `icount_for_ibody` encode against the production decode (the
+    /// staged area length IS the decoded `xattr_isize`).
+    #[ktest]
+    fn empty_name_entry_parse_gate_einval_and_miss() {
+        let fixture = fx_xattr_empty_name_entry();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        assert_eq!(inode.desc().xattr_isize, 20, "the icount encode round-trip");
+        let mut buf = [0u8; 16];
+        assert_errno!(get_attr(&inode, "user.", &mut buf), Errno::EINVAL);
+        assert_errno!(get_attr(&inode, "user.x", &mut buf), Errno::ENODATA);
+        let control = fs.iget(4).unwrap();
+        assert_eq!(get_attr(&control, "user.ctrl", &mut buf).unwrap(), 7);
+        assert_eq!(&buf[..7], b"ctrlval");
+    }
+
+    /// T-027 S12 (§6.3 X44/F17 get-side dual + the W-X02 state-B list
+    /// face): acl-index entries with a NON-empty suffix never match
+    /// the acl channel's empty-suffix internal query — both exact acl
+    /// names answer ENODATA — and the list side skips the acl rows
+    /// unconditionally (aster's single-namespace list channel has no
+    /// System enumeration; the registered state-B divergence — Linux
+    /// would emit the glued full names, aster skips, asserted at the
+    /// aster value).
+    #[ktest]
+    fn glued_acl_names_never_match_and_skip_in_list() {
+        let fixture = fx_xattr_glued_acl_name_entries();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 64];
+        assert_errno!(
+            get_attr(&inode, "system.posix_acl_access", &mut buf),
+            Errno::ENODATA
+        );
+        assert_errno!(
+            get_attr(&inode, "system.posix_acl_default", &mut buf),
+            Errno::ENODATA
+        );
+        let mut list_buf = [0u8; 64];
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            0,
+            "the acl rows never list (W-X02 state B)"
+        );
+    }
+
+    /// T-027 S12 (§6.2 X10): dead indexes 0, 5 (the empty lustre
+    /// slot), and 7 (the first value past the handler map) — get
+    /// never matches (the full-value index equality against the query
+    /// domain 1/4/6; X10/X11's get-side expression), and list skips
+    /// every row without counting it (a skip, never an error).
+    #[ktest]
+    fn dead_index_entries_skip_in_list_and_miss_in_get() {
+        let fixture = fx_xattr_dead_index_entries();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_errno!(get_attr(&inode, "user.x", &mut buf), Errno::ENODATA);
+        assert_errno!(get_attr(&inode, "trusted.x", &mut buf), Errno::ENODATA);
+        let mut list_buf = [0u8; 32];
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            0,
+            "a dead index is a skip, not an error (X10)"
+        );
+    }
+
+    /// T-027 S12 (§6.1 X23): header_sz ≥ isize — h_shared_count raised
+    /// to 2 on a 16-byte area (header_sz 20): NO explicit error
+    /// anywhere; init overran the id reads (the second id read four
+    /// bytes past the area end — the F2 overrun-as-garbage face, the
+    /// bytes are on-disk zeros), the inline walk is EMPTY, and the
+    /// overrun ids (both 0) resolve through xattr_blkaddr 0 to the
+    /// block-0 zero bytes — dead entries, exhaustion. get answers
+    /// ENODATA, list a 0-length listing. The control child hits: the
+    /// ENODATA is the X23 empty-walk shape, not a staging bug.
+    #[ktest]
+    fn header_size_overrun_empty_walk_and_overread() {
+        let fixture = fx_xattr_header_size_overrun();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        assert_eq!(inode.desc().xattr_isize, 16);
+        let mut buf = [0u8; 16];
+        assert_errno!(get_attr(&inode, "user.x", &mut buf), Errno::ENODATA);
+        let mut list_buf = [0u8; 32];
+        assert_eq!(list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(), 0);
+        let control = fs.iget(4).unwrap();
+        assert_eq!(get_attr(&control, "user.ok", &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"v0");
+    }
+
+    /// T-027 S12 (§6.1 X24): the entry beyond remaining — the crafted
+    /// entry's ALIGN4 size (roundup(4 + 1 + 20) = 28) overruns the
+    /// 20-byte entry area → EUCLEAN on BOTH faces: the gate lives in
+    /// the walk, ahead of every consumer, so get and list trip it
+    /// identically (the get chain's only on-disk-corruption
+    /// surfacing point; the ext2-style EIO gate is the F45
+    /// prohibition — EUCLEAN, never EIO).
+    #[ktest]
+    fn entry_beyond_remaining_euclean_both_faces() {
+        let fixture = fx_xattr_entry_beyond_remaining();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_errno!(get_attr(&inode, "user.x", &mut buf), Errno::EUCLEAN);
+        let mut list_buf = [0u8; 32];
+        assert_errno!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf),
+            Errno::EUCLEAN,
+            "the X24 gate precedes the list consumer too"
+        );
+    }
+
+    /// T-027 S12 (§6.1 W-X06): the non-UTF-8 name — the raw 0xFF/0x80
+    /// bytes ride on disk; every aster query arrives lossy-replaced
+    /// (U+FFFD ×2 = six UTF-8 bytes), which never byte-matches the
+    /// two-byte raw name → ENODATA (the REGISTERED DRIFT value; a
+    /// raw-byte Linux query would hit). The ASCII control hits
+    /// (两侧命中的负对照), and the list OUTPUT half carries the raw
+    /// bytes verbatim — a VmWriter byte face that never narrows
+    /// through &str (both kernels emit the same bytes there).
+    #[ktest]
+    fn non_utf8_name_get_enodata_list_raw_bytes() {
+        let fixture = fx_xattr_non_utf8_names();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_errno!(
+            get_attr(&inode, "user.\u{FFFD}\u{FFFD}", &mut buf),
+            Errno::ENODATA,
+            "the lossy replacement never matches the raw bytes (W-X06)"
+        );
+        assert_eq!(get_attr(&inode, "user.ok", &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"v0");
+        let mut list_buf = [0u8; 64];
+        let total = list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap();
+        assert_eq!(total, 16);
+        assert_eq!(&list_buf[..16], b"user.ok\0user.\xFF\x80\0");
+    }
+
+    /// T-027 S12 (§6.3 X45/X46, 值域畸形/空值): the acl value-domain
+    /// legs, one child each (an acl get parses the FIRST index-matching
+    /// entry). The three-code split with the production order
+    /// preserved: nid 2 carries a_version 1 on a MISALIGNED body —
+    /// EOPNOTSUPP, the version door before the alignment judgement
+    /// (nid 8 is the same shape with version 2 and answers EINVAL —
+    /// the order face pinned by the pair); the short and the EMPTY
+    /// values answer EINVAL (the 0-length half — the same on-disk
+    /// empty value is a legal Ok(0) on the generic user channel, nid
+    /// 16: two channels, two codes); the unknown tag and the
+    /// undefined −1 id fail at their own entries (EINVAL); the pure
+    /// version-2 header is "legal but empty" → ENODATA.
+    #[ktest]
+    fn acl_value_malformed_three_code_split() {
+        let fixture = fx_xattr_acl_value_malformed();
+        let fs = fixture.mounted();
+        let mut buf = [0u8; 64];
+        let mut acl = |nid: u64| {
+            get_attr(
+                &fs.iget(nid).unwrap(),
+                "system.posix_acl_access",
+                &mut buf,
+            )
+        };
+        assert_errno!(acl(2), Errno::EOPNOTSUPP, "version door before alignment");
+        assert_errno!(acl(4), Errno::EINVAL, "value shorter than the header");
+        assert_errno!(acl(6), Errno::EINVAL, "the empty acl value");
+        assert_errno!(acl(8), Errno::EINVAL, "(size - 4) not a multiple of 8");
+        assert_errno!(acl(10), Errno::EINVAL, "unknown acl tag");
+        assert_errno!(acl(12), Errno::EINVAL, "the undefined -1 acl id");
+        assert_errno!(acl(14), Errno::ENODATA, "a pure header is absent");
+        let generic = fs.iget(16).unwrap();
+        assert_eq!(
+            get_attr(&generic, "user.empty", &mut buf).unwrap(),
+            0,
+            "the same empty value is a legal Ok(0) on the generic channel"
+        );
+    }
+
+    /// T-027 S12 (§6.1 G-X09, the S08-frozen case B): the symlink
+    /// host — a fast LNK carrying user.* and trusted.* entries plus a
+    /// healthy inline target behind the ibody area. The type gate:
+    /// get("user.x") → ENODATA (X13: User ∧ non-reg/dir) while
+    /// get("trusted.x") hits (Trusted carries zero type gate) and
+    /// list emits the user row (no type gate on the list side — the
+    /// asymmetry face). read_link returns the target — the
+    /// ibody/payload interplay is staged right (inline_data_start =
+    /// iloc + 64 + isize). The X13-before-X3 ORDER face: re-mounted
+    /// with nouser_xattr, the same query still answers ENODATA —
+    /// EOPNOTSUPP here would be the reorder signal.
+    #[ktest]
+    fn symlink_host_user_type_gate_enodata() {
+        let fixture = fx_xattr_symlink_host_user();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        let mut buf = [0u8; 16];
+        assert_errno!(get_attr(&inode, "user.x", &mut buf), Errno::ENODATA);
+        assert_eq!(get_attr(&inode, "trusted.x", &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"tv");
+        let mut list_buf = [0u8; 32];
+        assert_eq!(list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(), 7);
+        assert_eq!(&list_buf[..7], b"user.x\0");
+        assert_eq!(inode.read_link().unwrap(), "ok-target");
+
+        // The X13-before-X3 order face: a second mount of the SAME
+        // image with nouser_xattr — the type gate (ENODATA) must
+        // still answer ahead of the option gate (EOPNOTSUPP).
+        let no_user = Erofs::open(
+            fixture.disk.clone() as Arc<dyn BlockDevice>,
+            FsFlags::empty(),
+            Some("nouser_xattr"),
+        )
+        .unwrap();
+        let inode = no_user.iget(2).unwrap();
+        assert_errno!(
+            get_attr(&inode, "user.x", &mut buf),
+            Errno::ENODATA,
+            "the type gate fires before the nouser_xattr gate"
+        );
+    }
 }

@@ -148,6 +148,21 @@
 //!   widen their declaration visibility for the special-file legs
 //!   (the S04/S06/S08 precedent, `inode/mod.rs`).
 //!
+//! * **T-027 S12, the FX-XATTR entry/layout family**: eight named
+//!   constructors (`fx_xattr_*`) per S06 §5.6 rows 6–13 — the
+//!   empty-name entry (W-X03's negative control), the glued acl
+//!   names, the dead indexes, the X23 header-size overrun, the X24
+//!   entry beyond remaining, the non-UTF-8 name (W-X06), the acl
+//!   value-domain malformations, and the G-X09 symlink host (the
+//!   S08-frozen case B). Each lays an ibody xattr area on a chassis
+//!   child (`lay_xattr_child_at` — the xattr chassis-variant single
+//!   source the S13 mechanism family reuses); every form mounts Ok
+//!   and the assertion surface is the get/list/acl read chains — the
+//!   suite lives in `xattr.rs` (that file's first ktests; the D1
+//!   host rule). Four live namespace-index constants widen their
+//!   visibility in `xattr.rs` for the builders (the S04 S_IF*
+//!   precedent).
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -190,6 +205,10 @@ use super::{
         SUPER_MAGIC_V1, SUPER_OFFSET, SUPPORTED_BLKSZBITS, SuperBlock, verify_superblock_checksum,
     },
     utils::crc32c,
+    xattr::{
+        RawXattrEntry, RawXattrIbodyHeader, XATTR_INDEX_POSIX_ACL_ACCESS,
+        XATTR_INDEX_POSIX_ACL_DEFAULT, XATTR_INDEX_TRUSTED, XATTR_INDEX_USER,
+    },
 };
 use crate::fs::vfs::file_system::FsFlags;
 
@@ -2878,6 +2897,381 @@ pub(super) fn fx_comp_packed_uncompressed_payload() -> ErofsFixture {
             CHASSIS_PACKED_NID,
         );
         write_super_block(disk, &sb);
+    })
+}
+
+// ===========================================================================
+// T-027 S12: the FX-XATTR entry/layout family (S06 §5.6 rows 6–13; matrix
+// §1.6 label row IMG-CRAFT-XATTR serving the §6.1 X24/W-X03/W-X06 rows,
+// the §6.2 dead-index/glued-name rows, the §6.3 value-malformed rows, and
+// the §6.1 G-X09 symlink-host half — the S08-frozen case B. The mechanism
+// rows 1–5, bloom/shared/prefix, are S13's, over the same chassis
+// variant). Eight named constructors, each a LOCAL rewrite of the chassis
+// laying an ibody xattr area on a child inode (the S06 §5.6 chassis
+// variant: i_xattr_icount patched, the ibody bytes staged at
+// suffix_xattr_start = iloc + 64, the production base point). Every form
+// mounts Ok — no mount gate reads a child's xattr area — and the
+// assertion surface is the get/list/acl read chains; the suite lives in
+// `xattr.rs` (that file's FIRST ktest suite; the D1 host rule).
+//
+// AUTO-DECISION: h_name_filter = 0 on every S12 ibody. The bloom gate is
+// ACTIVE on the chassis (compat 0x7 carries XATTR_FILTER and the
+// reserved byte is 0), and the all-clear bitmap is the one value that
+// denies no query, keeping every walk here reachable. The crafted
+// contradictory bitmap is S13's own form (G-X05); staging it on these
+// images would couple every entry/layout row to the bloom mechanism row.
+//
+// AUTO-DECISION: the xattr chassis variant lands as the laying helpers
+// below (`ibody_header`/`xattr_entry_bytes`/`icount_for_ibody`/
+// `lay_xattr_child_at`) over `rewritten_chassis`, not a parallel
+// staging path — every other chassis byte is form-independent (the
+// `lay_compact_root` precedent), and S13's mechanism builders re-consume
+// the same helpers (the subtask's single-source contract; their shared
+// area rides `write_meta_bytes` at block 8+). Rejected: a `xattr_chassis`
+// wrapper around `rewritten_chassis` (a pure alias); a second full
+// staging function (the S07-rejected duplication).
+// ===========================================================================
+
+/// Composes the 12-byte ibody header (S06 §5.6): `h_name_filter` and
+/// `h_shared_count` patched through `offset_of!`, `h_reserved2` left
+/// zero (never read, G5).
+fn ibody_header(name_filter: u32, shared_count: u8) -> [u8; size_of::<RawXattrIbodyHeader>()] {
+    let mut header = [0u8; size_of::<RawXattrIbodyHeader>()];
+    put_le_u32(
+        &mut header,
+        offset_of!(RawXattrIbodyHeader, h_name_filter),
+        name_filter,
+    );
+    header[offset_of!(RawXattrIbodyHeader, h_shared_count)] = shared_count;
+    header
+}
+
+/// Composes one on-disk xattr entry: the 4-byte header (`e_name_len` /
+/// `e_name_index` / `e_value_size` patched through `offset_of!`) plus
+/// the name and value bytes, zero-padded to the ALIGN4 total
+/// (`erofs_xattr_entry_size`; the pad unit is
+/// `size_of::<RawXattrEntry>()`, the C5 single source). The trailing
+/// pad bytes are never read on disk. The name may be empty (a legal
+/// on-disk value the acl storage and long-prefix matching consume)
+/// and may be non-UTF-8 (raw bytes — the W-X06 form's identity).
+fn xattr_entry_bytes(index: u8, name: &[u8], value: &[u8]) -> Vec<u8> {
+    assert!(name.len() <= NAME_LEN, "on-disk names are NAME_LEN-capped");
+    let entry_size = (size_of::<RawXattrEntry>() + name.len() + value.len())
+        .next_multiple_of(size_of::<RawXattrEntry>());
+    let mut entry = vec![0u8; entry_size];
+    entry[offset_of!(RawXattrEntry, e_name_len)] = name.len() as u8;
+    entry[offset_of!(RawXattrEntry, e_name_index)] = index;
+    put_le_u16(
+        &mut entry,
+        offset_of!(RawXattrEntry, e_value_size),
+        value.len() as u16,
+    );
+    let payload = size_of::<RawXattrEntry>();
+    entry[payload..payload + name.len()].copy_from_slice(name);
+    entry[payload + name.len()..payload + name.len() + value.len()].copy_from_slice(value);
+    entry
+}
+
+/// The i_xattr_icount whose production decode yields an ibody of
+/// exactly `ibody_len` bytes — the encode side of `xattr_ibody_size`
+/// (isize = 12 + 4 × (icount − 1), `inode/mod.rs`), the
+/// `chassis_i_format` inverse-of-decode discipline. Asserts the
+/// well-formed domain (≥ 12, multiple of 4) — a fixture bug fails
+/// loudly. The X23/X24 builders deliberately bypass this helper: their
+/// geometry mismatch IS the form.
+fn icount_for_ibody(ibody_len: usize) -> u16 {
+    assert!(ibody_len >= size_of::<RawXattrIbodyHeader>());
+    assert!(ibody_len.is_multiple_of(size_of::<RawXattrEntry>()));
+    ((ibody_len - size_of::<RawXattrIbodyHeader>()) / size_of::<RawXattrEntry>() + 1) as u16
+}
+
+/// Switches an extended seed record's S_IFMT segment, keeping the
+/// seed's permission bits — the one-line form the ibody children
+/// repeat (the inline `mode_off` dance, extracted for this family).
+fn switch_type_segment(record: &mut [u8; 64], segment: u16) {
+    let mode_off = offset_of!(RawInodeExtended, i_mode);
+    let mode = get_le_u16(record, mode_off);
+    put_le_u16(record, mode_off, (mode & !S_IFMT) | segment);
+}
+
+/// Lays the extended seed as a child at `nid` carrying an inline
+/// xattr ibody area — the S06 §5.6 xattr chassis variant, the S12/S13
+/// single source: `patch` rewrites the kind/datalayout/size fields
+/// (the `lay_extended_child_at` discipline), `i_xattr_icount` is set
+/// to `icount` (the CALLER owns the geometry — the X23/X24 forms
+/// deliberately mismatch it against the staged bytes), and `ibody`
+/// stages at suffix_xattr_start = iloc + 64 (the production base
+/// point, never recomputed here). The staged bytes must fit the
+/// 4-slot child spacing (the `lay_fast_symlink_at` room rule).
+fn lay_xattr_child_at(
+    disk: &ErofsMemoryDisk,
+    nid: u64,
+    icount: u16,
+    patch: impl FnOnce(&mut [u8; 64]),
+    ibody: &[u8],
+) {
+    let mut record = INODE_EXT_TEMPLATE;
+    patch(&mut record);
+    put_le_u16(
+        &mut record,
+        offset_of!(RawInodeExtended, i_xattr_icount),
+        icount,
+    );
+    write_inode_at(disk, nid, &record);
+    let iloc = inode_location(&staged_super_block(disk), nid) as usize;
+    let ibody_pos = iloc + size_of::<RawInodeExtended>();
+    // The 4-slot child spacing (the `lay_fast_symlink_at` room rule)
+    // leaves 64 bytes behind the record for the ibody.
+    let room = (4 << ISLOT_BITS) - size_of::<RawInodeExtended>();
+    assert!(ibody.len() <= room, "the ibody must fit the 4-slot child spacing");
+    disk.stage_bytes(ibody_pos, ibody);
+}
+
+/// The standard ibody-child record patch (the `patch_rd1_reg_record`
+/// shape minus the witnesses — the xattr chains never read the
+/// payload): a healthy zero-length REG × FLAT_PLAIN over free block 9.
+fn patch_reg_record(record: &mut [u8; 64]) {
+    put_le_u16(
+        record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
+    );
+    switch_type_segment(record, S_IFREG);
+    put_le_u64(record, offset_of!(RawInodeExtended, i_size), 0);
+    put_le_u32(record, offset_of!(RawInodeExtended, i_u), 9);
+    put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
+}
+
+/// Lays the standard ibody child: [`patch_reg_record`] plus the ibody
+/// area sized to the staged bytes (the well-formed geometry).
+fn lay_xattr_reg_child_at(disk: &ErofsMemoryDisk, nid: u64, ibody: &[u8]) {
+    lay_xattr_child_at(disk, nid, icount_for_ibody(ibody.len()), patch_reg_record, ibody);
+}
+
+/// Row 6 (§6.1 W-X03) — the empty-name entry: nid 2 carries a REAL
+/// user entry with e_name_len = 0 and a one-byte value (the marker
+/// ≠ 0: the entry demonstrably exists on disk), plus the healthy
+/// "ctrl" control child at nid 4. get("user.") answers EINVAL at the
+/// name-resolution gate (the per-FS W-X03 patch — the parse layer,
+/// F38), the control hits (the walk is healthy), and the empty-name
+/// entry matches no query (its suffix length 0 can never equal a
+/// post-strip suffix ≥ 1) — the negative control proving the EINVAL
+/// root is the parse gate, not absent entries. Suite: `xattr.rs`.
+pub(super) fn fx_xattr_empty_name_entry() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut crafted = ibody_header(0, 0).to_vec();
+        crafted.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"", b"m"));
+        lay_xattr_reg_child_at(disk, 2, &crafted);
+        let mut control = ibody_header(0, 0).to_vec();
+        control.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"ctrl", b"ctrlval"));
+        lay_xattr_reg_child_at(disk, 4, &control);
+    })
+}
+
+/// Row 7 (§6.3 X44/F17 get dual + the W-X02 state-B list face) — the
+/// glued acl names: index 2 and index 3 entries each carrying a
+/// non-empty suffix ("foo"/"bar") and a 4-byte marker value. The acl
+/// channel's INTERNAL query is empty-suffix — `e_name_len > 0` never
+/// matches it → both exact acl names answer ENODATA (the F17 get-side
+/// dual); the list side skips the acl rows unconditionally (aster's
+/// single-namespace list channel — the registered state-B divergence
+/// from Linux's glued full-name emission). Suite: `xattr.rs`.
+pub(super) fn fx_xattr_glued_acl_name_entries() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut ibody = ibody_header(0, 0).to_vec();
+        ibody.extend_from_slice(&xattr_entry_bytes(
+            XATTR_INDEX_POSIX_ACL_ACCESS,
+            b"foo",
+            b"blob",
+        ));
+        ibody.extend_from_slice(&xattr_entry_bytes(
+            XATTR_INDEX_POSIX_ACL_DEFAULT,
+            b"bar",
+            b"blob",
+        ));
+        lay_xattr_reg_child_at(disk, 2, &ibody);
+    })
+}
+
+/// Row 8 (§6.2 X10) — the dead indexes: three entries carrying index
+/// 0, 5 (the empty lustre slot), and 7 (the first value past the
+/// 7-entry handler map) — the X10 domain, spelled as crafted bytes
+/// (a malformation value, not a consumer face: the lustre constant
+/// stays private-dead in `xattr.rs`). get never matches (the
+/// full-value index equality against the query domain 1/4/6), list
+/// skips every row without counting it. Suite: `xattr.rs`.
+pub(super) fn fx_xattr_dead_index_entries() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut ibody = ibody_header(0, 0).to_vec();
+        for (index, name) in [(0u8, b"a" as &[u8]), (5, b"b"), (7, b"c")] {
+            ibody.extend_from_slice(&xattr_entry_bytes(index, name, b"v"));
+        }
+        lay_xattr_reg_child_at(disk, 2, &ibody);
+    })
+}
+
+/// Row 9 (§6.2 X23) — header_sz ≥ isize: a 16-byte ibody (icount 2)
+/// whose h_shared_count is raised to 2 (header_sz = 12 + 8 = 20 ≥ 16).
+/// No explicit error anywhere: init overran the id reads (the second
+/// id read four bytes PAST the area end — the F2 overrun-as-garbage
+/// face; the bytes there are the disk's zeros), the inline walk is
+/// empty, and the overrun ids (both 0) resolve through the chassis
+/// xattr_blkaddr 0 to the block-0 zero bytes — dead entries,
+/// exhaustion. The healthy "ok" control child at nid 4 separates the
+/// X23 empty-walk ENODATA from a staging bug. Suite: `xattr.rs`.
+pub(super) fn fx_xattr_header_size_overrun() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        // Only the 12-byte header is staged; the [12, 16) id slot and
+        // the overrun read land on the disk's zeros.
+        let ibody = ibody_header(0, 2);
+        // icount 2 → isize 16 < header_sz 20 — the form's identity.
+        lay_xattr_child_at(disk, 2, 2, patch_reg_record, &ibody);
+        let mut control = ibody_header(0, 0).to_vec();
+        control.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"ok", b"v0"));
+        lay_xattr_reg_child_at(disk, 4, &control);
+    })
+}
+
+/// Row 10 (§6.1 X24) — the entry beyond remaining: a 32-byte ibody
+/// (icount 6, entry area 20 bytes) whose single crafted entry claims
+/// a 20-byte value — ALIGN4 size roundup(4 + 1 + 20) = 28 > 20 → the
+/// X24 gate fires EUCLEAN at the walk, ahead of every consumer (the
+/// get chain's only on-disk-corruption surfacing point; get and list
+/// trip it identically). The staged entry bytes deliberately run past
+/// the ibody end — never read, the gate fires first. Suite:
+/// `xattr.rs`.
+pub(super) fn fx_xattr_entry_beyond_remaining() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut ibody = ibody_header(0, 0).to_vec();
+        ibody.extend_from_slice(&xattr_entry_bytes(
+            XATTR_INDEX_USER,
+            b"x",
+            &[0xA5; 20], // the claimed size overruns; the bytes are never read
+        ));
+        // icount 6 → isize 32 < the entry's 28-byte need past the
+        // header — the mismatch is the form.
+        lay_xattr_child_at(disk, 2, 6, patch_reg_record, &ibody);
+    })
+}
+
+/// Row 11 (§6.1 W-X06) — the non-UTF-8 name: a raw 0xFF/0x80 name
+/// entry (invalid UTF-8 in any position) behind the healthy ASCII
+/// "ok" control. Every aster query arrives lossy-replaced (U+FFFD,
+/// six UTF-8 bytes) and never byte-matches the two raw bytes → ENODATA
+/// — the REGISTERED DRIFT value (a raw-byte Linux query would hit).
+/// The list OUTPUT half carries the raw bytes verbatim (a VmWriter
+/// byte face, never narrowed through &str). Suite: `xattr.rs`.
+pub(super) fn fx_xattr_non_utf8_names() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut ibody = ibody_header(0, 0).to_vec();
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"ok", b"v0"));
+        ibody.extend_from_slice(&xattr_entry_bytes(
+            XATTR_INDEX_USER,
+            &[0xFF, 0x80],
+            b"v1",
+        ));
+        lay_xattr_reg_child_at(disk, 2, &ibody);
+    })
+}
+
+/// Row 12 (§6.3 X45/X46, 值域畸形/空值) — the acl value-domain legs,
+/// one child each (an acl get parses the FIRST index-matching entry —
+/// one outcome per inode), plus the generic-channel empty-value dual:
+///
+/// * nid 2: a_version 1 on a MISALIGNED 9-byte body → EOPNOTSUPP (the
+///   version door BEFORE the alignment judgement; nid 8 is the same
+///   shape with version 2 → EINVAL — the pair pins the order face);
+/// * nid 4: a 2-byte body → EINVAL (shorter than the header);
+/// * nid 6: the EMPTY value → EINVAL (the 0-length half — the acl
+///   channel; the generic channel's Ok(0) dual is nid 16);
+/// * nid 8: version 2 on the misaligned 9-byte body → EINVAL;
+/// * nid 10: unknown tag 0x0003 → EINVAL (at its own entry);
+/// * nid 12: ACL_USER (0x0002) carrying the −1 undefined id → EINVAL;
+/// * nid 14: the pure version-2 header → "legal but empty" ENODATA;
+/// * nid 16: a user entry "empty" with a 0-length value → Ok(0) (the
+///   same on-disk empty value through the generic face — two
+///   channels, two codes).
+///
+/// Suite: `xattr.rs`.
+pub(super) fn fx_xattr_acl_value_malformed() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let acl_child = |disk: &ErofsMemoryDisk, nid: u64, value: &[u8]| {
+            let mut ibody = ibody_header(0, 0).to_vec();
+            ibody.extend_from_slice(&xattr_entry_bytes(
+                XATTR_INDEX_POSIX_ACL_ACCESS,
+                b"",
+                value,
+            ));
+            lay_xattr_reg_child_at(disk, nid, &ibody);
+        };
+        // a_version = 1 (le32) + a misaligned 5-byte tail: the version
+        // door fires before the alignment judgement.
+        acl_child(disk, 2, &[0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00]);
+        // Shorter than the 4-byte header.
+        acl_child(disk, 4, &[0x02, 0x00]);
+        // The empty value (the acl-channel half of the 0-length form).
+        acl_child(disk, 6, &[]);
+        // a_version = 2 + the same misaligned 5-byte tail.
+        acl_child(disk, 8, &[0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00]);
+        // Version 2 + one record with the unknown tag 0x0003.
+        let unknown_tag = [0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00];
+        acl_child(disk, 10, &unknown_tag);
+        // Version 2 + ACL_USER (0x0002) with e_id = 0xFFFFFFFF.
+        let undef_id = [0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x06, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+        acl_child(disk, 12, &undef_id);
+        // The pure version-2 header: count 0 → "legal but empty".
+        acl_child(disk, 14, &[0x02, 0x00, 0x00, 0x00]);
+        // The generic-channel empty-value dual: user "empty", value 0.
+        let mut generic = ibody_header(0, 0).to_vec();
+        generic.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"empty", b""));
+        lay_xattr_reg_child_at(disk, 16, &generic);
+    })
+}
+
+/// Row 13 (§6.1 G-X09, the S08-frozen case B) — the symlink host: a
+/// fast LNK at nid 2 carrying a user.* and a trusted.* entry, with
+/// the ASCII inline target staged right behind the ibody area
+/// (inline_data_start = iloc + 64 + isize — the payload/xattr
+/// interplay the fast-symlink criterion consumes). get("user.x") →
+/// ENODATA (X13: User ∧ non-reg/dir), get("trusted.x") hits (Trusted
+/// carries zero type gate), list emits the user row (no type gate on
+/// list — the asymmetry face), read_link returns the target (the
+/// staging control), and a nouser_xattr re-mount of the same image
+/// pins the X13-before-X3 order (ENODATA, not EOPNOTSUPP). Suite:
+/// `xattr.rs`.
+pub(super) fn fx_xattr_symlink_host_user() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let target = b"ok-target";
+        let mut ibody = ibody_header(0, 0).to_vec();
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"x", b"uv"));
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_TRUSTED, b"x", b"tv"));
+        lay_xattr_child_at(
+            disk,
+            2,
+            icount_for_ibody(ibody.len()),
+            |record| {
+                put_le_u16(
+                    record,
+                    offset_of!(RawInodeExtended, i_format),
+                    chassis_i_format(InodeVersion::Extended, DataLayout::FlatInline),
+                );
+                switch_type_segment(record, S_IFLNK);
+                put_le_u64(
+                    record,
+                    offset_of!(RawInodeExtended, i_size),
+                    target.len() as u64,
+                );
+                put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
+            },
+            &ibody,
+        );
+        // The fast-symlink target behind the ibody area — the very
+        // position the fast/slow criterion and `read_link` consume.
+        let sb = staged_super_block(disk);
+        let inline_start = inode_location(&sb, 2)
+            + size_of::<RawInodeExtended>() as u64
+            + ibody.len() as u64;
+        disk.stage_bytes(inline_start as usize, target);
     })
 }
 
