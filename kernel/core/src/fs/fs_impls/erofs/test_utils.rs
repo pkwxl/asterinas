@@ -314,7 +314,7 @@ impl BlockDevice for ErofsMemoryDisk {
     fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
             max_nr_segments_per_bio: usize::MAX,
-            nr_sectors: self.effective_nr_sectors(),
+            nr_sectors: self.effective_nr_sectors() as usize,
         }
     }
 
@@ -635,22 +635,28 @@ pub(super) fn get_le_u64(buf: &[u8], off: usize) -> u64 {
 /// (0 / slot count / 32 / 1) and recomputes the checksum; the source
 /// values in the comments are the C1 measurement, kept for review.
 const SB_TEMPLATE: [u8; 128] = [
-    0xe2, 0xe1, 0xf5, 0xe0, 0x00, 0x00, 0x00, 0x00, // magic@0 = 0xE0F5E1E2; checksum@4 = 0 (recomputed by write_super_block; raw write = FX-SB V5 only)
-    0x07, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x26, 0x00, // feature_compat@8 = 0x7 (SB_CHKSUM | MTIME | XATTR_FILTER); blkszbits@12 = 12; sb_extslots@13 = 0; root_nid@14 = 38 (chassis patches to 0)
-    0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // inos@16 = 262 (chassis patches to slot count)
+    0xe2, 0xe1, 0xf5, 0xe0, 0x00, 0x00, 0x00,
+    0x00, // magic@0 = 0xE0F5E1E2; checksum@4 = 0 (recomputed by write_super_block; raw write = FX-SB V5 only)
+    0x07, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x26,
+    0x00, // feature_compat@8 = 0x7 (SB_CHKSUM | MTIME | XATTR_FILTER); blkszbits@12 = 12; sb_extslots@13 = 0; root_nid@14 = 38 (chassis patches to 0)
+    0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // inos@16 = 262 (chassis patches to slot count)
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // build_time@24 = 0 (WHITELISTED)
-    0x00, 0x00, 0x00, 0x00, 0x75, 0x00, 0x00, 0x00, // build_time_nsec@32 = 0 (WHITELISTED); blocks@36 = 117 (chassis: 32)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // meta_blkaddr@40 = 0 (chassis: 1); xattr_blkaddr@44 = 0
+    0x00, 0x00, 0x00, 0x00, 0x75, 0x00, 0x00,
+    0x00, // build_time_nsec@32 = 0 (WHITELISTED); blocks@36 = 117 (chassis: 32)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // meta_blkaddr@40 = 0 (chassis: 1); xattr_blkaddr@44 = 0
     0xe2, 0xe4, 0xf0, 0xc8, 0x1a, 0x2b, 0x4c, 0x3d, // uuid@48 = EROFS_UUID_BASE
-    0x9e, 0x8f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // volume_name@64 = NUL x 16
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // feature_incompat@80 = 0; u1@84 = 0; extra_devices@86 = 0
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // devt_slotoff@88 = 0; dirblkbits@90 = 0; xattr_prefix_count@91 = 0; xattr_prefix_start@92 = 0
+    0x9e, 0x8f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // volume_name@64 = NUL x 16
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // feature_incompat@80 = 0; u1@84 = 0; extra_devices@86 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // devt_slotoff@88 = 0; dirblkbits@90 = 0; xattr_prefix_count@91 = 0; xattr_prefix_start@92 = 0
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // packed_nid@96 = 0
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // xattr_filter_reserved@104 = 0; reserved2@105 = 0 x 23 (G5 verbatim)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // xattr_filter_reserved@104 = 0; reserved2@105 = 0 x 23 (G5 verbatim)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// T-EXT64: 64-byte extended inode seed, C1 root inode @ iloc 1216.
@@ -659,11 +665,14 @@ const SB_TEMPLATE: [u8; 128] = [
 /// direction). Inode time fields need no whitelisting: the T-018
 /// stage anchors all source mtimes to @0 (asserted at extraction).
 const INODE_EXT_TEMPLATE: [u8; 64] = [
-    0x05, 0x00, 0x00, 0x00, 0xed, 0x41, 0x00, 0x00, // i_format@0 = 0x0005 (version=1 extended, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_reserved@6 = 0
+    0x05, 0x00, 0x00, 0x00, 0xed, 0x41, 0x00,
+    0x00, // i_format@0 = 0x0005 (version=1 extended, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_reserved@6 = 0
     0x7a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_size@8 = 122 (le64)
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, // i_u@16 = 0xFFFFFFFF (FlatInline raw_blkaddr convention); i_ino@20 = 0
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00,
+    0x00, // i_u@16 = 0xFFFFFFFF (FlatInline raw_blkaddr convention); i_ino@20 = 0
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_uid@24 = 0; i_gid@28 = 0
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_mtime@32 = 0 (stage anchors mtimes to @0)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // i_mtime@32 = 0 (stage anchors mtimes to @0)
     0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, // i_mtime_nsec@40 = 0; i_nlink@44 = 7
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_reserved2@48 = 0 x 16
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -673,11 +682,20 @@ const INODE_EXT_TEMPLATE: [u8; 64] = [
 /// root inode @ iloc 1216. No time fields: compact ctime is
 /// synthesized from the superblock build_time (both zeroed on the
 /// chassis).
+// The S02 layout smoke walks the other four templates only (compact
+// chassis geometry arrives with the S07 FX-TIME / S08+ compact-inode
+// suites, the first consumers). When one of them starts patching
+// this seed, remove the expectation — an unfulfilled `expect` fails
+// the build, so the removal cannot be silently forgotten.
+#[expect(dead_code)]
 const INODE_CPT_TEMPLATE: [u8; 32] = [
-    0x04, 0x00, 0x00, 0x00, 0xed, 0x41, 0x07, 0x00, // i_format@0 = 0x0004 (version=0 compact, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_nlink@6 = 7 (le16)
-    0x7a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_size@8 = 122 (le32); i_reserved@12 = 0
+    0x04, 0x00, 0x00, 0x00, 0xed, 0x41, 0x07,
+    0x00, // i_format@0 = 0x0004 (version=0 compact, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_nlink@6 = 7 (le16)
+    0x7a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // i_size@8 = 122 (le32); i_reserved@12 = 0
     0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, // i_u@16 = 0xFFFFFFFF; i_ino@20 = 0
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_uid@24 = 0; i_gid@26 = 0; i_reserved2@28 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, // i_uid@24 = 0; i_gid@26 = 0; i_reserved2@28 = 0
 ];
 
 /// T-DIRENT: 12-byte dirent seed, C1 root directory first entry
@@ -687,7 +705,8 @@ const INODE_CPT_TEMPLATE: [u8; 32] = [
 /// lives in `test/erofs_fixture_templates.dump.txt`.
 const DIRENT_TEMPLATE: [u8; 12] = [
     0x26, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nid@0 = 38 (le64, '.')
-    0x54, 0x00, 0x02, 0x00, // nameoff@8 = 84 (le16, dirent array end of 7 entries); file_type@10 = 2 (DT_DIR); reserved@11 = 0
+    0x54, 0x00, 0x02,
+    0x00, // nameoff@8 = 84 (le16, dirent array end of 7 entries); file_type@10 = 2 (DT_DIR); reserved@11 = 0
 ];
 
 /// Prefix-record reference form, C10 erofs_prefix.img packed inode
@@ -698,9 +717,9 @@ const DIRENT_TEMPLATE: [u8; 12] = [
 /// copied (risk 3: parity is not an on-disk invariant; the chassis
 /// assigns its own even nids).
 const XATTR_PREFIX_RECORD_REF: [u8; 18] = [
-    0x10, 0x00, 0x01, 0x65, 0x72, 0x6f, 0x66, 0x73, // len@0 = 16 (le16: 1 index byte + 15-byte infix); index@2 = 0x01 (user namespace base index); infix@3 = "erofs_test.lpx." (15 bytes)
-    0x5f, 0x74, 0x65, 0x73, 0x74, 0x2e, 0x6c, 0x70,
-    0x78, 0x2e,
+    0x10, 0x00, 0x01, 0x65, 0x72, 0x6f, 0x66,
+    0x73, // len@0 = 16 (le16: 1 index byte + 15-byte infix); index@2 = 0x01 (user namespace base index); infix@3 = "erofs_test.lpx." (15 bytes)
+    0x5f, 0x74, 0x65, 0x73, 0x74, 0x2e, 0x6c, 0x70, 0x78, 0x2e,
 ];
 
 // ---------------------------------------------------------------------------
@@ -729,13 +748,19 @@ pub(super) fn write_super_block(disk: &ErofsMemoryDisk, sb: &[u8; 128]) {
     let mut buf = *sb;
     let compat_off = offset_of!(RawSuperBlock, feature_compat);
     let compat = get_le_u32(&buf, compat_off);
-    put_le_u32(&mut buf, compat_off, compat | FeatureCompatSet::SB_CHKSUM.bits());
+    put_le_u32(
+        &mut buf,
+        compat_off,
+        compat | FeatureCompatSet::SB_CHKSUM.bits(),
+    );
     put_le_u32(&mut buf, offset_of!(RawSuperBlock, checksum), 0);
     disk.stage_bytes(SUPER_OFFSET, &buf);
 
     let len = staged_super_block(disk).checksummed_len();
     let mut region = vec![0u8; len];
-    disk.segment().read_bytes(SUPER_OFFSET, &mut region).unwrap();
+    disk.segment()
+        .read_bytes(SUPER_OFFSET, &mut region)
+        .unwrap();
     let checksum = crc32c(!0, &region);
     put_le_u32(&mut buf, offset_of!(RawSuperBlock, checksum), checksum);
     disk.stage_bytes(SUPER_OFFSET, &buf);
@@ -798,6 +823,7 @@ mod tests {
     use ostd::prelude::*;
 
     use super::*;
+    use crate::fs::fs_impls::erofs::test_utils::assert_errno as assert_errno_reexport;
 
     /// Stages a position-dependent pattern and reads it back through
     /// the byte channel (`VmIo for dyn BlockDevice`), aligned and
@@ -1065,12 +1091,28 @@ mod tests {
     /// the macro's shape is proven before the S03+ mount/iget suites
     /// consume it (the Ok arm panics — a deliberately-failing form
     /// would abort the ktest run, so only the Err arm is spelled).
+    ///
+    /// `return_errno_with_message!` expands to a `return`, so each
+    /// input is produced by calling a closure whose body is just the
+    /// macro — the `return` then supplies the closure's value, the
+    /// same `Err` a real failing call site produces. The `Result`
+    /// type is spelled through `core::result`: both `ostd::prelude::*`
+    /// and `super::*` glob-import a `Result`, and a bare one is
+    /// ambiguous here (`Error` itself resolves unambiguously). The
+    /// second invocation goes through the
+    /// `pub(super)` re-export under its full crate path — the exact
+    /// import shape the S03+ host suites use (the ext2 hosts'
+    /// `use crate::fs::fs_impls::ext2::test_utils::{..,
+    /// assert_errno, ..}` pattern) — which also keeps that
+    /// re-export referenced until the hosts exist.
     #[ktest]
     fn assert_errno_macro_err_arm() {
-        let e: Result<()> = return_errno_with_message!(Errno::EINVAL, "ktest macro shape smoke");
+        let e: core::result::Result<(), Error> =
+            (|| return_errno_with_message!(Errno::EINVAL, "ktest macro shape smoke"))();
         assert_errno!(e, Errno::EINVAL);
-        let e: Result<()> = return_errno_with_message!(Errno::EUCLEAN, "second arm");
-        assert_errno!(e, Errno::EUCLEAN, "with message tail");
+        let e: core::result::Result<(), Error> =
+            (|| return_errno_with_message!(Errno::EUCLEAN, "second arm"))();
+        assert_errno_reexport!(e, Errno::EUCLEAN, "with message tail");
     }
 
     /// The LE helper family is little-endian by construction: known
@@ -1106,14 +1148,22 @@ mod tests {
             let raw: RawSuperBlock = disk.segment().read_val(SUPER_OFFSET).unwrap();
             let len = SuperBlock::from(raw).checksummed_len();
             let mut region = vec![0u8; len];
-            disk.segment().read_bytes(SUPER_OFFSET, &mut region).unwrap();
-            (raw.checksum, verify_superblock_checksum(&mut region, raw.checksum))
+            disk.segment()
+                .read_bytes(SUPER_OFFSET, &mut region)
+                .unwrap();
+            (
+                raw.checksum,
+                verify_superblock_checksum(&mut region, raw.checksum),
+            )
         };
 
         write_super_block(&disk, &SB_TEMPLATE);
         let (csum, ok) = verify_staged(&disk);
         assert!(ok, "production verify must accept the recomputed checksum");
-        assert_ne!(csum, 0, "the recomputed value replaces the whitelisted zero");
+        assert_ne!(
+            csum, 0,
+            "the recomputed value replaces the whitelisted zero"
+        );
 
         // SB_CHKSUM clear on input: the writer sets the bit before
         // computing, so the staged record still verifies.
@@ -1121,7 +1171,10 @@ mod tests {
         put_le_u32(&mut sb, offset_of!(RawSuperBlock, feature_compat), 0);
         write_super_block(&disk, &sb);
         let (_, ok) = verify_staged(&disk);
-        assert!(ok, "the S06 3.4 SB_CHKSUM set step must make the record verify");
+        assert!(
+            ok,
+            "the S06 3.4 SB_CHKSUM set step must make the record verify"
+        );
 
         // The raw channel: the template's zero checksum goes to disk
         // untouched and fails the production verify.
@@ -1139,7 +1192,9 @@ mod tests {
     /// addresses block + byte offset.
     #[ktest]
     fn layout_writers_stage_at_formula_offsets() {
-        let disk = ErofsMemoryDisk::new(8 * PAGE_SIZE);
+        // Nine pages: the meta-bytes stage writes into block 8
+        // (bytes 32776..32794), so the disk must hold blocks 0..=8.
+        let disk = ErofsMemoryDisk::new(9 * PAGE_SIZE);
 
         // Chassis-style superblock: the template patched to
         // meta_blkaddr = 1 (S06 3.2), staged through the recompute
@@ -1169,7 +1224,9 @@ mod tests {
         disk.segment().read_bytes(base, &mut entries_back).unwrap();
         assert_eq!(&entries_back[..12], &DIRENT_TEMPLATE);
         let mut names_back = [0u8; 6];
-        disk.segment().read_bytes(base + 24, &mut names_back).unwrap();
+        disk.segment()
+            .read_bytes(base + 24, &mut names_back)
+            .unwrap();
         assert_eq!(&names_back, b"names!");
 
         // Meta bytes: block + offset addressing (the prefix-record
