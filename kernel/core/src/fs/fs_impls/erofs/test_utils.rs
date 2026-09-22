@@ -59,8 +59,8 @@
 //!   chassis per S06 §5.1 — the V2–V8 superblock doors, the V5+V6
 //!   order cross, and the G-M15 root/packed mount doors. The
 //!   mount-assertion suite lives in `fs.rs` (the D1 host rule); the
-//!   G-M10 truncated-disk form is S14's (its assertion value is a
-//!   registered drift finalized there). Later slices append the
+//!   G-M10 truncated-disk form (the section's fifteenth constructor)
+//!   lands with S14 below. Later slices append the
 //!   FX-DIRENT/NAME/TIME/INODE/COMP/XATTR families the same way.
 //!
 //! * **T-027 S05, the FX-DIRENT builder family**: fifteen named
@@ -175,6 +175,20 @@
 //!   same-byte-family pass; the out-of-device start corner mounts
 //!   EINVAL). `FILTER_SEED` and `XATTR_LONG_PREFIX` widen their
 //!   visibility in `xattr.rs` for the builders (the same precedent).
+//!
+//! * **T-027 S14, the G-M10 truncated-disk form**: the §5.1
+//!   thirteenth row — `fx_sb_truncated_device`, the FULL healthy
+//!   chassis (all 32 blocks physically staged) on a disk that
+//!   DECLARES only 6 sectors (3072 bytes) through the S02
+//!   truncation channel: one knob — the declaration — away from
+//!   `healthy_fixture`. V1's superblock read [1024,1152) stays
+//!   inside the declaration; V5's checksum interval [1024,4096)
+//!   crosses it and the framework byte-channel bound fails the
+//!   mount EINVAL (the registered drift value — Linux zero-fills
+//!   the page tail and spells EBADMSG; S06 §9 R1, finalized by
+//!   this slice). The errno-source observation (pre-enqueue
+//!   `nr_sectors` bound vs channel error) rides the request log in
+//!   the `fs.rs` suite.
 //!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
@@ -321,8 +335,8 @@ pub(super) struct ErofsMemoryDisk {
     /// below the physical allocation, which stays whole pages. The
     /// framework byte-channel bound consumes the declared value, so
     /// reads past it fail `EINVAL` before reaching `enqueue`; the
-    /// mount-time assertion values of the truncated-image forms are
-    /// S14's to finalize (registered drift: aster EINVAL / Linux
+    /// truncated-disk mount form and its finalized assertion live in
+    /// the S14 builder below (registered drift: aster EINVAL / Linux
     /// EBADMSG).
     nr_sectors_override: Option<u64>,
 }
@@ -1174,6 +1188,29 @@ impl ErofsFixture {
     }
 }
 
+/// Opens the production mount over an already-staged chassis disk and
+/// wraps it into an [`ErofsFixture`] — the shared tail of
+/// [`healthy_fixture`], [`rewritten_chassis`], and the S14
+/// truncated-disk builder (the S06 §4.3 spelling `Erofs::open(disk,
+/// FsFlags::empty(), None)`; `open` itself forces RDONLY, so the
+/// empty flags are the fixture form).
+// AUTO-DECISION: the mount tail is extracted at its third caller
+// (S14's truncated builder needs the fixture shape over a disk the
+// `rewritten_chassis` shape cannot hand in) instead of growing a
+// third copy of the spelling. Rejected: duplicating the tail a
+// third time (a drifting copy of the §4.3 mount form); generalizing
+// `rewritten_chassis` with a disk-factory parameter (every existing
+// caller passes the plain constructor — dead generality).
+fn mounted_chassis_fixture(disk: Arc<ErofsMemoryDisk>) -> ErofsFixture {
+    let open = Erofs::open(disk.clone() as Arc<dyn BlockDevice>, FsFlags::empty(), None);
+    ErofsFixture {
+        disk,
+        open,
+        root_nid: CHASSIS_ROOT_NID,
+        meta_blkaddr: u64::from(CHASSIS_META_BLKADDR),
+    }
+}
+
 /// The untouched healthy chassis, mounted (the S06 Layer-5
 /// convenience entry): a fresh 32-block disk staged with
 /// [`stage_healthy_chassis`] and opened through the production
@@ -1184,13 +1221,7 @@ pub(super) fn healthy_fixture() -> ErofsFixture {
         CHASSIS_NR_BLOCKS as usize * CHASSIS_BLOCK_SIZE,
     ));
     stage_healthy_chassis(&disk);
-    let open = Erofs::open(disk.clone() as Arc<dyn BlockDevice>, FsFlags::empty(), None);
-    ErofsFixture {
-        disk,
-        open,
-        root_nid: CHASSIS_ROOT_NID,
-        meta_blkaddr: u64::from(CHASSIS_META_BLKADDR),
-    }
+    mounted_chassis_fixture(disk)
 }
 
 // ===========================================================================
@@ -1203,8 +1234,10 @@ pub(super) fn healthy_fixture() -> ErofsFixture {
 // forms alone stage through `write_super_block_raw`, the single
 // explicit skip channel, so the chassis checksum goes stale on
 // purpose. The mount-assertion suite lives in `fs.rs` (the D1 host
-// rule — the V1–V10 order authority is `Erofs::open`); the G-M10
-// truncated-DISK form is S14's and is not built here.
+// rule — the V1–V10 order authority is `Erofs::open`). The G-M10
+// truncated-DISK form (S14) joins this section as the fifteenth
+// constructor — not a byte rewrite but a device-declaration rewrite,
+// hence its own staging shape below.
 //
 // AUTO-DECISION: the V-door values are derived, not spelled — bad
 // magic = SUPER_MAGIC_V1 ^ 0x0100_0000 (the §5.1 one-bit diff), the
@@ -1240,13 +1273,7 @@ fn rewritten_chassis(rewrite: impl FnOnce(&ErofsMemoryDisk)) -> ErofsFixture {
     ));
     stage_healthy_chassis(&disk);
     rewrite(&disk);
-    let open = Erofs::open(disk.clone() as Arc<dyn BlockDevice>, FsFlags::empty(), None);
-    ErofsFixture {
-        disk,
-        open,
-        root_nid: CHASSIS_ROOT_NID,
-        meta_blkaddr: u64::from(CHASSIS_META_BLKADDR),
-    }
+    mounted_chassis_fixture(disk)
 }
 
 /// Reads the chassis root inode record, applies `patch`, and re-stages
@@ -1419,7 +1446,7 @@ pub(super) fn fx_sb_bad_checksum_and_unknown_incompat() -> ErofsFixture {
 /// device is reached. Expected EINVAL — the registered drift value
 /// (matrix §2.2 G-M10: Linux's metabuf read fails EIO; aster EINVAL
 /// per the T-014 §4.4 byte-channel ledger). The truncated-DISK
-/// sibling of this family is S14's (R1, value finalized there).
+/// sibling — R1's form — is `fx_sb_truncated_device` below.
 pub(super) fn fx_sb_root_nid_out_of_device() -> ErofsFixture {
     rewritten_chassis(|disk| {
         let mut sb = staged_super_block_record(disk);
@@ -1506,6 +1533,48 @@ pub(super) fn fx_sb_packed_compressed_payload() -> ErofsFixture {
         );
         write_super_block(disk, &sb);
     })
+}
+
+// The declared size of the G-M10 truncated disk (§5.1's own
+// `truncated(.., 6)` spelling — the form's identity, like the V7
+// 184/185 pair): 6 sectors = 3072 bytes, strictly between the V1
+// superblock read's end (SUPER_OFFSET + 128 = 1152, so the read
+// stays inside the declaration) and the V5 checksum interval's end
+// (SUPER_OFFSET + checksummed_len() = 4096, so the read crosses the
+// bound). Any declaration in that open interval behaves identically;
+// 6 sectors is the spelled corner.
+const CHASSIS_TRUNCATED_SECTORS: u64 = 6;
+
+/// G-M10 truncated disk (§5.1 row 13 — the form S06 §9 R1 reserves
+/// for this slice): the FULL healthy chassis, all 32 blocks
+/// physically staged, on a disk that DECLARES only 6 sectors (3072
+/// bytes) through the S02 truncation channel — exactly one knob (the
+/// declaration) away from `healthy_fixture`. Every staged byte is
+/// healthy: V1 reads [1024,1152) inside the declaration and passes,
+/// V2–V4 pass, then V5's checksum interval [1024,4096) crosses the
+/// declared end and the framework byte-channel bound
+/// (`request_end > nr_sectors * SECTOR_SIZE`, `impl_block_device.rs`)
+/// fails the read EINVAL before the device is ever reached.
+/// Registered drift asserted as-is (matrix §2.2 G-M10): Linux reads
+/// page-granularly, zero-fills the tail past 3072, and fails the
+/// checksum compare EBADMSG. The errno source — the pre-enqueue
+/// bound, not a channel error (the §8-4 mechanism observation) — is
+/// pinned through the request log by the `fs.rs` suite.
+// AUTO-DECISION: the physical disk keeps the full 32-block chassis,
+// not the §5.1 sketch's literal one-block `truncated(1, 6)` —
+// staging the chassis root at iloc 4096 already needs block 1, and a
+// partial-chassis staging path would conflate the physical-size knob
+// with the declaration knob this form exists to isolate. The mount
+// outcome (V1 passes, V5 crosses) is identical either way; the
+// single-knob shape makes the G-M10 reading literal — the IMAGE is
+// complete, the DEVICE declares itself short.
+pub(super) fn fx_sb_truncated_device() -> ErofsFixture {
+    let disk = Arc::new(ErofsMemoryDisk::truncated(
+        CHASSIS_NR_BLOCKS as usize * CHASSIS_BLOCK_SIZE,
+        CHASSIS_TRUNCATED_SECTORS,
+    ));
+    stage_healthy_chassis(&disk);
+    mounted_chassis_fixture(disk)
 }
 
 // ===========================================================================
@@ -4055,9 +4124,9 @@ mod tests {
     /// the override while the physical allocation stays whole pages —
     /// `metadata().nr_sectors` and `size_bytes()` report 6 sectors
     /// (3072 bytes), staging still reaches the full page beyond the
-    /// declared end. The mount-time assertion values of the
-    /// truncated-image forms belong to S14 (registered drift); this
-    /// smoke pins the mechanism only.
+    /// declared end. The truncated-disk MOUNT form and its finalized
+    /// assertion live at `fx_sb_truncated_device` (S14); this smoke
+    /// pins the mechanism only.
     #[ktest]
     fn memory_disk_truncated_declares_shrunk_sectors() {
         let disk = Arc::new(ErofsMemoryDisk::truncated(PAGE_SIZE, 6));

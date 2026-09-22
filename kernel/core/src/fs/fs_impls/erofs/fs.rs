@@ -1240,9 +1240,9 @@ mod tests {
         fx_sb_bad_magic, fx_sb_blkszbits_above_supported, fx_sb_blkszbits_below_min,
         fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
         fx_sb_extslots_past_page_boundary, fx_sb_packed_compressed_payload, fx_sb_root_compressed,
-        fx_sb_root_nid_out_of_device, fx_sb_root_not_dir, fx_sb_unknown_incompat_bit,
-        fx_sb_volume_name_without_nul, fx_xattr_prefix_len_boundary, fx_xattr_prefix_len_garbage,
-        fx_xattr_prefix_start_out_of_device, healthy_fixture,
+        fx_sb_root_nid_out_of_device, fx_sb_root_not_dir, fx_sb_truncated_device,
+        fx_sb_unknown_incompat_bit, fx_sb_volume_name_without_nul, fx_xattr_prefix_len_boundary,
+        fx_xattr_prefix_len_garbage, fx_xattr_prefix_start_out_of_device, healthy_fixture,
     };
 
     /// fold vectors (the design's §7 fold family). The all-zero
@@ -1455,13 +1455,45 @@ mod tests {
     /// end; the framework byte-channel bound fails it. Registered
     /// drift asserted as-is: aster EINVAL where Linux's metabuf read
     /// fails EIO (the T-014 §4.4 ledger). The truncated-DISK sibling
-    /// of this family is S14's.
+    /// of this family is the S14 test right below.
     #[ktest]
     fn mount_rejects_root_nid_out_of_device() {
         assert_errno!(
             fx_sb_root_nid_out_of_device().open,
             Errno::EINVAL,
             "G-M10 root out-of-device (registered drift: Linux EIO)"
+        );
+    }
+
+    /// T-027 S14 (FX-SB G-M10 truncated disk — §5.1 row 13, S06 §9
+    /// R1's value-finalizing form, matrix §2.2 G-M10): the FULL
+    /// healthy chassis on a disk that DECLARES only 6 sectors (3072
+    /// bytes). V1's superblock read [1024,1152) stays inside the
+    /// declaration; V5's checksum interval read [1024,4096) crosses
+    /// it, and the framework byte-channel bound fails the mount
+    /// EINVAL — the finalized registered-drift value (Linux reads
+    /// page-granularly, zero-fills the tail past 3072, and fails the
+    /// checksum compare EBADMSG; asserted as-is, never "fixed").
+    /// The mechanism observation (S06 §8-4): exactly one bio — V1's
+    /// — reached the device, so the rejection fired BEFORE enqueue
+    /// on the `nr_sectors` bound, not as a channel error on an
+    /// enqueued request (that face completes IoError → EIO, the
+    /// `memory_disk_fail_reads_injection` shape).
+    #[ktest]
+    fn mount_rejects_truncated_device() {
+        let fixture = fx_sb_truncated_device();
+        // §8-4 mechanism observation first: V1's bio is the only
+        // request that reached the device; the V5 read was rejected
+        // before enqueue.
+        assert_eq!(
+            fixture.disk.requests().len(),
+            1,
+            "the errno source is the pre-enqueue nr_sectors bound, not a channel error"
+        );
+        assert_errno!(
+            fixture.open,
+            Errno::EINVAL,
+            "G-M10: V5 csum read crosses the 6-sector declaration (drift: Linux EBADMSG)"
         );
     }
 
