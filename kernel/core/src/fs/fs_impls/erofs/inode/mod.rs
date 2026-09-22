@@ -172,8 +172,8 @@ pub(in crate::fs::fs_impls::erofs) struct InodeXattrState {
     /// `xattr_shared_count` (S01-D3: no separate count field).
     // Live since T-026 S02: the X23 header-size gate of the ibody
     // walk reads `len()` (the cached-count single source, xattr.c
-    // :322-323 — no header re-read); the value iteration joins with
-    // the shared-entry walk (T-026 S03).
+    // :322-323 — no header re-read); the value iteration joined
+    // with the shared-entry walk (T-026 S03).
     pub(in crate::fs::fs_impls::erofs) shared_ids: Vec<u32>,
 }
 
@@ -200,8 +200,8 @@ pub struct Inode {
     /// access through `xattr_state` (`xattr.rs`); initialization
     /// failures leave it vacant so the next access retries (F3).
     // Read by `xattr_state` (`xattr.rs`), live through the get and
-    // list entry chains' dead-code roots until the S09 trait
-    // forwards land; no expect needed.
+    // list entry chains (trait-forwarded from `impl_for_vfs` since
+    // T-026 S09); no expect needed.
     pub(in crate::fs::fs_impls::erofs) xattrs: Once<InodeXattrState>,
 }
 
@@ -596,7 +596,8 @@ pub(super) fn suffix_xattr_start(sb: &SuperBlock, nid: ErofsNid, desc: &InodeDes
 /// Byte offset of the FLAT_INLINE payload region (read site #14,
 /// `docs/T-011/S07/index.md` §3.2) = inode end + xattr_isize. The
 /// xattr size is the unvalidated decoded value — the boundary guard
-/// belongs to the consumer (T-026), not to this formula.
+/// belongs to the consumers (the xattr init walk's X1/X23 gates in
+/// `xattr.rs`, T-026 S02), not to this formula.
 pub(super) fn inline_data_start(sb: &SuperBlock, nid: ErofsNid, desc: &InodeDesc) -> u64 {
     suffix_xattr_start(sb, nid, desc) + desc.xattr_isize as u64
 }
@@ -1450,9 +1451,12 @@ impl AddrState {
 /// `i_u`, `size`, `xattr_isize`, and `addr_state` (read by
 /// `data_geometry` since T-025 S01) are live through the decode /
 /// payload-assembly chain (the iget slow path reads them all since
-/// T-024 S01), while the remaining fields carry their own
+/// T-024 S01), while the remaining fields carried their own
 /// `#[expect(dead_code)]` with the first consumer annotated, firing
-/// `unfulfilled` as the removal prompt when that consumer lands.
+/// `unfulfilled` as the removal prompt when that consumer landed.
+/// That ledger is closed — every descriptor field is live; the sole
+/// `expect` in this file is the `fast_symlink_target` accessor (a
+/// T-024 view face, not a descriptor field).
 ///
 /// # Not-mirrored ledger (explicit, `docs/T-011/analysis.md` §3.2)
 ///
@@ -1509,11 +1513,13 @@ pub(super) struct InodeDesc {
     pub(super) size: u64,
     /// The inline-xattr area size, as converted by
     /// `xattr_ibody_size` — an unvalidated value carried in the
-    /// mirror; the boundary guard belongs to the consumer (T-026).
+    /// mirror; the boundary guard belongs to the consumer (the
+    /// X1/X23/X24 gates of the ibody walk, `xattr.rs`, T-026 S02).
     // Live since T-024 S01: read by `inline_data_start` (the
     // base-point formula family) — the fast/slow criterion and the
     // inline read point consume the same single source; the
-    // three-state gate / ibody location (T-026) joins through it.
+    // three-state gate / ibody location joined through it (T-026
+    // S02).
     pub(super) xattr_isize: usize,
     /// The modification time (the F6/F6n carrier discipline: the
     /// le64 seconds domain is carried unchanged — the `as i64`
@@ -1560,7 +1566,7 @@ impl InodeDesc {
     /// consumer.
     // Live since T-024 S01: consumed by `suffix_xattr_start` (the
     // base-point formula family above); the extent-start location
-    // (T-025) and the ibody location (T-026) join through the same
+    // (T-025) and the ibody walk (T-026 S02) joined through the same
     // single source. The bridging `expect` was removed when the
     // first consumer landed.
     pub(super) fn inode_isize(&self) -> usize {
@@ -1643,7 +1649,8 @@ impl InodeDesc {
 /// An unconditional conversion with no boundary check: the le16
 /// input domain caps the result at 262148 bytes and the mirror
 /// deliberately carries the unvalidated value — the boundary guard
-/// belongs to the consumption point (T-026). The literal 12 is the
+/// belongs to the consumption point (the X1 three-state gate and
+/// the X23 walk gate, `xattr.rs`, T-026 S02). The literal 12 is the
 /// `RawXattrIbodyHeader` size, same-valued with its layout
 /// assertion in `xattr.rs` (a mutual proof — this file does not
 /// reference the xattr.rs type, the L4 direction forbids it). The

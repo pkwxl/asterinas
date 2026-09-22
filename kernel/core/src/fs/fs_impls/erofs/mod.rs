@@ -72,7 +72,13 @@
 //! (`inode/file.rs`), and the direct-I/O read path (the flag dispatch
 //! in `impl_for_vfs` plus `read_direct_at` in `inode/file.rs`) — DIO
 //! reads walk the extents straight through the device byte channel
-//! and never touch the page cache.
+//! and never touch the page cache. T-026 completes the extended-
+//! attribute domain (`xattr.rs`): the per-inode lazy state, the
+//! dual-storage walks, the bloom gate, the long-prefix table, the
+//! get/list/acl read channels, and the write rejection — with the
+//! trait forwards in `impl_for_vfs` collected (S09), every erofs
+//! member of the VFS inode face is terminal; the bring-up
+//! narration is closed.
 //!
 //! # References
 //!

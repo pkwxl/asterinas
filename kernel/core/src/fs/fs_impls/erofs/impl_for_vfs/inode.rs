@@ -9,7 +9,8 @@
 //! — a one-line forward into an inherent method (possibly with a
 //! view conversion), a single-line descriptor-field getter, or a
 //! write-face minimal body. No logic lives here; the bodies are
-//! hosted by the `inode/` submodules and cited per member. The one
+//! hosted by the inherent faces (the `inode/` submodules, and
+//! `xattr.rs` for the xattr pair) and cited per member. The one
 //! conditional landed with T-025 S07: `read_at` dispatches on the
 //! direct-I/O status flag before forwarding (F7) — a flag-based
 //! choice between two one-line forwards, still "dispatch only"
@@ -17,22 +18,27 @@
 //! the SINGLE place in erofs that reads the flag.
 //!
 //! Same-name pairs (`metadata`/`lookup`/`open`/`read_link`/
-//! `page_cache`/`fs`) resolve to the TYPED INHERENT faces through
-//! Rust's inherent-method precedence (the S08 §7.2 shadowing
-//! table): the framework only ever sees the trait face, while
-//! erofs-internal callers use the inherent faces directly.
+//! `page_cache`/`fs`, and since T-026 `get_xattr`/`list_xattr`)
+//! resolve to the TYPED INHERENT faces through Rust's
+//! inherent-method precedence (the S08 §7.2 shadowing table, the
+//! xattr pair its +2 continuation): the framework only ever sees
+//! the trait face, while erofs-internal callers use the inherent
+//! faces directly.
 //!
 //! Write faces: `write_at`, `resize`, `set_mode`, `set_owner`, and
 //! `set_group` answer `EROFS` (the S07-D5 minimal bodies); the
 //! no-`Result` time setters are no-ops (G-N07 — erofs never
 //! records atime writes anywhere, including directory reads); and
-//! `set_xattr`/`remove_xattr` answer `EROFS` deliberately: unlike
-//! the directory-entry family, the xattr write path has no VFS
-//! mount-writable front gate (`Path::set_xattr` is an unguarded
-//! inherited method), so this override is the only `EROFS` source
-//! for setxattr(2)/removexattr(2) on erofs (kept per T-024/S04 §4
-//! warning 3; the xattr READ faces `get_xattr`/`list_xattr` keep
-//! the trait `EOPNOTSUPP` defaults until T-026).
+//! `set_xattr`/`remove_xattr` answer `EROFS` deliberately (the
+//! W-X01 state-B terminal bodies, `docs/T-015/S09/index.md` §2.1):
+//! unlike the directory-entry family, the xattr write path has no
+//! VFS mount-writable front gate (`check_mount_writable` is only
+//! wired into directory entry mutations), so those overrides are
+//! the only `EROFS` source for setxattr(2)/removexattr(2) on
+//! erofs. The xattr read faces forward: `get_xattr`/`list_xattr`
+//! are one-line forwards into the inherent gate chains hosted by
+//! `xattr.rs` (T-026 S06/S07, the acl channel S08; every gate
+//! lives there — this file stays dispatch-only).
 //!
 //! Everything else walks the trait defaults, by design: the
 //! directory-entry mutation family (`create`, `create_tmpfile`,
@@ -57,7 +63,7 @@ use crate::{
         vfs::{
             file_system::FileSystem,
             inode::{Extension, FileOps, Inode, Metadata, SymbolicLink},
-            xattr::{XattrName, XattrSetFlags},
+            xattr::{XattrName, XattrNamespace, XattrSetFlags},
         },
     },
     process::{Gid, Uid},
@@ -230,20 +236,56 @@ impl Inode for ErofsInode {
         self.extension()
     }
 
+    fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize> {
+        // One-line forward to the inherent face (same-name
+        // shadowing: Rust resolves the inherent method first — not
+        // a recursion). The whole matrix-one gate chain — acl
+        // dispatch, type/permission, name resolution (prefix
+        // self-strip lives in `resolve_query_name`, the ext2-B4
+        // anti-copy placement), nouser_xattr, lazy init, bloom,
+        // the dual walk — is the inherent body (`xattr.rs`, T-026
+        // S06; the System half S08).
+        self.get_xattr(name, value_writer)
+    }
+
+    fn list_xattr(&self, namespace: XattrNamespace, list_writer: &mut VmWriter) -> Result<usize> {
+        // One-line forward (same shadowing form as above). The
+        // matrix-two chain — the X35 ENODATA conversion, the
+        // W-X02 state-B namespace-as-capability-signal
+        // consumption, the unconditionally ordered dual walk, and
+        // the single-point terminal write — is the inherent body
+        // (`xattr.rs`, T-026 S07).
+        self.list_xattr(namespace, list_writer)
+    }
+
+    // W-X01 (state B; no landing marker — the degradation
+    // condition is declared inline): The framework syscall layer
+    // has no mount-level write gate on the xattr path —
+    // `check_mount_writable` is only wired into directory entry
+    // mutations — so these overrides are the layer-(1) equivalent
+    // of the Linux mnt_want_write rejection: every write reaches
+    // here only after the path resolved, and is rejected with
+    // EROFS for any name, flags, value and inode type. If a
+    // framework-level gate is ever added to the
+    // setxattr/removexattr syscalls (state A1/A2 candidates),
+    // these overrides become unreachable and may be removed with
+    // no behavior change. The trait defaults (EOPNOTSUPP) below
+    // remain the layer-(2)/(3) equivalents — precisely equivalent
+    // and, as in Linux, permanently unreachable.
     fn set_xattr(
         &self,
         _name: XattrName,
         _value_reader: &mut VmReader,
         _flags: XattrSetFlags,
     ) -> Result<()> {
-        // Write-face minimal body, deliberately kept (T-024/S04
-        // §4 warning 3): the xattr write path has no VFS
-        // mount-writable front gate, so this member is the only
-        // EROFS source for setxattr(2)/removexattr(2).
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
+        // Write-face minimal body (T-013 §7.4 form ③; the S09 §2.1
+        // terminal text above). Message per S09-D2 — deliberately
+        // not the T-024 family string: this pair follows its own
+        // sample anchor (decision 6 of `docs/T-026/subtasks.md`).
+        return_errno_with_message!(Errno::EROFS, "the filesystem is read-only");
     }
 
     fn remove_xattr(&self, _name: XattrName) -> Result<()> {
-        return_errno_with_message!(Errno::EROFS, "erofs is a read-only filesystem");
+        return_errno_with_message!(Errno::EROFS, "the filesystem is read-only");
     }
 }

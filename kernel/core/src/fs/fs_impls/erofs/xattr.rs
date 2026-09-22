@@ -95,7 +95,8 @@ use crate::fs::{
 #[derive(Clone, Copy, Debug, Pod)]
 pub(super) struct RawXattrIbodyHeader {
     /// The name bloom-filter bitmap; bit value 1 means the name is
-    /// not present (consumed by the get chain, T-026).
+    /// not present (consumed by the get and acl chains since
+    /// T-026 S06/S08).
     pub h_name_filter: u32, // @0  __le32
     /// The number of shared-xattr references (the length of the
     /// trailing id array); no upper-bound check (≤ 255).
@@ -124,7 +125,7 @@ const_assert!(offset_of!(RawXattrIbodyHeader, h_reserved2) == 5); // erofs_fs.h:
 /// with name and value contiguous, no intermediate alignment, and
 /// padding bytes never read — is not modeled (U3.2); the name bytes
 /// carry no NUL terminator (the length is `e_name_len` itself). Name
-/// and value are read by byte offset at the walk (T-026).
+/// and value are read by byte offset at the walk (since T-026 S02).
 // No deadness attribute — same const_assert liveness rationale as
 // `RawXattrIbodyHeader` above.
 #[repr(C)]
@@ -136,10 +137,11 @@ pub(super) struct RawXattrEntry {
     pub e_name_len: u8, // @0  __u8
     /// The name index: bit 7 (`0x80`) is the long-prefix flag, the
     /// low 7 bits (`0x7f`) the prefix-table or short-prefix index.
-    /// No independent check — bounds are checked at use (T-026).
+    /// No independent check — bounds are checked at use (since
+    /// T-026: the X24 entry gate, the X27 table resolve).
     pub e_name_index: u8, // @1  __u8
     /// The value length; 0 is allowed. An undersized getxattr output
-    /// buffer reports ERANGE at the consumption face (T-026).
+    /// buffer reports ERANGE at the consumption face (T-026 S06).
     pub e_value_size: u16, // @2  __le16
 }
 
@@ -158,9 +160,12 @@ const_assert!(offset_of!(RawXattrEntry, e_value_size) == 2); // erofs_fs.h:234
 // linux/fs/erofs/erofs_fs.h and include/uapi/linux/posix_acl(_xattr).h,
 // referenced by path at their consumption sites, never forwarded
 // through the prelude. Private to this module; not enum-ized (XA1
-// value transcription). Unconsumed members carry transitional expects
-// with their first-consumer slice (the expect-wave discipline; removed
-// as the consumers land — the S09 slice reconciles the residue).
+// value transcription). Liveness closed at S09: every consumable
+// member is live through the entry chains (see the per-member
+// "Live since" notes); the two structurally-unconsumable
+// transcriptions (`FILTER_DEFAULT`, `XATTR_INDEX_LUSTRE`) keep
+// PERMANENT expects by design — never consumed, never deleted (the
+// expect-wave terminal state).
 // ---------------------------------------------------------------------------
 
 /// Name index of `user.*` attributes (`EROFS_XATTR_INDEX_USER`,
@@ -197,8 +202,10 @@ const XATTR_INDEX_TRUSTED: u8 = 4; // erofs_fs.h:215
 // namespace resolves to it (the query domain is 1/4/6 plus the ACL
 // pair 2/3) and no list row exists, so on-disk entries carrying it
 // simply never match and list skips them. Kept for the XA1 faithful
-// transcription; the expect stays until the S09
-// consumed-or-deleted reconciliation.
+// transcription; the S09 consumed-or-deleted reconciliation closed
+// on "kept" — the same permanent-expect form as FILTER_DEFAULT above
+// (never consumed, never deleted; wiring it anywhere would fabricate
+// a handler row Linux does not have).
 #[expect(dead_code)]
 const XATTR_INDEX_LUSTRE: u8 = 5; // erofs_fs.h:216
 
@@ -328,7 +335,8 @@ const ACL_UNDEFINED_ID: u32 = u32::MAX; // (-1), posix_acl.h:21
 // Hosted as an inherent `impl Inode` block here — the cross-module
 // inherent-impl precedent of `inode/symlink.rs`/`inode/dir.rs`: the
 // state lives on the handle (inode/mod.rs), the xattr logic lives
-// here. One-line trait forwards join at `impl_for_vfs` (T-026 S09).
+// here. The one-line trait forwards live at `impl_for_vfs`
+// (since T-026 S09).
 // ---------------------------------------------------------------------------
 
 impl Inode {
@@ -348,10 +356,10 @@ impl Inode {
     // Live since T-026 S06: consumed by the get entry chain below,
     // the list entry chain since S07, and the acl channel
     // (`get_system_xattr` below) since S08. The dead-code-analysis
-    // roots are the get and list entries themselves (transitional
-    // expects until the S09 trait forwards land); the cell field
-    // read and the init function stay live through those roots. The
-    // bridging `expect` was removed when the first consumer landed.
+    // roots are the get and list entries themselves (trait forwards
+    // in `impl_for_vfs` since T-026 S09); the cell field read and
+    // the init function stay live through those roots. The bridging
+    // `expect` was removed when the first consumer landed.
     pub(in crate::fs::fs_impls::erofs) fn xattr_state(&self) -> Result<&InodeXattrState> {
         let fs = self.fs()?;
         let (nid, desc) = (self.ino(), self.desc());
@@ -1072,7 +1080,7 @@ impl Erofs {
 // §2.5 — the `erofs_getxattr` counterpart, xattr.c:384-426, plus the
 // foreach consumer of both storage walks, xattr.c:251-312). The entry is
 // an inherent method on `Inode`; the trait override in `impl_for_vfs`
-// joins as the S06-D1 one-line forward at T-026 S09 (gate position:
+// is the S06-D1 one-line forward (since T-026 S09; gate position:
 // every gate lives in this body — `impl_for_vfs` stays dispatch-only).
 // The entry-matching half is the S08-D1 shared extraction
 // `entry_matches`, landed here directly in its final form (analysis
@@ -1241,12 +1249,11 @@ impl Inode {
     /// 384-426), matrix-one rows 6–31. The gate order below IS the
     /// priority order (⑥–⑮, the C call chain ⑤–⑩ mirrored; a swapped
     /// pair is an assertion face, never a refactor).
-    // Transitional — consumed by the trait forward that lands with
-    // T-026 S09; remove this expect then. Until then it is the
-    // dead-code-analysis root that keeps the whole chain below alive
+    // Live since T-026 S09: the trait forward in `impl_for_vfs`
+    // calls it; through it the whole chain below stays live
     // (xattr_state, both walks, the bloom gate, the prefix resolve
-    // face, and the constants/fields they consume).
-    #[expect(dead_code)]
+    // face, and the constants/fields they consume). The bridging
+    // `expect` of S06–S08 was removed when the forward landed.
     pub(in crate::fs::fs_impls::erofs) fn get_xattr(
         &self,
         name: XattrName<'_>,
@@ -1495,7 +1502,7 @@ impl Inode {
 // the `erofs_listxattr` counterpart, xattr.c:428-455, plus the list
 // foreach consumer of both storage walks, xattr.c:200-249). The entry is
 // an inherent method on `Inode`; the trait override in `impl_for_vfs`
-// joins as the one-line forward at T-026 S09 (gate position: every gate
+// is the one-line forward (since T-026 S09; gate position: every gate
 // lives in this body — `impl_for_vfs` stays dispatch-only). Structurally
 // free of any bloom reference (the get/list asymmetry, S04 §2.5): the
 // caller set of `xattr_filter_denies` — the get chain above and,
@@ -1732,12 +1739,12 @@ impl Inode {
     /// (a state-A signature extension) or changes the selector
     /// semantics, the trusted gate here must be re-derived from the
     /// caller's credentials; the rest of this method is unaffected.
-    // Transitional — consumed by the trait forward that lands with
-    // T-026 S09; remove this expect then. Until then it is the
-    // dead-code-analysis root that keeps the list chain above alive
+    // Live since T-026 S09: the trait forward in `impl_for_vfs`
+    // calls it; through it the list chain above stays live
     // (list_base_prefix, ListCtx, list_foreach_body, the ACL index
-    // constants, and the posix_acl accessor they consume).
-    #[expect(dead_code)]
+    // constants, and the posix_acl accessor they consume). The
+    // bridging `expect` of S07–S08 was removed when the forward
+    // landed.
     pub(in crate::fs::fs_impls::erofs) fn list_xattr(
         &self,
         namespace: XattrNamespace,

@@ -19,11 +19,13 @@
 //! mount-time validation order (`read_superblock` in `fs.rs`,
 //! T-023 S03) consumes the mirror: every V-door predicate, the
 //! checksum helper, and the magic/dirblkbits/u1 fields are live
-//! through it. Surfaces whose consumers land later — the
-//! root-inode/geometry fields (the assembly and statfs faces of this
-//! task), the xattr prefix family (T-026), and the packed-inode nid
-//! (G-Z01 revival) — still carry their own `#[expect(dead_code)]`
-//! removal prompt with their first consumer annotated.
+//! through it. Every later consumer family has since landed too —
+//! the root-inode/geometry fields with T-023, the xattr family
+//! (the bloom bit + reservation byte since T-026 S04, the prefix
+//! count/start since S05, `xattr_blkaddr` since S03) — so the only
+//! `#[expect(dead_code)]` residue is the two permanent cut-domain
+//! groups: the compression config record headers (G-Z01 revival)
+//! and the `volume_name()` view accessor (no consumer yet).
 //!
 //! Boundary: field-level decoding and predicates only — the assembly
 //! and validation *order* decisions belong solely to
@@ -65,10 +67,11 @@ pub(super) const SUPER_MAGIC_V1: u32 = 0xE0F5E1E2;
 // Hosted here (XA2) because the consumers, `inode/dir.rs` and
 // `xattr.rs`, are mutually independent in the module DAG.
 // Live since T-023 S06: the statfs namelen face of
-// `Erofs::vfs_super_block` (`fs.rs`) reads it (SF7); the namei/xattr
-// consumers join with their domains (T-024/T-026) through the same
-// constant. The bridging `expect` was removed when the first
-// consumer landed.
+// `Erofs::vfs_super_block` (`fs.rs`) reads it (SF7); the namei
+// consumer (T-024) and the xattr consumers — the P4 record-domain
+// bound and the list name scratch (T-026 S05/S07) — read it
+// through the same constant. The bridging `expect` was removed
+// when the first consumer landed.
 pub(super) const NAME_LEN: usize = 255;
 
 /// The size of one superblock extension slot in bytes
@@ -477,15 +480,20 @@ struct RawZstdCfgs {
 /// carrying an `expect` is a dead-code-analysis root, so its reads
 /// count, and an accessor consumed by the mount validation order
 /// (`read_superblock` in `fs.rs`, live since T-023 S03) keeps its
-/// field live without any attribute. Every other field carries its
-/// own `#[expect(dead_code)]` with its first consumer annotated:
-/// the `expect` fires `unfulfilled` the moment that consumer lands,
-/// which is the removal prompt (the cut-domain pair additionally
-/// carries its SB5 revival note). The design sketch marked only the
-/// cut-domain pair with a deadness attribute; the landed form
-/// generalizes it to every not-yet-read field, for the same reason
-/// S01 replaced `#[allow]` with `#[expect]` — the workspace bans
-/// allow attributes, and the `expect` doubles as the revival alarm.
+/// field live without any attribute. Every other field carried
+/// its own `#[expect(dead_code)]` with its first consumer
+/// annotated: the `expect` fired `unfulfilled` the moment that
+/// consumer landed, which was the removal prompt (the cut-domain
+/// pair additionally carried its SB5 revival note). The ledger is
+/// closed — the xattr family completed the last field wave
+/// (T-026 S03–S05), every mirror field is live, and the module's
+/// residual expects (the compression config record headers, the
+/// `volume_name()` accessor) are not mirror fields. The design
+/// sketch marked only the cut-domain pair with a deadness
+/// attribute; the landed form generalized it to every
+/// not-yet-read field, for the same reason S01 replaced
+/// `#[allow]` with `#[expect]` — the workspace bans allow
+/// attributes, and the `expect` doubles as the revival alarm.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
     /// The file system magic number (host order; the `From` body is

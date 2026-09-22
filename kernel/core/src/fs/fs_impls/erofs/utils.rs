@@ -38,7 +38,7 @@
 // caller before the xattr bloom domain. The first regular-build
 // caller, the bloom denial predicate in `xattr.rs` (itself a
 // dead-code-analysis root under a transitional expect until the get
-// entry chain consumes it, T-026 S06), landed with T-026 S04: every
+// entry chain consumed it, T-026 S06), landed with T-026 S04: every
 // item here is live in every cfg now, and the module-level
 // expectation was removed (keeping it would be reported unfulfilled).
 // Earlier liveness: `crc32c` since T-022 S03 (called by the checksum
