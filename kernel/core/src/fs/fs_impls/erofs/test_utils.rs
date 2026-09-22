@@ -29,11 +29,26 @@
 //!   live in `fs.rs` (`Erofs::ktest_new_with`,
 //!   `DeviceTable::ktest_new`) and are re-faced here as thin
 //!   helpers.
+//! * **T-027 S02, builder foundations** (the sections between the
+//!   fs wiring and the self-smoke suite): the `assert_errno!`
+//!   macro and the little-endian byte patch/read helpers (the
+//!   ext2 Layer-0 primitives minus the bitmap bit setter, which
+//!   erofs has no use for), the five whitelisted byte templates
+//!   extracted from the T-018 pipeline images
+//!   (`docs/T-027/S01/index.md`), the layout writers that stage
+//!   them (`write_super_block` with the checksummed finish,
+//!   `write_super_block_raw` as the V5-only skip channel,
+//!   `write_inode_at` on the production iloc formula,
+//!   `write_dirents`, `write_meta_bytes`), and the memory-disk
+//!   truncation channel (`nr_sectors_override`, the G-M10 form).
+//!   The layer numbering above stays the T-024/T-025 four-layer
+//!   form — the S02 sections slot in without renumbering
+//!   (increment, not refactor).
 //!
-//! The full erofs image builder (staged disk bytes walked by the
-//! real `Erofs::open` chain) is still T-027's; until it lands,
-//! ktests assemble handles directly (`ktest_new`/`ktest_fs_on`)
-//! instead of mounting.
+//! The `ErofsFixture` chassis and the FX-* builder family land
+//! with S03+; until then no ktest walks `Erofs::open` over a
+//! staged image (S03 is the first — handles are still assembled
+//! directly via `ktest_new`/`ktest_fs_on`).
 //!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
@@ -48,6 +63,7 @@
 
 use core::{
     fmt,
+    mem::offset_of,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -65,10 +81,15 @@ use super::{
     Erofs,
     fs::DeviceTable,
     inode::{
-        AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, InodeDesc, InodeVersion,
+        AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, ISLOT_BITS, InodeDesc,
+        InodeVersion, inode_location,
     },
     prelude::*,
-    super_block::SuperBlock,
+    super_block::{
+        FeatureCompatSet, RawSuperBlock, SUPER_OFFSET, SUPPORTED_BLKSZBITS, SuperBlock,
+        verify_superblock_checksum,
+    },
+    utils::crc32c,
 };
 
 // ===========================================================================
@@ -160,6 +181,16 @@ pub(super) struct ErofsMemoryDisk {
     segment: Segment<()>,
     requests: SpinLock<Vec<BioRequest>>,
     fail_reads: AtomicBool,
+    /// The G-M10 truncation knob (T-027 S02): `None` — every disk so
+    /// far — declares the physical segment size; `Some(sectors)`
+    /// shrinks the *declared* device size (`metadata().nr_sectors`)
+    /// below the physical allocation, which stays whole pages. The
+    /// framework byte-channel bound consumes the declared value, so
+    /// reads past it fail `EINVAL` before reaching `enqueue`; the
+    /// mount-time assertion values of the truncated-image forms are
+    /// S14's to finalize (registered drift: aster EINVAL / Linux
+    /// EBADMSG).
+    nr_sectors_override: Option<u64>,
 }
 
 impl ErofsMemoryDisk {
@@ -178,7 +209,27 @@ impl ErofsMemoryDisk {
             segment,
             requests: SpinLock::new(Vec::new()),
             fail_reads: AtomicBool::new(false),
+            nr_sectors_override: None,
         }
+    }
+
+    /// The G-M10 truncated disk: physical allocation of `nbytes`
+    /// bytes (page-rounded — staging still reaches every physical
+    /// page), but the device declares only `nr_sectors_override`
+    /// sectors (e.g. 6 = 3072 bytes). Keeps everything else of the
+    /// regular constructor: the request log, the read-only
+    /// discipline, the `fail_reads` injection.
+    pub(super) fn truncated(nbytes: usize, nr_sectors_override: u64) -> Self {
+        let mut disk = Self::new(nbytes);
+        disk.nr_sectors_override = Some(nr_sectors_override);
+        disk
+    }
+
+    /// The declared device size in sectors — the override when
+    /// present, the physical size otherwise.
+    fn effective_nr_sectors(&self) -> u64 {
+        self.nr_sectors_override
+            .unwrap_or(self.segment.size() as u64 / SECTOR_SIZE as u64)
     }
 
     /// The staging surface: tests pre-load disk content through it
@@ -195,10 +246,12 @@ impl ErofsMemoryDisk {
     }
 
     /// The byte bound the framework enforces on the byte channel:
-    /// `nr_sectors * SECTOR_SIZE`. Reads touching or crossing this
-    /// bound fail `EINVAL` before reaching the device.
+    /// the *declared* `nr_sectors * SECTOR_SIZE` — the truncated
+    /// disk declares less than it physically holds, and that smaller
+    /// bound is what fires. Reads touching or crossing it fail
+    /// `EINVAL` before reaching the device.
     pub(super) fn size_bytes(&self) -> usize {
-        self.segment.size() / SECTOR_SIZE * SECTOR_SIZE
+        self.effective_nr_sectors() as usize * SECTOR_SIZE
     }
 
     /// A snapshot of the request log, in submission order.
@@ -261,7 +314,7 @@ impl BlockDevice for ErofsMemoryDisk {
     fn metadata(&self) -> BlockDeviceMeta {
         BlockDeviceMeta {
             max_nr_segments_per_bio: usize::MAX,
-            nr_sectors: self.segment.size() / SECTOR_SIZE,
+            nr_sectors: self.effective_nr_sectors(),
         }
     }
 
@@ -490,7 +543,254 @@ pub(super) fn ktest_fs_on(
 }
 
 // ===========================================================================
-// Layer 4: fixture self-smoke (T-025 S02)
+// T-027 S02: fixture-builder foundations — the assertion macro, the
+// LE byte helpers, the whitelisted templates, the layout writers
+// (design: docs/T-016/S06 §4.1–§4.2, decisions D3/D4)
+// ===========================================================================
+
+/// Asserts that `$expr` is `Err` carrying exactly `$errno` — the
+/// ext2 `test_utils.rs` Layer-0 form, transcribed verbatim. The
+/// mount/iget assertion suites of S03+ consume it through the
+/// `pub(super) use` re-export below (host-file ktests import it as
+/// `test_utils::assert_errno`); the `Ok` arm panics so a silently
+/// succeeding form fails loudly instead of passing vacuously.
+macro_rules! assert_errno {
+    ($expr:expr, $errno:expr) => {
+        match $expr {
+            Err(e) => assert_eq!(e.error(), $errno),
+            Ok(_) => panic!("expected Err({:?}), got Ok(_)", $errno),
+        }
+    };
+    ($expr:expr, $errno:expr, $($msg:tt)+) => {
+        match $expr {
+            Err(e) => assert_eq!(e.error(), $errno, $($msg)+),
+            Ok(_) => panic!("expected Err({:?}), got Ok(_): {}", $errno, format_args!($($msg)+)),
+        }
+    };
+}
+pub(super) use assert_errno;
+
+// AUTO-DECISION: the LE byte family lands as width-split free
+// functions (put_le_u16/u32/u64, get_le_u16/u32/u64) rather than the
+// S06 §4.1 sketch's generic `put_le::<const N: usize>` spelling
+// (context risk 7, implementation means only). The generic form has
+// no clean read-side story — `get_le` would need to dispatch a
+// return type from a const generic, which stable Rust cannot express
+// without a macro anyway — and the per-width functions are the
+// greppable, macro-free form. Patch offsets still come exclusively
+// from `offset_of!` at every call site (the D3 discipline); these
+// helpers carry no offsets of their own.
+
+/// Patches `v` little-endian into `buf` at `off`. Panics when the
+/// field range does not fit — a fixture bug that should fail loudly.
+pub(super) fn put_le_u16(buf: &mut [u8], off: usize, v: u16) {
+    buf[off..off + size_of::<u16>()].copy_from_slice(&v.to_le_bytes());
+}
+
+/// The u32 arm of the patch family.
+pub(super) fn put_le_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + size_of::<u32>()].copy_from_slice(&v.to_le_bytes());
+}
+
+/// The u64 arm of the patch family.
+pub(super) fn put_le_u64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + size_of::<u64>()].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Reads the little-endian u16 at `off` — the read side the
+/// assertion suites use to check what a patch actually staged.
+pub(super) fn get_le_u16(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(buf[off..off + size_of::<u16>()].try_into().unwrap())
+}
+
+/// The u32 arm of the read family.
+pub(super) fn get_le_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + size_of::<u32>()].try_into().unwrap())
+}
+
+/// The u64 arm of the read family.
+pub(super) fn get_le_u64(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + size_of::<u64>()].try_into().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2 increment: the whitelisted byte templates (S06 §3.1/§3.3,
+// decision D3 — byte constants + typed patches). Pasted verbatim from
+// the S01 extraction product `test/erofs_fixture_templates.rs`
+// (script `test/erofs_fixture_templates.sh`; sources = the T-018
+// pipeline images C1/C2/C10, sha256s recorded there and in
+// `docs/T-027/S01/index.md` §2). Non-deterministic-field whitelist
+// already applied at extraction, exactly three items:
+// build_time/build_time_nsec zeroed, uuid = EROFS_UUID_BASE,
+// checksum zeroed (always recomputed by `write_super_block` below).
+// Field offsets named in comments mirror the const_assert anchors in
+// super_block.rs / inode/mod.rs / inode/dir.rs — patch code takes
+// them from `offset_of!`, never from these comments.
+// ---------------------------------------------------------------------------
+
+/// T-SB: 128-byte super block seed, C1 erofs_base.img [1024,1152),
+/// whitelist applied (checksum/build_time/build_time_nsec zeroed,
+/// uuid = base). Chassis landing (S06 §3.2) patches
+/// root_nid/inos/blocks/meta_blkaddr to the chassis geometry
+/// (0 / slot count / 32 / 1) and recomputes the checksum; the source
+/// values in the comments are the C1 measurement, kept for review.
+const SB_TEMPLATE: [u8; 128] = [
+    0xe2, 0xe1, 0xf5, 0xe0, 0x00, 0x00, 0x00, 0x00, // magic@0 = 0xE0F5E1E2; checksum@4 = 0 (recomputed by write_super_block; raw write = FX-SB V5 only)
+    0x07, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x26, 0x00, // feature_compat@8 = 0x7 (SB_CHKSUM | MTIME | XATTR_FILTER); blkszbits@12 = 12; sb_extslots@13 = 0; root_nid@14 = 38 (chassis patches to 0)
+    0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // inos@16 = 262 (chassis patches to slot count)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // build_time@24 = 0 (WHITELISTED)
+    0x00, 0x00, 0x00, 0x00, 0x75, 0x00, 0x00, 0x00, // build_time_nsec@32 = 0 (WHITELISTED); blocks@36 = 117 (chassis: 32)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // meta_blkaddr@40 = 0 (chassis: 1); xattr_blkaddr@44 = 0
+    0xe2, 0xe4, 0xf0, 0xc8, 0x1a, 0x2b, 0x4c, 0x3d, // uuid@48 = EROFS_UUID_BASE
+    0x9e, 0x8f, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0x0f,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // volume_name@64 = NUL x 16
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // feature_incompat@80 = 0; u1@84 = 0; extra_devices@86 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // devt_slotoff@88 = 0; dirblkbits@90 = 0; xattr_prefix_count@91 = 0; xattr_prefix_start@92 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // packed_nid@96 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // xattr_filter_reserved@104 = 0; reserved2@105 = 0 x 23 (G5 verbatim)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// T-EXT64: 64-byte extended inode seed, C1 root inode @ iloc 1216.
+/// FlatInline on disk; the chassis root switches datalayout to
+/// FLAT_PLAIN with raw_blkaddr = block 4 (T-027 risk-1 resolution
+/// direction). Inode time fields need no whitelisting: the T-018
+/// stage anchors all source mtimes to @0 (asserted at extraction).
+const INODE_EXT_TEMPLATE: [u8; 64] = [
+    0x05, 0x00, 0x00, 0x00, 0xed, 0x41, 0x00, 0x00, // i_format@0 = 0x0005 (version=1 extended, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_reserved@6 = 0
+    0x7a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_size@8 = 122 (le64)
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, // i_u@16 = 0xFFFFFFFF (FlatInline raw_blkaddr convention); i_ino@20 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_uid@24 = 0; i_gid@28 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_mtime@32 = 0 (stage anchors mtimes to @0)
+    0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, // i_mtime_nsec@40 = 0; i_nlink@44 = 7
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_reserved2@48 = 0 x 16
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// T-CPT32: 32-byte compact inode seed, C2 (erofs_base_cpt.img)
+/// root inode @ iloc 1216. No time fields: compact ctime is
+/// synthesized from the superblock build_time (both zeroed on the
+/// chassis).
+const INODE_CPT_TEMPLATE: [u8; 32] = [
+    0x04, 0x00, 0x00, 0x00, 0xed, 0x41, 0x07, 0x00, // i_format@0 = 0x0004 (version=0 compact, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_nlink@6 = 7 (le16)
+    0x7a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_size@8 = 122 (le32); i_reserved@12 = 0
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, // i_u@16 = 0xFFFFFFFF; i_ino@20 = 0
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // i_uid@24 = 0; i_gid@26 = 0; i_reserved2@28 = 0
+];
+
+/// T-DIRENT: 12-byte dirent seed, C1 root directory first entry
+/// ".". Reference walk of the full 122-byte dir data (7 entries:
+/// . .. dirs regular special symlink xattr_host; nids
+/// 38,38,44,51,62,68,75; nameoff chain 84,85,87,91,98,105,112)
+/// lives in `test/erofs_fixture_templates.dump.txt`.
+const DIRENT_TEMPLATE: [u8; 12] = [
+    0x26, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nid@0 = 38 (le64, '.')
+    0x54, 0x00, 0x02, 0x00, // nameoff@8 = 84 (le16, dirent array end of 7 entries); file_type@10 = 2 (DT_DIR); reserved@11 = 0
+];
+
+/// Prefix-record reference form, C10 erofs_prefix.img packed inode
+/// payload (record at packed iloc + 64; pos0 = xattr_prefix_start
+/// << 2 = 0). Packed form is mkfs-reachable only; the FX-XATTR
+/// meta-form half (S13) lays this byte family into the meta area
+/// itself (S06 §5.6). Reference only — the nid geometry is NOT
+/// copied (risk 3: parity is not an on-disk invariant; the chassis
+/// assigns its own even nids).
+const XATTR_PREFIX_RECORD_REF: [u8; 18] = [
+    0x10, 0x00, 0x01, 0x65, 0x72, 0x6f, 0x66, 0x73, // len@0 = 16 (le16: 1 index byte + 15-byte infix); index@2 = 0x01 (user namespace base index); infix@3 = "erofs_test.lpx." (15 bytes)
+    0x5f, 0x74, 0x65, 0x73, 0x74, 0x2e, 0x6c, 0x70,
+    0x78, 0x2e,
+];
+
+// ---------------------------------------------------------------------------
+// Layer 3 increment: the layout writers (S06 §4.2 — the
+// `write_raw_inode_to_disk`/`write_simple_root_dir_block`
+// counterparts; the group-descriptor and bitmap families are cut
+// whole: erofs nids are direct-addressed, no indirection).
+// ---------------------------------------------------------------------------
+
+/// The chassis block geometry (S06 §3.2): the physical fixture block
+/// is 4k and stays 4k regardless of any FX-SB V3 blkszbits *field*
+/// rewrite — derived from the mount-gate constant, never a literal.
+const CHASSIS_BLOCK_SIZE: usize = 1 << SUPPORTED_BLKSZBITS;
+
+/// Stages `sb` at `SUPER_OFFSET` finished with the S06 §3.4
+/// checksum sequence: set `SB_CHKSUM` (idempotent — the chassis
+/// compat 0x7 already carries it), zero the `checksum` field, then
+/// write back `crc32c(!0, region)` over `[SUPER_OFFSET,
+/// SUPER_OFFSET + checksummed_len())`. The interval length comes
+/// from the production formula (`SuperBlock::checksummed_len` over
+/// the just-staged record) and the CRC from production
+/// `utils::crc32c` — the fixture and the mount verifier share the
+/// single source, so they cannot drift apart. Every healthy-landing
+/// and FX superblock rewrite goes through here.
+pub(super) fn write_super_block(disk: &ErofsMemoryDisk, sb: &[u8; 128]) {
+    let mut buf = *sb;
+    let compat_off = offset_of!(RawSuperBlock, feature_compat);
+    let compat = get_le_u32(&buf, compat_off);
+    put_le_u32(&mut buf, compat_off, compat | FeatureCompatSet::SB_CHKSUM.bits());
+    put_le_u32(&mut buf, offset_of!(RawSuperBlock, checksum), 0);
+    disk.stage_bytes(SUPER_OFFSET, &buf);
+
+    let len = staged_super_block(disk).checksummed_len();
+    let mut region = vec![0u8; len];
+    disk.segment().read_bytes(SUPER_OFFSET, &mut region).unwrap();
+    let checksum = crc32c(!0, &region);
+    put_le_u32(&mut buf, offset_of!(RawSuperBlock, checksum), checksum);
+    disk.stage_bytes(SUPER_OFFSET, &buf);
+}
+
+/// Stages `sb` verbatim — no SB_CHKSUM set, no checksum recompute.
+/// The single explicit skip channel of S06 §3.4, reserved for the
+/// FX-SB V5 bad-csum forms whose whole point is a broken checksum.
+pub(super) fn write_super_block_raw(disk: &ErofsMemoryDisk, sb: &[u8; 128]) {
+    disk.stage_bytes(SUPER_OFFSET, sb);
+}
+
+/// Decodes the currently staged superblock through the production
+/// `From` conversion — the write family's addressing base and the
+/// smoke suites' mirror, reading the same decode the mount path
+/// reads.
+fn staged_super_block(disk: &ErofsMemoryDisk) -> SuperBlock {
+    let raw: RawSuperBlock = disk.segment().read_val(SUPER_OFFSET).unwrap();
+    SuperBlock::from(raw)
+}
+
+/// Stages an inode record at the production slot offset — `iloc =
+/// (meta_blkaddr << blkszbits) + (nid << ISLOT_BITS)` via
+/// `inode::inode_location` (single source) over the *currently
+/// staged* superblock. Contract: stage the chassis superblock
+/// (meta_blkaddr = 1) before laying inodes; no FX form rewrites
+/// meta_blkaddr, so the base stays stable through every later patch.
+pub(super) fn write_inode_at(disk: &ErofsMemoryDisk, nid: u64, raw: &[u8]) {
+    let iloc = inode_location(&staged_super_block(disk), nid) as usize;
+    disk.stage_bytes(iloc, raw);
+}
+
+/// Stages a directory data block: the dirent array at the block
+/// base, the name area immediately after it. The caller's first
+/// dirent `nameoff` must therefore equal `entries.len()` — the
+/// healthy mkfs form the T-DIRENT template mirrors (nameoff 84 =
+/// 7 × 12). Block addressing uses the fixed chassis geometry, not
+/// the staged sb: an FX-SB V3 blkszbits rewrite is a field patch,
+/// not a geometry change (S06 §3.2).
+pub(super) fn write_dirents(disk: &ErofsMemoryDisk, blk: u64, entries: &[u8], names: &[u8]) {
+    let base = blk as usize * CHASSIS_BLOCK_SIZE;
+    disk.stage_bytes(base, entries);
+    disk.stage_bytes(base + entries.len(), names);
+}
+
+/// Stages arbitrary bytes into a metadata block — the shared-xattr
+/// area, prefix records, chunk-index tables (S06 §4.2). Same fixed
+/// chassis geometry as `write_dirents`.
+pub(super) fn write_meta_bytes(disk: &ErofsMemoryDisk, blk: u64, off: usize, bytes: &[u8]) {
+    disk.stage_bytes(blk as usize * CHASSIS_BLOCK_SIZE + off, bytes);
+}
+
+// ===========================================================================
+// Layer 4: fixture self-smoke (T-025 S02; the T-027 S02 smokes of the
+// builder foundations join at the tail)
 // ===========================================================================
 
 mod tests {
@@ -758,5 +1058,151 @@ mod tests {
             (cross.inline_data_start % PAGE_SIZE as u64) + 100 > PAGE_SIZE as u64,
             "the crafted inline tail must cross the block end"
         );
+    }
+
+    /// The assertion macro itself, exercised once in-file: the Err
+    /// arm extracts `error()` and compares the errno. Pinned here so
+    /// the macro's shape is proven before the S03+ mount/iget suites
+    /// consume it (the Ok arm panics — a deliberately-failing form
+    /// would abort the ktest run, so only the Err arm is spelled).
+    #[ktest]
+    fn assert_errno_macro_err_arm() {
+        let e: Result<()> = return_errno_with_message!(Errno::EINVAL, "ktest macro shape smoke");
+        assert_errno!(e, Errno::EINVAL);
+        let e: Result<()> = return_errno_with_message!(Errno::EUCLEAN, "second arm");
+        assert_errno!(e, Errno::EUCLEAN, "with message tail");
+    }
+
+    /// The LE helper family is little-endian by construction: known
+    /// values land as explicitly spelled low-byte-first bytes, and
+    /// the get side round-trips them back.
+    #[ktest]
+    fn le_helpers_little_endian_roundtrip() {
+        let mut buf = [0u8; 14];
+        put_le_u16(&mut buf, 0, 0x1234);
+        assert_eq!(&buf[..2], &[0x34, 0x12]);
+        put_le_u32(&mut buf, 2, 0xABCD_EF01);
+        assert_eq!(&buf[2..6], &[0x01, 0xEF, 0xCD, 0xAB]);
+        put_le_u64(&mut buf, 6, 0x0102_0304_0506_0708);
+        assert_eq!(
+            &buf[6..14],
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
+        assert_eq!(get_le_u16(&buf, 0), 0x1234);
+        assert_eq!(get_le_u32(&buf, 2), 0xABCD_EF01);
+        assert_eq!(get_le_u64(&buf, 6), 0x0102_0304_0506_0708);
+    }
+
+    /// `write_super_block` finishes with a checksum the production
+    /// verifier accepts — including when the input carries the
+    /// SB_CHKSUM bit clear (the §3.4 set step) — while
+    /// `write_super_block_raw` stages the whitelisted template
+    /// verbatim: zero checksum, verifier rejects. The V5-only skip
+    /// semantics in miniature.
+    #[ktest]
+    fn write_super_block_recompute_vs_raw() {
+        let disk = ErofsMemoryDisk::new(PAGE_SIZE);
+        let verify_staged = |disk: &ErofsMemoryDisk| {
+            let raw: RawSuperBlock = disk.segment().read_val(SUPER_OFFSET).unwrap();
+            let len = SuperBlock::from(raw).checksummed_len();
+            let mut region = vec![0u8; len];
+            disk.segment().read_bytes(SUPER_OFFSET, &mut region).unwrap();
+            (raw.checksum, verify_superblock_checksum(&mut region, raw.checksum))
+        };
+
+        write_super_block(&disk, &SB_TEMPLATE);
+        let (csum, ok) = verify_staged(&disk);
+        assert!(ok, "production verify must accept the recomputed checksum");
+        assert_ne!(csum, 0, "the recomputed value replaces the whitelisted zero");
+
+        // SB_CHKSUM clear on input: the writer sets the bit before
+        // computing, so the staged record still verifies.
+        let mut sb = SB_TEMPLATE;
+        put_le_u32(&mut sb, offset_of!(RawSuperBlock, feature_compat), 0);
+        write_super_block(&disk, &sb);
+        let (_, ok) = verify_staged(&disk);
+        assert!(ok, "the S06 3.4 SB_CHKSUM set step must make the record verify");
+
+        // The raw channel: the template's zero checksum goes to disk
+        // untouched and fails the production verify.
+        write_super_block_raw(&disk, &SB_TEMPLATE);
+        let (csum, ok) = verify_staged(&disk);
+        assert_eq!(csum, 0);
+        assert!(!ok, "raw staging must NOT verify (the V5 skip channel)");
+    }
+
+    /// The layout writers stage at the formula offsets:
+    /// `write_inode_at` lands the record at the production `iloc`
+    /// (meta 1, blkszbits 12, so nid 2 → 4096 + 64);
+    /// `write_dirents` lays the dirent array at the chassis block
+    /// base with the name area right behind it; `write_meta_bytes`
+    /// addresses block + byte offset.
+    #[ktest]
+    fn layout_writers_stage_at_formula_offsets() {
+        let disk = ErofsMemoryDisk::new(8 * PAGE_SIZE);
+
+        // Chassis-style superblock: the template patched to
+        // meta_blkaddr = 1 (S06 3.2), staged through the recompute
+        // writer so the record is mount-shaped.
+        let mut sb = SB_TEMPLATE;
+        put_le_u32(&mut sb, offset_of!(RawSuperBlock, meta_blkaddr), 1);
+        write_super_block(&disk, &sb);
+        let staged = staged_super_block(&disk);
+        assert_eq!(staged.meta_blkaddr, 1);
+        assert_eq!(staged.blkszbits, SUPPORTED_BLKSZBITS);
+
+        // Inode: iloc via the production formula over the staged sb.
+        write_inode_at(&disk, 2, &INODE_EXT_TEMPLATE);
+        let iloc = inode_location(&staged, 2) as usize;
+        assert_eq!(iloc, CHASSIS_BLOCK_SIZE + (2usize << ISLOT_BITS));
+        let mut inode_back = [0u8; 64];
+        disk.segment().read_bytes(iloc, &mut inode_back).unwrap();
+        assert_eq!(inode_back, INODE_EXT_TEMPLATE);
+
+        // Dirents: entries at the block base, names right after
+        // (first-nameoff contract: entries.len()).
+        let mut entries = DIRENT_TEMPLATE.to_vec();
+        entries.extend_from_slice(&DIRENT_TEMPLATE);
+        write_dirents(&disk, 4, &entries, b"names!");
+        let base = 4 * CHASSIS_BLOCK_SIZE;
+        let mut entries_back = [0u8; 24];
+        disk.segment().read_bytes(base, &mut entries_back).unwrap();
+        assert_eq!(&entries_back[..12], &DIRENT_TEMPLATE);
+        let mut names_back = [0u8; 6];
+        disk.segment().read_bytes(base + 24, &mut names_back).unwrap();
+        assert_eq!(&names_back, b"names!");
+
+        // Meta bytes: block + offset addressing (the prefix-record
+        // reference family is the S13 consumer).
+        write_meta_bytes(&disk, 8, 16, &XATTR_PREFIX_RECORD_REF);
+        let mut prefix_back = [0u8; 18];
+        disk.segment()
+            .read_bytes(8 * CHASSIS_BLOCK_SIZE + 16, &mut prefix_back)
+            .unwrap();
+        assert_eq!(prefix_back, XATTR_PREFIX_RECORD_REF);
+    }
+
+    /// The G-M10 truncation channel: the declared size shrinks to
+    /// the override while the physical allocation stays whole pages —
+    /// `metadata().nr_sectors` and `size_bytes()` report 6 sectors
+    /// (3072 bytes), staging still reaches the full page beyond the
+    /// declared end. The mount-time assertion values of the
+    /// truncated-image forms belong to S14 (registered drift); this
+    /// smoke pins the mechanism only.
+    #[ktest]
+    fn memory_disk_truncated_declares_shrunk_sectors() {
+        let disk = Arc::new(ErofsMemoryDisk::truncated(PAGE_SIZE, 6));
+        let dev: Arc<dyn BlockDevice> = disk.clone();
+        assert_eq!(dev.metadata().nr_sectors, 6);
+        assert_eq!(disk.size_bytes(), 6 * SECTOR_SIZE);
+
+        // The physical page beyond the declared end is still
+        // stageable and readable through the segment.
+        disk.stage_bytes(6 * SECTOR_SIZE, &[0xAA, 0xBB]);
+        let mut back = [0u8; 2];
+        disk.segment()
+            .read_bytes(6 * SECTOR_SIZE, &mut back)
+            .unwrap();
+        assert_eq!(back, [0xAA, 0xBB]);
     }
 }
