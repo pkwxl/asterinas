@@ -1272,17 +1272,18 @@ impl DataLayout {
 // transcribed as the module-private host — no framework-wide host
 // exists: `InodeType` carries its own local `TYPE_MASK`, and its
 // `from_raw_mode` is the rejected precedent documented on `FileKind`).
-// S_IFMT/S_IFREG/S_IFLNK additionally carry `pub(in …erofs)` for the
-// cfg(ktest) fixture face (the T-027 FX mode patches in test_utils.rs reach
+// S_IFMT/S_IFREG/S_IFLNK/S_IFIFO additionally carry `pub(in …erofs)` for
+// the cfg(ktest) fixture face (the T-027 FX mode patches in test_utils.rs reach
 // them as `inode::{S_IFMT, …}` through this declaration visibility alone).
 // AUTO-DECISION: no re-export `use` here — a `use self::{S_IFMT, …}`
 // would collide with these very declarations (E0255, the S04 first-run
 // lesson); and only the names with consumers today carry the widened
 // visibility (S_IFMT/S_IFREG since T-027 S04, S_IFLNK with the S06 FX-NAME
-// symlink-target builder), later FX slices widen more as their consumers
+// symlink-target builder, S_IFIFO with the S08 FX-INODE FIFO×CHUNK
+// acceptance-cross builder), later FX slices widen more as their consumers
 // land. The rest stay private.
 pub(in crate::fs::fs_impls::erofs) const S_IFMT: u16 = 0o170000;
-const S_IFIFO: u16 = 0o010000;
+pub(in crate::fs::fs_impls::erofs) const S_IFIFO: u16 = 0o010000;
 const S_IFCHR: u16 = 0o020000;
 const S_IFDIR: u16 = 0o040000;
 const S_IFBLK: u16 = 0o060000;
@@ -2085,9 +2086,12 @@ mod tests {
     use super::*;
     use crate::{
         fs::fs_impls::erofs::test_utils::{
-            BioRequest, ErofsMemoryDisk, fx_time_compact_ctime, fx_time_giant_nsec,
-            fx_time_giant_seconds, ktest_bio_trio, ktest_flat_geometry, ktest_fs_on,
-            ktest_single_device_table, ktest_super_block,
+            BioRequest, ErofsMemoryDisk, RD1_CROSS_BLOCK_NID, RD1_EXACT_BOUNDARY_NID,
+            assert_errno, fx_inode_bogus_mode, fx_inode_chunk_format, fx_inode_cross_block_slot,
+            fx_inode_datalayout_reserved, fx_inode_exact_boundary_slot, fx_inode_ifmt_high_bits,
+            fx_inode_kind_layout_cross, fx_inode_negative_size, fx_time_compact_ctime,
+            fx_time_giant_nsec, fx_time_giant_seconds, ktest_bio_trio, ktest_flat_geometry,
+            ktest_fs_on, ktest_single_device_table, ktest_super_block,
         },
         vm::page_cache::BlockAsPageCacheBackend,
     };
@@ -2802,5 +2806,161 @@ mod tests {
         assert_eq!(metadata.last_access_at, metadata.last_meta_change_at);
         assert_eq!(metadata.last_modify_at, metadata.last_meta_change_at);
         assert_eq!(metadata.last_meta_change_at.as_secs() as i64, i64::MIN);
+    }
+
+    // ------------------------------------------------------------------
+    // T-027 S08: the FX-INODE suite (S06 §5.2; matrix §3.1 rows — the
+    // decode guard family, the extended cross-block splice D4a, the
+    // kind × datalayout acceptance crosses). Every form mounts Ok (no
+    // mount gate reads a child slot); the guard forms fire at `iget`
+    // and are asserted through `assert_errno!`, the accept forms
+    // through the decoded descriptor and the assembled payload.
+    // ------------------------------------------------------------------
+
+    /// Row 1 (I3): `i_format` bits above `I_ALL` — EOPNOTSUPP at the
+    /// entry's one-shot validation, the decode's first door. I3 and
+    /// I4 share the errno, so the ISOLATED pattern (high bits only,
+    /// the version/datalayout nibble untouched) is what makes this
+    /// form pin I3 specifically.
+    #[ktest]
+    fn ifmt_high_bits_rejects_with_eopnotsupp() {
+        let fixture = fx_inode_ifmt_high_bits();
+        let fs = fixture.mounted();
+        assert_errno!(fs.iget(2), Errno::EOPNOTSUPP);
+    }
+
+    /// Row 2 (I4): the reserved datalayout (the production sentinel
+    /// value 5, the first of 5..=7) — EOPNOTSUPP strictly after I3's
+    /// mask check passed.
+    #[ktest]
+    fn reserved_datalayout_rejects_with_eopnotsupp() {
+        let fixture = fx_inode_datalayout_reserved();
+        let fs = fixture.mounted();
+        assert_errno!(fs.iget(2), Errno::EOPNOTSUPP);
+    }
+
+    /// Row 3 (I7): a negative extended `i_size` (the le64 high bit) —
+    /// EUCLEAN. The compact form is structurally non-negative (le32
+    /// domain); no compact twin exists (G7 — the unreachable guard is
+    /// not fabricated), so the extended child is the row's whole
+    /// face.
+    #[ktest]
+    fn negative_i_size_rejects_with_euclean() {
+        let fixture = fx_inode_negative_size();
+        let fs = fixture.mounted();
+        assert_errno!(fs.iget(2), Errno::EUCLEAN);
+    }
+
+    /// Row 4 (I8): bogus i_mode — both corners of the row in one
+    /// image. The all-zero word is the row's MUST-TEST corner: a
+    /// `0 → File` special case (the framework `from_raw_mode`
+    /// precedent this decode rejects) would swallow exactly this
+    /// form; 0x3000 is a plain outside-the-seven-kinds S_IFMT
+    /// segment. Both EUCLEAN, ahead of any payload assembly.
+    #[ktest]
+    fn bogus_i_mode_rejects_with_euclean_both_corners() {
+        let fixture = fx_inode_bogus_mode();
+        let fs = fixture.mounted();
+        assert_errno!(fs.iget(2), Errno::EUCLEAN);
+        assert_errno!(fs.iget(4), Errno::EUCLEAN);
+    }
+
+    /// Row 5 (I10/G5): the chunk-format door — an unknown bit
+    /// (outside `CHUNK_FORMAT_ALL`) rejects EOPNOTSUPP before the
+    /// `Chunked` materialization, while the INDEXES variant (a known
+    /// bit) is ACCEPTED: the addr state materializes Chunked carrying
+    /// the format word verbatim, and the chunk bits stay the plain
+    /// `sb.blkszbits + 0` (G5 — the 5-bit blkbits domain has no
+    /// upper-bound check; the INDEXES flag is a legal unit switch).
+    #[ktest]
+    fn chunk_format_unknown_bit_rejects_indexes_variant_accepted() {
+        let fixture = fx_inode_chunk_format();
+        let fs = fixture.mounted();
+        assert_errno!(fs.iget(2), Errno::EOPNOTSUPP);
+
+        let chunked = fs.iget(4).unwrap();
+        assert_eq!(chunked.kind(), FileKind::Dir);
+        match &chunked.desc().addr_state {
+            AddrState::Chunked { format, bits } => {
+                assert_eq!(*format, CHUNK_FORMAT_INDEXES);
+                assert_eq!(*bits, u32::from(fs.super_block().blkszbits));
+            }
+            other => panic!("the INDEXES variant must materialize Chunked, got {other:?}"),
+        }
+    }
+
+    /// Row 9 (组合照收): the pathological kind × datalayout crosses
+    /// are consumed AS-IS — DIR × CHUNK assembles a DataBacked payload
+    /// over the chunk geometry, FIFO × CHUNK (INDEXES) assembles the
+    /// Fifo payload untouched by the layout — and the I10 door stays
+    /// reachable on the cross cell (FIFO × CHUNK + an unknown bit →
+    /// EOPNOTSUPP: the D9 cross-cut never sits inside a kind branch).
+    #[ktest]
+    fn dir_chunk_and_fifo_chunk_cross_products_accepted() {
+        let fixture = fx_inode_kind_layout_cross();
+        let fs = fixture.mounted();
+
+        let dir_chunked = fs.iget(2).unwrap();
+        assert_eq!(dir_chunked.kind(), FileKind::Dir);
+        assert!(matches!(
+            dir_chunked.desc().addr_state,
+            AddrState::Chunked { .. }
+        ));
+        assert!(matches!(
+            dir_chunked.payload,
+            InodePayload::DataBacked { .. }
+        ));
+
+        let fifo_chunked = fs.iget(4).unwrap();
+        assert_eq!(fifo_chunked.kind(), FileKind::Fifo);
+        assert!(matches!(fifo_chunked.payload, InodePayload::Fifo { .. }));
+
+        assert_errno!(fs.iget(6), Errno::EOPNOTSUPP);
+    }
+
+    /// Row 6, cross-block leg (D4a/RD1): the nid 127 record spans
+    /// [8160, 8224) — block 1's last slot spliced with block 2's
+    /// first. The single-point read (RD0) decodes the record whole:
+    /// every staged field survives byte-exact, including one witness
+    /// from EACH 32-byte half (i_size @8 in the first, i_mtime @32 in
+    /// the second — the half a mis-spliced read would corrupt).
+    #[ktest]
+    fn cross_block_slot_splice_decodes_record() {
+        let fixture = fx_inode_cross_block_slot();
+        let fs = fixture.mounted();
+
+        let inode = fs.iget(RD1_CROSS_BLOCK_NID).unwrap();
+        assert_eq!(inode.kind(), FileKind::Reg);
+        assert_eq!(inode.desc().size, 100, "the first-half witness");
+        let metadata = inode.metadata();
+        assert_eq!(
+            metadata.last_modify_at,
+            Duration::new(1_700_000_000, 0),
+            "the second-half witness (offset 32, inside the spliced half)"
+        );
+        // D10: the three times stay one source.
+        assert_eq!(metadata.last_access_at, metadata.last_modify_at);
+        assert_eq!(metadata.last_meta_change_at, metadata.last_modify_at);
+    }
+
+    /// Row 6, exact-boundary leg: the nid 126 record ends EXACTLY at
+    /// the block boundary (4032 + 64 = 4096) — not a cross-block read
+    /// (the §1.6 label row's "ofs=4032" reading, corrected by T-011
+    /// RD1; this fixture is the disproof). The single-form read
+    /// treats both slots identically: iget Ok, with this record's OWN
+    /// witnesses decoded (size 200 / mtime 1.6e9, distinct from the
+    /// cross leg's pair — a cross-wired slot read would fail here).
+    #[ktest]
+    fn exact_boundary_slot_decodes_whole_record() {
+        let fixture = fx_inode_exact_boundary_slot();
+        let fs = fixture.mounted();
+
+        let inode = fs.iget(RD1_EXACT_BOUNDARY_NID).unwrap();
+        assert_eq!(inode.kind(), FileKind::Reg);
+        assert_eq!(inode.desc().size, 200);
+        assert_eq!(
+            inode.metadata().last_modify_at,
+            Duration::new(1_600_000_000, 0)
+        );
     }
 }

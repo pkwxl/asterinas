@@ -99,6 +99,17 @@
 //!   variant of S06 §3.2 lands with the third form
 //!   (`lay_compact_root`).
 //!
+//! * **T-027 S08, the FX-INODE builder family**: eight named
+//!   constructors (`fx_inode_*`) laying crafted CHILD inode records
+//!   per S06 §5.2 (this slice = rows 1–6 and 9: the I3/I4/I7/I8/I10
+//!   decode guards, the RD1 slot pair at nid 127/126 — cross-block
+//!   splice vs exact-boundary corner, both over healthy records —
+//!   and the DIR×CHUNK / FIFO×CHUNK acceptance crosses; the
+//!   data-defense rows 7/8/11 are S09's, the compressed-special
+//!   row 10 is S10/S11's). No mount gate reads a child slot, so
+//!   every form mounts Ok and the guards fire at `iget`; the
+//!   assertion suite lives in `inode/mod.rs` (the D1 host rule).
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -130,9 +141,10 @@ use super::{
     Erofs,
     fs::DeviceTable,
     inode::{
-        AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, I_DATALAYOUT_BIT,
-        I_VERSION_BIT, ISLOT_BITS, InodeDesc, InodeVersion, RawDirent, RawInodeCompact,
-        RawInodeExtended, S_IFLNK, S_IFMT, S_IFREG, inode_location,
+        AddrState, CHUNK_FORMAT_ALL, CHUNK_FORMAT_INDEXES, ChunkGeometry, DataGeometry,
+        DataLayout, FileKind, I_ALL, I_DATALAYOUT_BIT, I_VERSION_BIT, INODE_DATALAYOUT_MAX,
+        ISLOT_BITS, InodeDesc, InodeVersion, RawDirent, RawInodeCompact, RawInodeExtended,
+        S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, inode_location,
     },
     prelude::*,
     super_block::{
@@ -2121,6 +2133,265 @@ pub(super) fn fx_time_compact_ctime() -> ErofsFixture {
         let mut sb = staged_super_block_record(disk);
         put_le_u64(&mut sb, offset_of!(RawSuperBlock, build_time), 1u64 << 63);
         write_super_block(disk, &sb);
+    })
+}
+
+// ===========================================================================
+// T-027 S08: the FX-INODE builder family (S06 §5.2; matrix §1.6 label
+// row IMG-CRAFT-INODE serving the §3.1 rows — the decode guard family,
+// the extended cross-block splice D4a, and the kind × datalayout
+// acceptance crosses). Eight named constructors laying crafted CHILD
+// inode records: no mount gate reads a child slot, so every form
+// mounts Ok and the guards fire at `iget` — the S06 §4.3 "mount-Ok
+// forms ... do iget/lookup follow-up assertions" spelling; the suite
+// lives in `inode/mod.rs` (the D1 host rule). This slice lands the
+// §5.2 rows 1–6 and 9; the data-defense rows (exact-boundary
+// full-block inline, cross-block slow LNK, the giant-i_size truncation
+// angle — rows 7/8/11) are S09's and the compressed-special row 10 is
+// S10/S11's.
+//
+// AUTO-DECISION: the RD1 slot pair lands as TWO fixtures — nid 127's
+// 64-byte record spans slots 127+128 ([8160, 8224), its second half
+// in block 2) while nid 126's spans slots 126+127 ([8128, 8192),
+// ending exactly at the boundary), so the two records OVERLAP on
+// slot 127 and structurally cannot share one image; §5.2's 「两槽都
+// 造」 is thus one builder per slot. Rejected: one image carrying
+// both records (slot collision); a nid-127-only family (the boundary
+// corner is RD1's own correction — the §1.6 label row's "ofs=4032"
+// misreading is exactly what the nid 126 form disproves).
+//
+// AUTO-DECISION: the RD1 records are REG × FLAT_PLAIN children with
+// distinctive `i_size` (offset 8, inside the record's first 32-byte
+// half) and `i_mtime` seconds (offset 32, inside the second half)
+// values — a zero-content data block is legal regular-file content,
+// so the carrier stays inside the healthy-mkfs-producible form, and a
+// witness in EACH half pins the splice's byte fidelity (a misaligned
+// or re-based read would decode the second-half mtime wrong).
+// Rejected: the empty-directory child (the `lay_empty_dir_at` shape,
+// size 0 — a zero-filled slot would decode identically, weakening
+// the pin to a tautology).
+//
+// AUTO-DECISION: the I3 pattern is derived from the guard's own mask
+// (`!I_ALL & 0x00FF` = bits 4–7), not §5.2's verbatim 0xF0F example —
+// the example's low nibble corrupts the version/datalayout bits too,
+// tripping I3 AND I4 with the same shared errno (both EOPNOTSUPP) and
+// muddying which door the form pins; the derived pattern keeps the
+// seed's low nibble so I3 is the only door that fires. Rejected:
+// spelling 0x0F0F (a same-errno double trip adds no distinguishable
+// face — unlike the FX-SB V5+V6 cross, whose two errnos differ).
+// ===========================================================================
+
+/// Lays the extended seed as a child record at `nid`, with `patch`
+/// applied — the FX-INODE staging face: the seed carries every
+/// healthy field, the patch rewrites exactly the fields its form
+/// names (the `patch_root_inode` read-patch-restage discipline,
+/// applied to a freshly-laid record instead of the staged root).
+fn lay_extended_child_at(disk: &ErofsMemoryDisk, nid: u64, patch: impl FnOnce(&mut [u8; 64])) {
+    let mut record = INODE_EXT_TEMPLATE;
+    patch(&mut record);
+    write_inode_at(disk, nid, &record);
+}
+
+/// The RD1 slot pair (S06 §5.2 / T-011 §5.1), derived from the
+/// chassis geometry through the slot arithmetic — never spelled as
+/// bare nids. A 4k block holds 128 slots; the unique cross-block
+/// record starts at the block's LAST slot (nid ≡ 127 mod 128, offset
+/// bs − 32 = 4064: the 64-byte read crosses into block 2), and the
+/// exact-boundary corner one slot earlier (nid ≡ 126, offset 4032:
+/// 4032 + 64 = 4096 ends AT the boundary, no crossing).
+pub(super) const RD1_CROSS_BLOCK_NID: u64 = (CHASSIS_BLOCK_SIZE >> ISLOT_BITS) as u64 - 1;
+/// The exact-boundary companion slot of [`RD1_CROSS_BLOCK_NID`] — the
+/// corner the T-011 RD1 correction rescued from the §1.6 label row's
+/// "ofs=4032" cross-block misreading.
+pub(super) const RD1_EXACT_BOUNDARY_NID: u64 = (CHASSIS_BLOCK_SIZE >> ISLOT_BITS) as u64 - 2;
+
+/// The lowest chunk-format bit outside `CHUNK_FORMAT_ALL` (0x3F →
+/// 0x40), derived from the production mask — the same shape as
+/// `unknown_incompat_bit` above, feeding the I10 forms.
+fn unknown_chunk_format_bit() -> u16 {
+    CHUNK_FORMAT_ALL.next_power_of_two()
+}
+
+/// Switches an extended seed record into a CHUNK_BASED child carrying
+/// `chunkformat` in the low half of `i_u` (the D9 second reading),
+/// optionally switching the S_IFMT type segment — the staging face
+/// shared by the row 5 chunk-format family and the row 9 acceptance
+/// crosses.
+fn patch_chunk_child(record: &mut [u8; 64], chunkformat: u16, type_segment: Option<u16>) {
+    put_le_u16(
+        record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::ChunkBased),
+    );
+    if let Some(segment) = type_segment {
+        let mode_off = offset_of!(RawInodeExtended, i_mode);
+        let mode = get_le_u16(record, mode_off);
+        put_le_u16(record, mode_off, (mode & !S_IFMT) | segment);
+    }
+    put_le_u32(
+        record,
+        offset_of!(RawInodeExtended, i_u),
+        u32::from(chunkformat),
+    );
+}
+
+/// Switches an extended seed record into the healthy REG × FLAT_PLAIN
+/// child the RD1 fixtures decode: datalayout FLAT_PLAIN over a free
+/// data block (all-zero content — legal regular-file bytes), type REG
+/// keeping the seed's permission bits, and the two splice witnesses —
+/// `size` (offset 8, first 32-byte half) and `mtime` seconds
+/// (offset 32, second half).
+fn patch_rd1_reg_record(record: &mut [u8; 64], size: u64, mtime_secs: u64) {
+    put_le_u16(
+        record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
+    );
+    let mode_off = offset_of!(RawInodeExtended, i_mode);
+    let mode = get_le_u16(record, mode_off);
+    put_le_u16(record, mode_off, (mode & !S_IFMT) | S_IFREG);
+    put_le_u64(record, offset_of!(RawInodeExtended, i_size), size);
+    // Block 9: behind the meta area and the root data block — a free
+    // chassis block (never read at iget; the address just has to be
+    // in-device legal).
+    put_le_u32(record, offset_of!(RawInodeExtended, i_u), 9);
+    put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
+    put_le_u64(record, offset_of!(RawInodeExtended, i_mtime), mtime_secs);
+}
+
+/// Row 1 (I3) — i_format high bits: bits 4–7 above `I_ALL`, the
+/// version/datalayout nibble untouched (the section note: the derived
+/// isolated pattern, not §5.2's 0xF0F). Expected EOPNOTSUPP at the
+/// entry's one-shot validation (matrix §3.1 guard row) — the 2-byte
+/// pre-read is the form's whole read set.
+pub(super) fn fx_inode_ifmt_high_bits() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            let off = offset_of!(RawInodeExtended, i_format);
+            let ifmt = get_le_u16(record, off);
+            put_le_u16(record, off, ifmt | (!I_ALL & 0x00FF));
+        });
+    })
+}
+
+/// Row 2 (I4) — a reserved datalayout: the discriminant set to
+/// `INODE_DATALAYOUT_MAX` (5, the first reserved value, derived from
+/// the production sentinel the guard compares against; the version
+/// bit stays extended). Expected EOPNOTSUPP, strictly after I3's
+/// mask check passed.
+pub(super) fn fx_inode_datalayout_reserved() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            put_le_u16(
+                record,
+                offset_of!(RawInodeExtended, i_format),
+                ((INODE_DATALAYOUT_MAX as u16) << I_DATALAYOUT_BIT)
+                    | ((InodeVersion::Extended as u16) << I_VERSION_BIT),
+            );
+        });
+    })
+}
+
+/// Row 3 (I7) — a negative i_size: the le64 domain's high bit set
+/// (`1 << 63`, the ≥ 2^63 domain), extended-only reachable — the
+/// compact le32 domain is structurally non-negative, so no compact
+/// twin is built (G7: the unreachable guard is not fabricated).
+/// Expected EUCLEAN.
+pub(super) fn fx_inode_negative_size() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            put_le_u64(record, offset_of!(RawInodeExtended, i_size), 1u64 << 63);
+        });
+    })
+}
+
+/// Row 4 (I8) — bogus i_mode, both spelled corners in one image: nid 2
+/// carries 0x0000 (the all-zero word — the matrix row's must-test
+/// corner: a `0 → File` special-case misjudgement would swallow
+/// exactly this form) and nid 4 carries 0x3000 (an S_IFMT segment
+/// outside the seven kinds). Every other seed field stays healthy.
+/// Both igets expected EUCLEAN — the guard fires before any payload
+/// assembly (the one-image precedent: the d_type 8/255 form).
+pub(super) fn fx_inode_bogus_mode() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            put_le_u16(record, offset_of!(RawInodeExtended, i_mode), 0x0000);
+        });
+        lay_extended_child_at(disk, 4, |record| {
+            put_le_u16(record, offset_of!(RawInodeExtended, i_mode), 0x3000);
+        });
+    })
+}
+
+/// Row 5 (I10 / G5) — the chunk-format family on DIR × CHUNK records,
+/// both halves in one image: nid 2 carries an unknown chunk-format
+/// bit (derived: strictly above `CHUNK_FORMAT_ALL`, hence outside it)
+/// — expected EOPNOTSUPP at the I10 guard, before the `Chunked`
+/// materialization; nid 4 carries the INDEXES variant (a known bit) —
+/// expected iget Ok, the G5 acceptance face: the 5-bit blkbits domain
+/// carries with no upper-bound check, and the INDEXES flag is a legal
+/// chunk-unit switch.
+pub(super) fn fx_inode_chunk_format() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            patch_chunk_child(record, unknown_chunk_format_bit(), None);
+        });
+        lay_extended_child_at(disk, 4, |record| {
+            patch_chunk_child(record, CHUNK_FORMAT_INDEXES, None);
+        });
+    })
+}
+
+/// Row 6, cross-block leg (D4a / RD1) — a healthy REG × FLAT_PLAIN
+/// record at nid 127: the 64-byte read spans [8160, 8224), splicing
+/// block 1's last slot with block 2's first (aster's single-point
+/// read, RD0 — no boundary test, no two-segment splice). Expected
+/// iget Ok with every staged field decoded byte-exact: the two
+/// half-witnesses (i_size @8 / i_mtime @32) pin the splice fidelity
+/// (matrix §3.1 D4a row: 拼接解码成功).
+pub(super) fn fx_inode_cross_block_slot() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, RD1_CROSS_BLOCK_NID, |record| {
+            patch_rd1_reg_record(record, 100, 1_700_000_000);
+        });
+    })
+}
+
+/// Row 6, exact-boundary leg — the same healthy record at nid 126:
+/// [8128, 8192) ends exactly at the block boundary (4032 + 64 = 4096),
+/// NOT a cross-block read (the §1.6 label row's "ofs=4032" reading,
+/// corrected by T-011 RD1 — the corner this fixture disproves).
+/// Expected iget Ok with identical treatment (the single-form read
+/// knows no block boundaries); its own witness pair (size 200 /
+/// mtime 1.6e9, distinct from the cross leg's) proves the read
+/// fetched THIS record, not a neighbor's bytes.
+pub(super) fn fx_inode_exact_boundary_slot() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, RD1_EXACT_BOUNDARY_NID, |record| {
+            patch_rd1_reg_record(record, 200, 1_600_000_000);
+        });
+    })
+}
+
+/// Row 9 (组合照收) — the kind × datalayout acceptance crosses, three
+/// children in one image: nid 2 DIR × CHUNK with a plain chunk format
+/// (blkbits 0, the 4-byte block-map variant) and nid 4 FIFO × CHUNK
+/// with the INDEXES variant — both ACCEPTED as-is (the D9 cross-cut
+/// never sits inside a kind branch; the payloads land DataBacked over
+/// the chunk geometry and Fifo respectively) — plus nid 6 FIFO ×
+/// CHUNK with an unknown chunk bit: the I10 door stays reachable on
+/// the cross cell too (matrix §3.1 组合照收行), expected EOPNOTSUPP.
+pub(super) fn fx_inode_kind_layout_cross() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_extended_child_at(disk, 2, |record| {
+            patch_chunk_child(record, 0, None);
+        });
+        lay_extended_child_at(disk, 4, |record| {
+            patch_chunk_child(record, CHUNK_FORMAT_INDEXES, Some(S_IFIFO));
+        });
+        lay_extended_child_at(disk, 6, |record| {
+            patch_chunk_child(record, unknown_chunk_format_bit(), Some(S_IFIFO));
+        });
     })
 }
 
