@@ -1549,12 +1549,16 @@ mod tests {
         let leg = |name: &str, fixture: ErofsFixture, bit: u32| {
             let fs = fixture.mounted();
             assert_eq!(
-                fs.super_block().feature_incompat, bit,
+                fs.super_block().feature_incompat,
+                bit,
                 "{name}: exactly the one bit landed"
             );
             let root = fs.root_inode().unwrap();
             let dot = root.lookup(".").unwrap();
-            assert!(Arc::ptr_eq(&dot, &root), "{name}: behavior same as bit clear");
+            assert!(
+                Arc::ptr_eq(&dot, &root),
+                "{name}: behavior same as bit clear"
+            );
         };
         leg(
             "ZERO_PADDING 0x1",

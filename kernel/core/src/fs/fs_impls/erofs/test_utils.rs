@@ -118,10 +118,10 @@
 //!   pass corner), and the cross-block slot's slow symlink (nid 127,
 //!   one byte past the fast-criterion boundary: the map layer says
 //!   EUCLEAN, the registered VmIo-boundary drift exits EINVAL).
-//! These forms mount Ok AND iget Ok — the defenses fire on the
-//! read path; the suites live in `inode/data.rs` and
-//! `inode/symlink.rs` (the D1 host rule), the first FX suites to
-//! drive the full mounted chain through the read API.
+//!   These forms mount Ok AND iget Ok — the defenses fire on the
+//!   read path; the suites live in `inode/data.rs` and
+//!   `inode/symlink.rs` (the D1 host rule), the first FX suites to
+//!   drive the full mounted chain through the read API.
 //!
 //! * **T-027 S10, the FX-COMP mount-half family + the algs=0 comp
 //!   chassis**: seven named constructors (`fx_comp_*`) per S06 §5.7 —
