@@ -118,10 +118,23 @@
 //!   pass corner), and the cross-block slot's slow symlink (nid 127,
 //!   one byte past the fast-criterion boundary: the map layer says
 //!   EUCLEAN, the registered VmIo-boundary drift exits EINVAL).
-//!   These forms mount Ok AND iget Ok — the defenses fire on the
-//!   read path; the suites live in `inode/data.rs` and
-//!   `inode/symlink.rs` (the D1 host rule), the first FX suites to
-//!   drive the full mounted chain through the read API.
+//! These forms mount Ok AND iget Ok — the defenses fire on the
+//! read path; the suites live in `inode/data.rs` and
+//! `inode/symlink.rs` (the D1 host rule), the first FX suites to
+//! drive the full mounted chain through the read API.
+//!
+//! * **T-027 S10, the FX-COMP mount-half family + the algs=0 comp
+//!   chassis**: seven named constructors (`fx_comp_*`) per S06 §5.7 —
+//!   the u1≠0 over-rejection and unknown-algs forms (the V9 door,
+//!   rows 1/3), and the algs=0 `comp_chassis` single source with
+//!   COMPR_CFGS and each of the four other known compression incompat
+//!   bits set one at a time (rows 2/8, the G-Z03 parsed-but-ignored
+//!   acceptance face; the 0x2 leg IS the row-2 chassis — dual
+//!   consumption). Row 6 (fragments + packed compressed payload) has
+//!   no builder here: it is the S04 G-M15 material, re-asserted by
+//!   the `fs.rs` suite under the §5.1⑤ label (共同约束 10: 素材落
+//!   S04, 断言 S10 复用). The iget half (rows 4/5/7) is S11's, over
+//!   the same chassis.
 //!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
@@ -2557,6 +2570,149 @@ pub(super) fn fx_inode_cross_block_slow_symlink() -> ErofsFixture {
             put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
         });
     })
+}
+
+// ===========================================================================
+// T-027 S10: the FX-COMP mount-half family and the algs=0 comp chassis
+// (S06 §5.7; matrix §1.6 label row IMG-CRAFT-COMP serving the §5.1 rows
+// ②③④⑤ and the §5.3 per-bit row). This slice = the MOUNT half: the u1
+// door forms (rows 1/3, the V9 rejection), the algs=0 chassis with
+// COMPR_CFGS / each known compression incompat bit set one at a time
+// (rows 2/8, the G-Z03 parsed-but-ignored acceptance face), and row 6
+// (fragments + packed compressed) consumed as the S04 G-M15 material's
+// second assertion face — no builder of its own (共同约束 10: 素材落
+// S04, 断言 S10 复用). The iget half (rows 4/5/7: compressed-datalayout
+// inodes, the compressed-special accounting, the dual-malformed mount-Ok
+// form) is S11's, over the same chassis. The suite lives in `fs.rs`
+// (the D1 host rule — the V9 door and the Step-4/5 doors are
+// `read_superblock`/`Erofs::open` business).
+//
+// AUTO-DECISION: the algs=0 comp chassis — the "comp 畸形底盘单源" of
+// the S10/S11 split — lands as ONE parameterized private constructor,
+// `comp_chassis(bits, rewrite)`: healthy chassis (u1 already 0), the
+// per-form `rewrite`, then `bits` ORed into feature_incompat as the
+// LAST staging step so the checksummed finish covers the final record
+// (the fx_sb_packed_compressed_payload ordering: inodes first,
+// superblock last). The cfg area COMPR_CFGS nominally announces is NOT
+// staged — aster's layer 2 is shelved (tier A, G-Z01): no cfg reader
+// exists, per §5.7②'s own "cfg 区不铺". Rejected: per-form open-coded
+// superblock patches (the single source would dissolve into copy-paste
+// across S10/S11); a chainable fixture (D5 already rejected chains).
+//
+// AUTO-DECISION: the §5.3 per-bit row lands as FOUR new constructors
+// plus the row-2 chassis leg — the 0x2 form IS the algs=0+COMPR_CFGS
+// chassis (u1=0 ∧ incompat=0x2, byte-identical), so one constructor
+// carries both rows' assertion faces (the S06 FX-NAME dual-consumption
+// precedent: a form's builder lives in exactly one family; the second
+// consumption joins through the assertion face, in `fs.rs`). Rejected:
+// a fifth near-identical 0x2 constructor (two names over the same
+// bytes confuses the grep-able form list); collapsing the five legs
+// into one parameterized call site (D5: named constructors ARE the
+// form list). CHUNKED_FILE (0x4) has no leg — §5.3's own list is the
+// five compression-half bits only.
+//
+// AUTO-DECISION: the u1 forms (rows 1/3) patch the PLAIN healthy
+// chassis, not the comp chassis — their malformation is u1≠0 itself
+// (the V9 door), and the comp constructor's contract keeps u1 at 0;
+// routing them through it would fight the constructor's own invariant.
+// The two u1 values are §5.7's own spellings (0x0003/0x0010): aster
+// parses no algs bits — V9 is a plain u1≠0 test — so no production
+// constant exists to derive them from (the S04 extslots 184/185
+// precedent: values that ARE the form's identity get spelled).
+// ===========================================================================
+
+/// The algs=0 comp chassis — the single source of the FX-COMP forms
+/// (S06 §5.7's "algs=0 畸形底盘", the S10/S11 cross-consumption base):
+/// the healthy chassis (u1 already 0 = algs 0), the per-form
+/// `rewrite`, then `bits` ORed into feature_incompat as the last
+/// staging step through the checksummed writer. The COMPR_CFGS cfg
+/// area is not staged (tier A has no layer-2 reader, §5.7②'s own
+/// "cfg 区不铺"). S11's iget-half builders re-consume this
+/// constructor with their child-inode rewrites in `rewrite`.
+fn comp_chassis(bits: FeatureIncompatSet, rewrite: impl FnOnce(&ErofsMemoryDisk)) -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        rewrite(disk);
+        let mut sb = staged_super_block_record(disk);
+        let off = offset_of!(RawSuperBlock, feature_incompat);
+        let incompat = get_le_u32(&sb, off);
+        put_le_u32(&mut sb, off, incompat | bits.bits());
+        write_super_block(disk, &sb);
+    })
+}
+
+/// Row 1 (§5.1③) — u1 ≠ 0 with NO COMPR_CFGS bit: the plain chassis
+/// (incompat stays 0 — "不置 0x2" is the untouched chassis value) with
+/// u1 = 0x0003 (the LZ4|LZMA algs pair, §5.7's own spelling). Expected
+/// EOPNOTSUPP at the V9 door — the OVER-REJECTION face: the mainline
+/// stub is deliberately a plain u1≠0 test that does not consult
+/// COMPR_CFGS (G-Z03), and the matrix row pins it as-is ("过拒面断言,
+/// 主列既有取舍勿「修正」") — no tightening, no cross-check.
+pub(super) fn fx_comp_u1_without_cfgs() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        put_le_u16(&mut sb, offset_of!(RawSuperBlock, u1), 0x0003);
+        write_super_block(disk, &sb);
+    })
+}
+
+/// Row 3 (§5.1④) — algs carrying an unknown bit: u1 = 0x0010 (bit 4,
+/// above the four known algorithm bits LZ4/LZMA/DEFLATE/ZSTD; §5.7's
+/// own spelling). Expected EOPNOTSUPP — the same V9 door as row 1
+/// (both are u1≠0; layer 1 is errno-blind to WHICH bits are set — the
+/// algs domain is layer-2 business that tier A does not have). The
+/// distinct value keeps the form separately grep-able, not separately
+/// errno-ed.
+pub(super) fn fx_comp_algs_unknown_bit() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let mut sb = staged_super_block_record(disk);
+        put_le_u16(&mut sb, offset_of!(RawSuperBlock, u1), 0x0010);
+        write_super_block(disk, &sb);
+    })
+}
+
+/// Row 2 (§5.1②, mount half) — algs=0 with COMPR_CFGS set: the comp
+/// chassis with the one bit (u1 stays the chassis 0; the cfg area is
+/// not staged). Expected mount Ok: layer 1 passes (u1 == 0) and no cfg
+/// consumption exists — the G-M11 "COMPR_CFGS ∧ u1=0" counterpart
+/// synthesized on the crafted side (a healthy mkfs never produces it;
+/// the EROFS-COMP initramfs image carries u1≠0 and fails layer 1).
+/// The compressed-inode I12 rejection over this chassis is S11's.
+/// Dual service: this same image is the §5.3 per-bit row's 0x2 leg.
+pub(super) fn fx_comp_algs_zero_with_cfgs() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::COMPR_CFGS, |_| {})
+}
+
+/// Row 8 (§5.3), ZERO_PADDING leg (0x1) — the decompressor's
+/// zero-padding variant, a compression-domain bit with no tier-A
+/// consumer. Expected mount Ok: parsed into the feature set, never
+/// acted on (G-Z03).
+pub(super) fn fx_comp_incompat_zero_padding() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::ZERO_PADDING, |_| {})
+}
+
+/// Row 8 (§5.3), DEVICE_TABLE leg (0x8, alias COMPR_HEAD2) — the
+/// dual-name bit's compression half. The bit's DEVICE_TABLE behavior
+/// (the V10 scan reading `extra_devices`) is §2.2/G-M14 business; on
+/// the chassis (extra_devices = 0) the scan takes the single-device
+/// early return. This leg pins only the V6 acceptance: a known bit is
+/// not rejected as unknown. Expected mount Ok.
+pub(super) fn fx_comp_incompat_device_table() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::DEVICE_TABLE, |_| {})
+}
+
+/// Row 8 (§5.3), ZTAILPACKING leg (0x10) — a version gate with no
+/// other v6.12 consumer. Expected mount Ok (parsed but ignored).
+pub(super) fn fx_comp_incompat_ztailpacking() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::ZTAILPACKING, |_| {})
+}
+
+/// Row 8 (§5.3), FRAGMENTS leg (0x20, alias DEDUPE) — the dual-name
+/// bit's compression half. The FRAGMENTS behavior (the Step-4 F10
+/// packed door) is §2.2/G-M15 business; with the chassis packed_nid
+/// = 0 the door's second conjunct fails open and no iget runs. This
+/// leg pins only the V6 acceptance. Expected mount Ok.
+pub(super) fn fx_comp_incompat_fragments() -> ErofsFixture {
+    comp_chassis(FeatureIncompatSet::FRAGMENTS, |_| {})
 }
 
 // ===========================================================================

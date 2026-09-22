@@ -1233,12 +1233,14 @@ mod tests {
 
     use super::*;
     use crate::fs::fs_impls::erofs::test_utils::{
-        assert_errno, fx_sb_bad_checksum, fx_sb_bad_checksum_and_unknown_incompat, fx_sb_bad_magic,
-        fx_sb_blkszbits_above_supported, fx_sb_blkszbits_below_min, fx_sb_dirblkbits_nonzero,
-        fx_sb_extslots_at_page_boundary, fx_sb_extslots_past_page_boundary,
-        fx_sb_packed_compressed_payload, fx_sb_root_compressed, fx_sb_root_nid_out_of_device,
-        fx_sb_root_not_dir, fx_sb_unknown_incompat_bit, fx_sb_volume_name_without_nul,
-        healthy_fixture,
+        ErofsFixture, assert_errno, fx_comp_algs_unknown_bit, fx_comp_algs_zero_with_cfgs,
+        fx_comp_incompat_device_table, fx_comp_incompat_fragments, fx_comp_incompat_zero_padding,
+        fx_comp_incompat_ztailpacking, fx_comp_u1_without_cfgs, fx_sb_bad_checksum,
+        fx_sb_bad_checksum_and_unknown_incompat, fx_sb_bad_magic, fx_sb_blkszbits_above_supported,
+        fx_sb_blkszbits_below_min, fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
+        fx_sb_extslots_past_page_boundary, fx_sb_packed_compressed_payload, fx_sb_root_compressed,
+        fx_sb_root_nid_out_of_device, fx_sb_root_not_dir, fx_sb_unknown_incompat_bit,
+        fx_sb_volume_name_without_nul, healthy_fixture,
     };
 
     /// fold vectors (the design's §7 fold family). The all-zero
@@ -1485,6 +1487,120 @@ mod tests {
             fx_sb_packed_compressed_payload().open,
             Errno::EOPNOTSUPP,
             "G-M15: compressed packed payload (F10 -> I12)"
+        );
+    }
+
+    /// T-027 S10 (FX-COMP rows 1/3, matrix §5.1③④ — the layer-1
+    /// compression rejection): u1 ≠ 0 fails the mount EOPNOTSUPP at
+    /// the V9 door, both forms. Row ③ is the OVER-REJECTION face —
+    /// u1 = 0x0003 with NO COMPR_CFGS bit: the guard is deliberately
+    /// a plain u1≠0 test that does not consult the incompat bit
+    /// (G-Z03); asserted as-is, never "fixed". Row ④ is the
+    /// unknown-algs form (u1 = 0x0010, bit 4 above the four known
+    /// algorithm bits) — errno-indistinguishable from ③ at layer 1
+    /// by design: the algs domain is shelved layer-2 business.
+    #[ktest]
+    fn mount_rejects_nonzero_u1() {
+        assert_errno!(
+            fx_comp_u1_without_cfgs().open,
+            Errno::EOPNOTSUPP,
+            "V9 over-rejection: u1 != 0 without COMPR_CFGS (as-is)"
+        );
+        assert_errno!(
+            fx_comp_algs_unknown_bit().open,
+            Errno::EOPNOTSUPP,
+            "V9: algs bit 4 (0x0010), above the known-algs domain"
+        );
+    }
+
+    /// T-027 S10 (FX-COMP row 2 mount half, matrix §5.1② — the G-M11
+    /// "COMPR_CFGS ∧ u1=0" counterpart synthesized on the crafted
+    /// side): algs = 0 with COMPR_CFGS set mounts Ok — layer 1 passes
+    /// (u1 == 0) and the shelved layer 2 has no cfg reader (tier A;
+    /// the cfg area is not even staged). Beyond Ok: the mirror locks
+    /// algs 0 and exactly the one incompat bit (the literals are
+    /// deliberately independent of the staging constants — the S03
+    /// drift-alarm discipline). The compressed-inode I12 face over
+    /// this chassis is S11's.
+    #[ktest]
+    fn mount_accepts_algs_zero_with_compr_cfgs() {
+        let fs = fx_comp_algs_zero_with_cfgs().mounted();
+        assert_eq!(fs.super_block().u1, 0, "algs stays 0 (the chassis value)");
+        assert_eq!(
+            fs.super_block().feature_incompat,
+            FeatureIncompatSet::COMPR_CFGS.bits(),
+            "exactly the COMPR_CFGS bit landed"
+        );
+    }
+
+    /// T-027 S10 (FX-COMP row 8, matrix §5.3 — G-Z03 parsed-but-
+    /// ignored): the five known compression-half incompat bits, set
+    /// one at a time on the algs=0 chassis, each mount Ok with the
+    /// bit landing on the mirror and the behavior same as clear (the
+    /// dot walk resolving the same cached root identity — the minimal
+    /// such face). The 0x2 leg is the row-2 chassis itself (dual
+    /// consumption). The dual-name bits' BEHAVIORAL halves belong to
+    /// their §2.2 rows (0x8 → G-M14 flatdev, 0x20 → G-M15 packed
+    /// door); this suite pins only the V6 acceptance — "not rejected
+    /// as unknown", never a cross-check against u1 or inode layouts
+    /// (no tightening).
+    #[ktest]
+    fn mount_accepts_known_incompat_bits() {
+        let leg = |name: &str, fixture: ErofsFixture, bit: u32| {
+            let fs = fixture.mounted();
+            assert_eq!(
+                fs.super_block().feature_incompat, bit,
+                "{name}: exactly the one bit landed"
+            );
+            let root = fs.root_inode().unwrap();
+            let dot = root.lookup(".").unwrap();
+            assert!(Arc::ptr_eq(&dot, &root), "{name}: behavior same as bit clear");
+        };
+        leg(
+            "ZERO_PADDING 0x1",
+            fx_comp_incompat_zero_padding(),
+            FeatureIncompatSet::ZERO_PADDING.bits(),
+        );
+        leg(
+            "COMPR_CFGS 0x2 (the row-2 chassis leg)",
+            fx_comp_algs_zero_with_cfgs(),
+            FeatureIncompatSet::COMPR_CFGS.bits(),
+        );
+        leg(
+            "DEVICE_TABLE 0x8",
+            fx_comp_incompat_device_table(),
+            FeatureIncompatSet::DEVICE_TABLE.bits(),
+        );
+        leg(
+            "ZTAILPACKING 0x10",
+            fx_comp_incompat_ztailpacking(),
+            FeatureIncompatSet::ZTAILPACKING.bits(),
+        );
+        leg(
+            "FRAGMENTS 0x20",
+            fx_comp_incompat_fragments(),
+            FeatureIncompatSet::FRAGMENTS.bits(),
+        );
+    }
+
+    /// T-027 S10 (FX-COMP row 6, matrix §5.1⑤ — the FX-COMP half of
+    /// the S04 double consumption, the shared-constraint ruling "the
+    /// material is S04's, the assertion is S10's to reuse"): the same
+    /// G-M15 material (`fx_sb_packed_compressed_payload` — algs=0
+    /// chassis + FRAGMENTS + packed_nid addressing a compressed REG)
+    /// read through the compression rejection
+    /// chain: layer 1 passes (u1 == 0), the Step-4 F10 iget hits the
+    /// I12 arm-head gate, the mount fails EOPNOTSUPP. G-Z05's
+    /// negative rides the same door: the gate checks ONLY for a
+    /// compressed payload — no "packed must be compressed"
+    /// cross-check (the dual-malformed mount-Ok form is S11's, not
+    /// tightened here).
+    #[ktest]
+    fn mount_rejects_fragments_packed_compressed_payload() {
+        assert_errno!(
+            fx_sb_packed_compressed_payload().open,
+            Errno::EOPNOTSUPP,
+            "§5.1⑤: layer 1 passes (u1 = 0), F10 iget -> I12"
         );
     }
 }
