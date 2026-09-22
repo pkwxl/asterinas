@@ -165,7 +165,7 @@ mod tests {
     use crate::fs::fs_impls::erofs::{
         Erofs,
         inode::{DataLayout, InodeVersion},
-        test_utils::{ktest_lnk_desc, ktest_super_block},
+        test_utils::{assert_errno, fx_name_non_utf8_symlink_target, ktest_lnk_desc, ktest_super_block},
     };
 
     /// Three-element criterion vectors (SYM-06/SYM-07, `docs/T-013/
@@ -352,5 +352,44 @@ mod tests {
                 size,
             );
         }
+    }
+
+    /// T-027 S06 (FX-NAME, matrix §3.3 G-N02): a non-UTF-8 symlink
+    /// target fails `read_link` with EIO — the registered candidate-①
+    /// face, asserted at the aster side per the matrix. The fixture
+    /// carries both payload arms plus ASCII controls: the raw 0xFF/0x80
+    /// (fast, inline) and 0xFE/0xFF (slow, DataBacked over a whole
+    /// block) targets reach this exit UNJUDGED (S02-D2: the UTF-8
+    /// judgement is deferred here from iget), so both arms fail at the
+    /// single shared conversion point while both controls read back
+    /// verbatim — the EIO is the UTF-8 judgement, not the arm
+    /// machinery. (The fixture binding stays alive for the whole
+    /// block: `Inode` holds only a `Weak<Erofs>`.)
+    #[ktest]
+    fn non_utf8_symlink_target_eio_both_arms() {
+        let fixture = fx_name_non_utf8_symlink_target();
+        let root = fixture.mounted().root_inode().unwrap();
+
+        // Controls: ASCII targets through BOTH arms, verbatim.
+        assert_eq!(
+            root.lookup("fastgood").unwrap().read_link().unwrap(),
+            "ok-target"
+        );
+        assert_eq!(
+            root.lookup("slowgood").unwrap().read_link().unwrap(),
+            "page-target"
+        );
+
+        // G-N02: the raw-byte targets, both arms, one errno.
+        assert_errno!(
+            root.lookup("fastbad").unwrap().read_link(),
+            Errno::EIO,
+            "G-N02: the fast inline arm's non-UTF-8 target"
+        );
+        assert_errno!(
+            root.lookup("slowbad").unwrap().read_link(),
+            Errno::EIO,
+            "G-N02: the slow DataBacked arm likewise"
+        );
     }
 }

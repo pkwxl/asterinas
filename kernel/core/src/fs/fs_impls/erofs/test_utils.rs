@@ -75,6 +75,17 @@
 //!   the two-strictness-domains pin there finally gets its executed
 //!   R5 column over real malformed images.
 //!
+//! * **T-027 S06, the FX-NAME builder family**: three named
+//!   constructors (`fx_name_*`), each a local rewrite of the chassis
+//!   per S06 §5.4 — the non-UTF-8 dirent name (readdir EIO at the
+//!   G-N04 precheck, lookup-side unreachability), the slash-bearing
+//!   name (the G-N05 precheck), and the non-UTF-8 symlink target
+//!   with both payload arms in one image (G-N02, the unified
+//!   `read_link` conversion exit). The embedded-NUL name-family half
+//!   reuses the S05 `fx_dirent_embedded_nul_names` image (same
+//!   material, double consumption). Assertion suites live in
+//!   `inode/dir.rs` and `inode/symlink.rs` (the D1 host rule).
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -108,7 +119,7 @@ use super::{
     inode::{
         AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, I_DATALAYOUT_BIT,
         I_VERSION_BIT, ISLOT_BITS, InodeDesc, InodeVersion, RawDirent, RawInodeCompact,
-        RawInodeExtended, S_IFMT, S_IFREG, inode_location,
+        RawInodeExtended, S_IFLNK, S_IFMT, S_IFREG, inode_location,
     },
     prelude::*,
     super_block::{
@@ -1815,6 +1826,167 @@ pub(super) fn fx_dirent_name_beyond_maxsize() -> ErofsFixture {
         patch_root_dirent(disk, 1, |de| {
             put_le_u16(de, offset_of!(RawDirent, nameoff), nameoff);
         });
+    })
+}
+
+// ===========================================================================
+// T-027 S06: the FX-NAME builder family (S06 §5.4; matrix §1.6 label row
+// IMG-CRAFT-NAME — the name/target CONTENT family: non-UTF-8 name, non-UTF-8
+// symlink target, '/' name, embedded-NUL name — serving the §3.3 G-N02 /
+// §3.4 W-N04 / §3.5 G-N04/G-N05/W-N05 rows per the matrix §8.3 service
+// column, which is the authority over §5.4's service labels (the '/'-name
+// row there cites G-N04 and the NUL row G-N05/W-N05; the matrix rows pin
+// G-N04 = readdir non-UTF-8 → EIO and G-N05 = '/'-name → EIO — the
+// builder SET is §1.6's four forms either way, only the row labels shift).
+// Three new constructors; the embedded-NUL name-family half reuses the S05
+// `fx_dirent_embedded_nul_names` image (below). The crafted names stay at
+// their byte-sort position in the root block (the 0xFF-led name sorts
+// above every ASCII name), so the lookup binary search keeps healthy
+// trajectories for the sibling lookups the dir.rs suite asserts.
+//
+// AUTO-DECISION: the embedded-NUL name-family half lands as exact-byte
+// lookup assertions over the S05 `fx_dirent_embedded_nul_names` image —
+// same material, double consumption (the FX-SB G-M15 / FX-COMP §5.7
+// precedent: one builder lives in exactly one family) — instead of a
+// fourth builder re-staging the same `a\0b` shape. Rejected: a duplicate
+// `fx_name_embedded_nul` image (two fixtures for one form, no added
+// assertion surface).
+//
+// AUTO-DECISION: the G-N02 form covers BOTH payload arms plus two ASCII
+// controls in ONE image — fast FLAT_INLINE and slow FLAT_PLAIN (i_u)
+// share the single `read_link` conversion exit (S04-D5), so one image
+// with a 2×2 arm/expectation grid pins the unified exit and proves the
+// EIO comes from the UTF-8 judgement, not the staging. Rejected: one arm
+// per builder (same mechanism, the d_type 8/255 one-image precedent).
+// ===========================================================================
+
+/// Lays a healthy FAST child symlink at `nid`: the extended seed with
+/// the S_IFMT segment switched to LNK and datalayout FlatInline, the
+/// `target` bytes staged right behind the record (the
+/// `inline_data_start` position at the seed's zero xattr_icount).
+///
+/// Slot-geometry note: an extended record spans TWO 32-byte slots, so
+/// the inline tail of a fast symlink at nid N collides with the record
+/// of a child laid at nid N+2. The fixture therefore spaces its
+/// inline-carrying children FOUR slots apart (target room = 64 bytes,
+/// far above every target this family stages); the even-nid chassis
+/// convention itself is untouched.
+fn lay_fast_symlink_at(disk: &ErofsMemoryDisk, nid: u64, target: &[u8]) {
+    let mut record = INODE_EXT_TEMPLATE;
+    put_le_u16(
+        &mut record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::FlatInline),
+    );
+    let mode_off = offset_of!(RawInodeExtended, i_mode);
+    let mode = get_le_u16(&record, mode_off);
+    put_le_u16(&mut record, mode_off, (mode & !S_IFMT) | S_IFLNK);
+    put_le_u64(
+        &mut record,
+        offset_of!(RawInodeExtended, i_size),
+        target.len() as u64,
+    );
+    put_le_u32(&mut record, offset_of!(RawInodeExtended, i_nlink), 1);
+    write_inode_at(disk, nid, &record);
+    let iloc = inode_location(&staged_super_block(disk), nid) as usize;
+    disk.stage_bytes(iloc + size_of::<RawInodeExtended>(), target);
+}
+
+/// Lays a healthy SLOW child symlink at `nid`: LNK × FLAT_PLAIN over a
+/// whole target block (`i_u = blk`), the target bytes staged at the
+/// block base — the DataBacked arm reads the very same bytes through
+/// the page cache (the unified-exit premise of the G-N02 form).
+fn lay_slow_symlink_at(disk: &ErofsMemoryDisk, nid: u64, blk: u32, target: &[u8]) {
+    let mut record = INODE_EXT_TEMPLATE;
+    put_le_u16(
+        &mut record,
+        offset_of!(RawInodeExtended, i_format),
+        chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
+    );
+    let mode_off = offset_of!(RawInodeExtended, i_mode);
+    let mode = get_le_u16(&record, mode_off);
+    put_le_u16(&mut record, mode_off, (mode & !S_IFMT) | S_IFLNK);
+    put_le_u64(
+        &mut record,
+        offset_of!(RawInodeExtended, i_size),
+        target.len() as u64,
+    );
+    put_le_u32(&mut record, offset_of!(RawInodeExtended, i_u), blk);
+    put_le_u32(&mut record, offset_of!(RawInodeExtended, i_nlink), 1);
+    write_inode_at(disk, nid, &record);
+    write_meta_bytes(disk, u64::from(blk), 0, target);
+}
+
+/// Row 1, non-UTF-8 dirent name — the crafted name is the two-byte
+/// 0xFF/0x80 sequence (invalid UTF-8 in any position), sorted LAST in
+/// the root block behind a healthy "tail" sibling. Readdir emits the
+/// rows before it, then aborts EIO at the G-N04 precheck; lookup can
+/// never match the bytes (no UTF-8 string contains 0xFF), the lossy
+/// U+FFFD replacement included — the W-N04 registered drift's
+/// fixture-side leg. Both targets are laid real (empty directories).
+pub(super) fn fx_name_non_utf8_names() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_empty_dir_at(disk, 2); // "tail"
+        lay_empty_dir_at(disk, 4); // the unreachable 0xFF-name target
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, 48, 2),
+                dirent_record(CHASSIS_ROOT_NID, 49, 2),
+                dirent_record(2, 51, 2), // "tail" @ [51, 55)
+                dirent_record(4, 55, 2), // 0xFF 0x80 @ [55, 57), trailing
+            ],
+            b"...tail\xFF\x80",
+        );
+    })
+}
+
+/// Row 3, '/'-bearing name — "a/b" as a single dirent name (a healthy
+/// mkfs never emits one: the separator is not a name byte). Readdir
+/// aborts EIO at the G-N05 slash precheck (which runs BEFORE the
+/// UTF-8 decode); the lookup half has no slash gate at all and
+/// consumes the name byte-wise like any other.
+pub(super) fn fx_name_slash_name() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_empty_dir_at(disk, 2);
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, 36, 2),
+                dirent_record(CHASSIS_ROOT_NID, 37, 2),
+                dirent_record(2, 39, 2), // "a/b" @ [39, 42), trailing
+            ],
+            b"...a/b",
+        );
+    })
+}
+
+/// Row 2, non-UTF-8 symlink target — four LNK children spaced four
+/// slots apart (the inline-tail room, see `lay_fast_symlink_at`): the
+/// fast arm with an ASCII target ("fastgood" @ nid 2, the control)
+/// and with the raw 0xFF/0x80 bytes ("fastbad" @ nid 6), and the slow
+/// FLAT_PLAIN arm likewise over whole target blocks ("slowbad" @ nid
+/// 10 → block 5, "slowgood" @ nid 14 → block 6). The raw bytes reach
+/// `read_link` unjudged (S02-D2) and fail EIO at the shared
+/// conversion exit — matrix §3.3 G-N02, both arms, one image.
+pub(super) fn fx_name_non_utf8_symlink_target() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_fast_symlink_at(disk, 2, b"ok-target");
+        lay_fast_symlink_at(disk, 6, &[0xFF, 0x80]);
+        lay_slow_symlink_at(disk, 10, 5, &[0xFE, 0xFF]);
+        lay_slow_symlink_at(disk, 14, 6, b"page-target");
+        lay_root_dirents(
+            disk,
+            &[
+                dirent_record(CHASSIS_ROOT_NID, 72, 2),
+                dirent_record(CHASSIS_ROOT_NID, 73, 2),
+                dirent_record(2, 75, 7),  // "fastbad" @ [75, 82)
+                dirent_record(6, 82, 7),  // "fastgood" @ [82, 90)
+                dirent_record(10, 90, 7), // "slowbad" @ [90, 97)
+                dirent_record(14, 97, 7), // "slowgood" @ [97, 105)
+            ],
+            b"...fastbadfastgoodslowbadslowgood",
+        );
     })
 }
 

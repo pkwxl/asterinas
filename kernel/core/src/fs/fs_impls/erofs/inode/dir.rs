@@ -628,7 +628,8 @@ mod tests {
             fx_dirent_missing_dotdot_child, fx_dirent_missing_dotdot_root,
             fx_dirent_name_beyond_maxsize, fx_dirent_name_over_255, fx_dirent_nameoff_high_bits,
             fx_dirent_nameoff_inverted, fx_dirent_nameoff_not_multiple, fx_dirent_nameoff_zero,
-            fx_dirent_unsorted_binary_search, fx_dirent_zero_nid_entry, healthy_fixture,
+            fx_dirent_unsorted_binary_search, fx_dirent_zero_nid_entry, fx_name_non_utf8_names,
+            fx_name_slash_name, healthy_fixture,
         },
     };
 
@@ -1219,6 +1220,114 @@ mod tests {
             root.lookup("b"),
             Errno::ENOENT,
             "the post-NUL tail is unreachable"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // T-027 S06: the FX-NAME fixture suites (matrix §1.6 IMG-CRAFT-NAME).
+    // The name-CONTENT forms: each crafted name keeps its byte-sort
+    // position in the root block, so the lookup half's binary search
+    // stays on healthy trajectories for the sibling lookups asserted
+    // alongside the readdir aborts.
+    // ------------------------------------------------------------------
+
+    /// The non-UTF-8 name (matrix §3.5 G-N04 + §3.4 W-N04): readdir
+    /// emits the rows before the crafted name, then aborts EIO at the
+    /// UTF-8 precheck (the rows after it never materialize — the walk
+    /// stops there). The lookup domain carries no UTF-8 knowledge:
+    /// the healthy "tail" sibling still resolves, while the crafted
+    /// 0xFF/0x80 bytes are unreachable by ANY `&str` query — no valid
+    /// UTF-8 string contains 0xFF, the lossy U+FFFD replacement
+    /// included (the fixture-side leg of the W-N04 registered drift:
+    /// Linux hits the raw bytes, aster can only ENOENT).
+    #[ktest]
+    fn non_utf8_name_readdir_eio_lookup_unreachable() {
+        let fixture = fx_name_non_utf8_names();
+        let root = fixture.mounted().root_inode().unwrap();
+
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EIO,
+            "G-N04: invalid dir entry name"
+        );
+        assert_eq!(
+            visitor.rows,
+            [
+                (b".".to_vec(), 0, InodeType::Dir, 12),
+                (b"..".to_vec(), 0, InodeType::Dir, 24),
+                (b"tail".to_vec(), 2, InodeType::Dir, 36),
+            ],
+            "the rows before the crafted name were already emitted"
+        );
+
+        // The lossy replacement (what a non-UTF-8 path component
+        // becomes on the way in) is a different byte sequence — miss.
+        assert_errno!(
+            root.lookup("\u{FFFD}\u{FFFD}"),
+            Errno::ENOENT,
+            "W-N04 fixture leg: the replacement cannot equal the raw bytes"
+        );
+        // The sibling resolves: the crafted name poisoned nothing on
+        // this side (byte comparison has no UTF-8 gate).
+        assert_eq!(root.lookup("tail").unwrap().ino(), 2);
+    }
+
+    /// The '/'-bearing name (matrix §3.5 G-N05): readdir emits the dot
+    /// rows, then aborts EIO at the slash precheck — which runs BEFORE
+    /// the UTF-8 decode ("a/b" is valid UTF-8; the observable is the
+    /// slash door alone). The lookup half has no slash gate: "a/b" is
+    /// just bytes to the comparison and resolves — the VFS resolver
+    /// is what never delivers a slash inside a single component.
+    #[ktest]
+    fn slash_name_readdir_eio_lookup_consumes() {
+        let fixture = fx_name_slash_name();
+        let root = fixture.mounted().root_inode().unwrap();
+
+        let mut visitor = RecordingVisitor::default();
+        assert_errno!(
+            root.readdir_at(0, &mut visitor),
+            Errno::EIO,
+            "G-N05: entry name contains slash"
+        );
+        assert_eq!(
+            visitor.rows,
+            [
+                (b".".to_vec(), 0, InodeType::Dir, 12),
+                (b"..".to_vec(), 0, InodeType::Dir, 24),
+            ],
+            "the dot rows precede the abort"
+        );
+
+        let child = root.lookup("a/b").unwrap();
+        assert_eq!(
+            child.ino(),
+            2,
+            "the lookup domain consumes the slash name byte-wise, as-is"
+        );
+    }
+
+    /// The embedded-NUL name, NAME-FAMILY half (matrix §3.5 W-N05; the
+    /// NUL-truncation half is the S05 test above — same image, double
+    /// consumption): the exact-byte queries — NUL included — RESOLVE.
+    /// `dirnamecmp` reads the query off a NUL-terminated buffer
+    /// (namei.c:33-35): the on-disk name truncates at its NUL, and the
+    /// query's own NUL at that same position counts as exhaustion, so
+    /// "a\0b" and "t\0u" match their entries through the identical
+    /// comparison that answers "a" and "t".
+    #[ktest]
+    fn embedded_nul_full_name_lookup_hits() {
+        let fixture = fx_dirent_embedded_nul_names();
+        let root = fixture.mounted().root_inode().unwrap();
+        assert_eq!(
+            root.lookup("a\0b").unwrap().ino(),
+            2,
+            "the exact non-trailing bytes — NUL included — hit"
+        );
+        assert_eq!(
+            root.lookup("t\0u").unwrap().ino(),
+            4,
+            "... for the trailing entry likewise"
         );
     }
 }

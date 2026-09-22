@@ -1272,13 +1272,14 @@ impl DataLayout {
 // transcribed as the module-private host — no framework-wide host
 // exists: `InodeType` carries its own local `TYPE_MASK`, and its
 // `from_raw_mode` is the rejected precedent documented on `FileKind`).
-// S_IFMT/S_IFREG additionally carry `pub(in …erofs)` for the cfg(ktest)
-// fixture face (the T-027 FX mode patches in test_utils.rs reach them as
-// `inode::{S_IFMT, S_IFREG}` through this declaration visibility alone).
+// S_IFMT/S_IFREG/S_IFLNK additionally carry `pub(in …erofs)` for the
+// cfg(ktest) fixture face (the T-027 FX mode patches in test_utils.rs reach
+// them as `inode::{S_IFMT, …}` through this declaration visibility alone).
 // AUTO-DECISION: no re-export `use` here — a `use self::{S_IFMT, …}`
 // would collide with these very declarations (E0255, the S04 first-run
-// lesson); and only the two names with consumers today carry the widened
-// visibility (T-027 S04), later FX slices widen more as their consumers
+// lesson); and only the names with consumers today carry the widened
+// visibility (S_IFMT/S_IFREG since T-027 S04, S_IFLNK with the S06 FX-NAME
+// symlink-target builder), later FX slices widen more as their consumers
 // land. The rest stay private.
 pub(in crate::fs::fs_impls::erofs) const S_IFMT: u16 = 0o170000;
 const S_IFIFO: u16 = 0o010000;
@@ -1286,7 +1287,7 @@ const S_IFCHR: u16 = 0o020000;
 const S_IFDIR: u16 = 0o040000;
 const S_IFBLK: u16 = 0o060000;
 pub(in crate::fs::fs_impls::erofs) const S_IFREG: u16 = 0o100000;
-const S_IFLNK: u16 = 0o120000;
+pub(in crate::fs::fs_impls::erofs) const S_IFLNK: u16 = 0o120000;
 const S_IFSOCK: u16 = 0o140000;
 
 /// The S_IFMT type segment of `i_mode`, typed (T-001 §9.7.4 full
