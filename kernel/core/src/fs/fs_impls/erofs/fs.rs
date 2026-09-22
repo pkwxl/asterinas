@@ -1241,8 +1241,8 @@ mod tests {
         fx_sb_dirblkbits_nonzero, fx_sb_extslots_at_page_boundary,
         fx_sb_extslots_past_page_boundary, fx_sb_packed_compressed_payload, fx_sb_root_compressed,
         fx_sb_root_nid_out_of_device, fx_sb_root_not_dir, fx_sb_unknown_incompat_bit,
-        fx_sb_volume_name_without_nul, fx_xattr_prefix_len_boundary,
-        fx_xattr_prefix_len_garbage, fx_xattr_prefix_start_out_of_device, healthy_fixture,
+        fx_sb_volume_name_without_nul, fx_xattr_prefix_len_boundary, fx_xattr_prefix_len_garbage,
+        fx_xattr_prefix_start_out_of_device, healthy_fixture,
     };
 
     /// fold vectors (the design's §7 fold family). The all-zero
@@ -1667,7 +1667,8 @@ mod tests {
     fn mount_accepts_boundary_xattr_prefix_len() {
         let fs = fx_xattr_prefix_len_boundary().mounted();
         assert_eq!(
-            fs.super_block().xattr_prefix_count, 1,
+            fs.super_block().xattr_prefix_count,
+            1,
             "the boundary record loaded (the count mirror)"
         );
     }

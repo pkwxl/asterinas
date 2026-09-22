@@ -3538,11 +3538,7 @@ pub(super) fn fx_xattr_prefix_len_boundary() -> ErofsFixture {
         patch_chassis_sb(disk, |sb| patch_prefix_knobs(sb, 1));
         let mut body = vec![XATTR_INDEX_USER];
         body.extend_from_slice(&[b'x'; NAME_LEN]);
-        lay_prefix_record(
-            disk,
-            (NAME_LEN + LONG_PREFIX_FIXED_LEN) as u16,
-            &body,
-        );
+        lay_prefix_record(disk, (NAME_LEN + LONG_PREFIX_FIXED_LEN) as u16, &body);
     })
 }
 

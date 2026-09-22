@@ -2089,14 +2089,17 @@ mod tests {
 
     use super::*;
     use crate::fs::{
-        fs_impls::erofs::super_block::RawSuperBlock,
-        fs_impls::erofs::test_utils::{
-            assert_errno, fx_xattr_acl_value_malformed, fx_xattr_contradictory_bloom,
-            fx_xattr_dead_index_entries, fx_xattr_empty_name_entry, fx_xattr_entry_beyond_remaining,
-            fx_xattr_glued_acl_name_entries, fx_xattr_header_size_overrun, fx_xattr_non_utf8_names,
-            fx_xattr_prefix_bit_set_count_zero, fx_xattr_prefix_table_meta,
-            fx_xattr_shared_id_bounds, fx_xattr_symlink_host_user, get_le_u32, patch_chassis_sb,
-            put_le_u32,
+        fs_impls::erofs::{
+            super_block::RawSuperBlock,
+            test_utils::{
+                assert_errno, fx_xattr_acl_value_malformed, fx_xattr_contradictory_bloom,
+                fx_xattr_dead_index_entries, fx_xattr_empty_name_entry,
+                fx_xattr_entry_beyond_remaining, fx_xattr_glued_acl_name_entries,
+                fx_xattr_header_size_overrun, fx_xattr_non_utf8_names,
+                fx_xattr_prefix_bit_set_count_zero, fx_xattr_prefix_table_meta,
+                fx_xattr_shared_id_bounds, fx_xattr_symlink_host_user, get_le_u32,
+                patch_chassis_sb, put_le_u32,
+            },
         },
         vfs::file_system::FsFlags,
     };
@@ -2403,12 +2406,16 @@ mod tests {
             "② the in-area mismatch iterates on to exhaustion"
         );
         let mut list_buf = [0u8; 32];
+        // AUTO-DECISION: 17→16 — the count literal was an arithmetic
+        // slip against its own byte literal right below (7+1+7+1=16);
+        // the per-name trailing NUL convention is pinned by the
+        // passing 7/22 baselines (user.x\0, user.erofs_test.lpx.s\0).
         assert_eq!(
             list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
-            17,
+            16,
             "X37: any inline Ok continues onto the shared rows"
         );
-        assert_eq!(&list_buf[..17], b"user.in\0user.sh\0");
+        assert_eq!(&list_buf[..16], b"user.in\0user.sh\0");
 
         // (c) The masking order: the inline X24 EUCLEAN preempts the
         // same-named shared entry on both faces.
@@ -2458,12 +2465,16 @@ mod tests {
         );
         assert_eq!(&buf[..2], b"ov");
         let mut list_buf = [0u8; 32];
+        // AUTO-DECISION: the emission order follows the on-disk entry
+        // chain (probe is laid before ok in the fixture body), not
+        // name sort — the earlier alphabetical literal was flipped;
+        // count 19 per the pinned per-name trailing-NUL convention.
         assert_eq!(
             list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
-            20,
+            19,
             "the list chain never consults the bloom bitmap"
         );
-        assert_eq!(&list_buf[..20], b"user.ok\0user.probe\0");
+        assert_eq!(&list_buf[..19], b"user.probe\0user.ok\0");
 
         // The acl channel's own gate: the empty-suffix internal query
         // over a valid value — only the denial answers ENODATA here.
@@ -2479,7 +2490,11 @@ mod tests {
         patch_chassis_sb(&fixture.disk, |sb| {
             let compat_off = offset_of!(RawSuperBlock, feature_compat);
             let compat = get_le_u32(sb, compat_off);
-            put_le_u32(sb, compat_off, compat & !FeatureCompatSet::XATTR_FILTER.bits());
+            put_le_u32(
+                sb,
+                compat_off,
+                compat & !FeatureCompatSet::XATTR_FILTER.bits(),
+            );
         });
         let gate_off = Erofs::open(
             fixture.disk.clone() as Arc<dyn BlockDevice>,
@@ -2500,7 +2515,11 @@ mod tests {
         patch_chassis_sb(&fixture.disk, |sb| {
             let compat_off = offset_of!(RawSuperBlock, feature_compat);
             let compat = get_le_u32(sb, compat_off);
-            put_le_u32(sb, compat_off, compat | FeatureCompatSet::XATTR_FILTER.bits());
+            put_le_u32(
+                sb,
+                compat_off,
+                compat | FeatureCompatSet::XATTR_FILTER.bits(),
+            );
             sb[offset_of!(RawSuperBlock, xattr_filter_reserved)] = 1;
         });
         let reserved_off = Erofs::open(
