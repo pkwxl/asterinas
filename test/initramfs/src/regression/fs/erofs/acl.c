@@ -278,6 +278,18 @@ END_TEST()
  * Matrix sec. 6.3 X43 symlink own-gate (parity): both precise names
  * on a symlink answer EOPNOTSUPP -- the gate's own code, NOT the
  * ENODATA a user.* name gets on a symlink (X13 is xattr.c's face).
+ *
+ * Carrier erratum (T-026/S10, test.201): the assertion must ride
+ * lgetxattr. aster's sys_getxattr resolves the path with
+ * lookup("Symlinks are always followed", resolver.rs) -- same as
+ * Linux getxattr(2) -- so a getxattr carrier reaches the TARGET
+ * inode (../regular/content_anchor.txt, no acl entry -> ENODATA) and
+ * the X43-3 gate is structurally unreachable; the matrix D-series
+ * (sec. 6.4) registers no follow-semantics drift because there is
+ * none. lgetxattr (PathNoFollow) is the minimal channel that hands
+ * the symlink inode itself to the gate. The expected code stays
+ * matrix-anchored (EOPNOTSUPP); only the carrier variant is
+ * corrected -- this is NOT an expected-value adjustment.
  */
 FN_TEST(acl_symlink_own_gate)
 {
@@ -285,11 +297,11 @@ FN_TEST(acl_symlink_own_gate)
 
 	EROFS_SKIP_IF_NO_INIT_MNT();
 
-	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/symlink/to_file_short", AC_ACCESS,
-			    buf, sizeof(buf)),
+	TEST_ERRNO(lgetxattr(EROFS_INIT_MNT "/symlink/to_file_short",
+			     AC_ACCESS, buf, sizeof(buf)),
 		   EOPNOTSUPP);
-	TEST_ERRNO(getxattr(EROFS_INIT_MNT "/symlink/to_file_short", AC_DEFAULT,
-			    buf, sizeof(buf)),
+	TEST_ERRNO(lgetxattr(EROFS_INIT_MNT "/symlink/to_file_short",
+			     AC_DEFAULT, buf, sizeof(buf)),
 		   EOPNOTSUPP);
 }
 END_TEST()
