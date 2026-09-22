@@ -2085,7 +2085,8 @@ mod tests {
     use super::*;
     use crate::{
         fs::fs_impls::erofs::test_utils::{
-            BioRequest, ErofsMemoryDisk, ktest_bio_trio, ktest_flat_geometry, ktest_fs_on,
+            BioRequest, ErofsMemoryDisk, fx_time_compact_ctime, fx_time_giant_nsec,
+            fx_time_giant_seconds, ktest_bio_trio, ktest_flat_geometry, ktest_fs_on,
             ktest_single_device_table, ktest_super_block,
         },
         vm::page_cache::BlockAsPageCacheBackend,
@@ -2714,5 +2715,92 @@ mod tests {
             disk.requests().is_empty(),
             "both empty-inline forms touch zero pages (zero device requests)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // T-027 S07: the FX-TIME suite (S06 §5.5; matrix §3.1 giant-
+    // timestamp bit-pattern row; the nsec half = the F6n registered
+    // drift, T-011 §4). All three forms are ACCEPT faces — the mount
+    // stays Ok and no errno is asserted; the surface is the decoded
+    // time itself: the D10 three-times-one-source snapshot plus the
+    // statx-exit bit pattern. The exit conversion is spelled here as
+    // `as_secs() as i64` — the exact expression of the framework's
+    // `StatxTimestamp::from(Duration)` (syscall/statx.rs), whose
+    // struct is syscall-private and thus unreachable from a ktest.
+    // ------------------------------------------------------------------
+
+    /// Row 1 (F6, bit-pattern parity): `i_mtime = 1 << 63` carries
+    /// through the Duration decode unchanged, and the statx exit
+    /// truncation emits the SAME bit pattern as a negative tv_sec —
+    /// `i64::MIN` here — never a saturated value and never an error.
+    #[ktest]
+    fn giant_mtime_seconds_carries_bit_pattern() {
+        let fixture = fx_time_giant_seconds();
+        let root = fixture.mounted().root_inode().unwrap();
+        let metadata = root.metadata();
+
+        let giant = 1u64 << 63;
+        assert_eq!(
+            metadata.last_modify_at,
+            Duration::new(giant, 0),
+            "the le64 seconds domain carries unchanged (seed nsec 0)"
+        );
+        // D10: the three times are one source, zero arithmetic.
+        assert_eq!(metadata.last_access_at, metadata.last_modify_at);
+        assert_eq!(metadata.last_meta_change_at, metadata.last_modify_at);
+
+        // The statx exit, spelled as syscall/statx.rs spells it: the
+        // same bits as i64 (a negative tv_sec), not a saturation.
+        assert_eq!(metadata.last_modify_at.as_secs() as i64, giant as i64);
+        assert_eq!(giant as i64, i64::MIN);
+    }
+
+    /// Row 2 (F6n, the registered drift): `i_mtime_nsec = 2e9`
+    /// normalizes through `duration_from_parts` into (2 s, 0 ns) —
+    /// aster's spelling of the same time quantity as the legal
+    /// timespec. Linux passes the raw pair out ((0, 2e9): an
+    /// illegal-but-verbatim tv_nsec inside [1e9, 2^31)); both
+    /// components differ — the known-diff registered by T-011 §4,
+    /// asserted here at aster's normalized value (the matrix §3.1
+    /// known-diff口径).
+    #[ktest]
+    fn giant_mtime_nsec_normalizes_f6n_drift() {
+        let fixture = fx_time_giant_nsec();
+        let root = fixture.mounted().root_inode().unwrap();
+        let metadata = root.metadata();
+
+        assert_eq!(
+            metadata.last_modify_at,
+            Duration::new(2, 0),
+            "2e9 ns carries into 2 s — the F6n normalization"
+        );
+        assert_eq!(metadata.last_modify_at.subsec_nanos(), 0);
+        assert_eq!(metadata.last_access_at, metadata.last_modify_at);
+        assert_eq!(metadata.last_meta_change_at, metadata.last_modify_at);
+    }
+
+    /// Row 3 (the compact half): the compact chassis plus a giant
+    /// `sb.build_time` — a compact record has no time field, the three
+    /// times synthesize from the superblock (D10/G-M17), and the
+    /// bit-pattern assertion runs on that synthesized value: the only
+    /// reachable host of the giant-seconds face on a compact image.
+    #[ktest]
+    fn compact_ctime_giant_build_time_bit_pattern() {
+        let fixture = fx_time_compact_ctime();
+        let root = fixture.mounted().root_inode().unwrap();
+        // The form under test is the compact record, not the extended
+        // chassis silently re-mounted.
+        assert_eq!(root.desc.version, InodeVersion::Compact);
+
+        let metadata = root.metadata();
+        let giant = 1u64 << 63;
+        assert_eq!(
+            metadata.last_meta_change_at,
+            Duration::new(giant, 0),
+            "the synthesized ctime carries the giant build_time"
+        );
+        assert_eq!(metadata.last_access_at, metadata.last_meta_change_at);
+        assert_eq!(metadata.last_modify_at, metadata.last_meta_change_at);
+        assert_eq!(metadata.last_meta_change_at.as_secs() as i64, i64::MIN);
     }
 }

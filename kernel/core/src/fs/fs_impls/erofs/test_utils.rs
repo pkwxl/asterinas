@@ -86,6 +86,19 @@
 //!   material, double consumption). Assertion suites live in
 //!   `inode/dir.rs` and `inode/symlink.rs` (the D1 host rule).
 //!
+//! * **T-027 S07, the FX-TIME builder family**: three named
+//!   constructors (`fx_time_*`), each a local rewrite of the chassis
+//!   per S06 §5.5 — the giant mtime seconds word (le64 high bit, the
+//!   F6 bit-pattern carrier), the giant mtime nsec (2e9, the F6n
+//!   normalization registered drift), and the compact chassis with a
+//!   giant superblock build_time (the compact ctime synthesis path,
+//!   the compact half of the same bit-pattern assertion). All three
+//!   are accept faces — no mount gate consumes a time field — so the
+//!   assertion surface is the decoded time itself; the suite lives
+//!   in `inode/mod.rs` (the D1 host rule). The compact chassis
+//!   variant of S06 §3.2 lands with the third form
+//!   (`lay_compact_root`).
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -722,9 +735,9 @@ const INODE_EXT_TEMPLATE: [u8; 64] = [
 /// chassis).
 // First consumer since T-027 S03: the `chassis_staging_shape`
 // smoke cross-locks the seed's i_format word against the compose
-// helper — the S02-era dead-code expectation came off with it.
-// Compact chassis staging itself arrives with the S07 FX-TIME
-// suites.
+// helper — the S02-era dead-code expectation came off with it. The
+// compact chassis staging itself joined with the S07 FX-TIME family
+// (`lay_compact_root`).
 const INODE_CPT_TEMPLATE: [u8; 32] = [
     0x04, 0x00, 0x00, 0x00, 0xed, 0x41, 0x07,
     0x00, // i_format@0 = 0x0004 (version=0 compact, datalayout=2 FlatInline); i_xattr_icount@2 = 0; i_mode@4 = 0x41ED (S_IFDIR | 0755); i_nlink@6 = 7 (le16)
@@ -1987,6 +2000,115 @@ pub(super) fn fx_name_non_utf8_symlink_target() -> ErofsFixture {
             ],
             b"...fastbadfastgoodslowbadslowgood",
         );
+    })
+}
+
+// ===========================================================================
+// T-027 S07: the FX-TIME builder family (S06 §5.5; matrix §1.6 label row
+// IMG-CRAFT-TIME serving the §3.1 giant-timestamp bit-pattern row per the
+// matrix §8.3 FX-TIME service row). Three named constructors, each a LOCAL
+// rewrite of the chassis — and, unlike every family before it, all three
+// are ACCEPT faces: no mount gate consumes a time field, so the mount
+// stays Ok and the assertion surface is the DECODED TIME itself (the
+// inode/mod.rs suite): the D10 three-times-one-source snapshot and the
+// statx-exit bit pattern.
+//
+// AUTO-DECISION: the assertion venue is the module face, not the syscall
+// face — `StatxTimestamp` is syscall-private, so the F6 exit is pinned by
+// spelling the same conversion expression (`as_secs() as i64`,
+// syscall/statx.rs) over the metadata Duration. The expression being
+// identical, the "same bit pattern, never saturated, never an error"
+// contract is locked at the carrier level. Rejected: reaching into the
+// syscall item (not exported to the ktest domain); asserting only the
+// Duration and trusting the exit (the exit conversion is exactly what
+// the F6 row names as its constraint).
+//
+// AUTO-DECISION: the compact chassis variant (S06 §3.2 "compact 变体
+// 底盘", continuous nids, T-CPT32 seed) lands as an in-place conversion
+// of the staged extended chassis — `lay_compact_root` replaces the root
+// record and clears the sibling slot — not as a parallel staging path:
+// every other chassis byte (the superblock geometry patches, the
+// `.`/`..` data block) is form-independent, so a second staging function
+// would restate them for zero behavioral difference. Rejected:
+// `stage_compact_chassis` as a full twin of `stage_healthy_chassis`
+// (duplication with no assertion face).
+//
+// AUTO-DECISION: the giant values are derived, not hexadecimal-literal —
+// the seconds word is `1u64 << 63` (§5.5's "le64 高位置 1" made code)
+// and the nsec word is 2_000_000_000 (§5.5's own decimal spelling; the
+// value is the form's identity). Rejected: 0x8000... literals (a second
+// spelling of the same bits).
+// ===========================================================================
+
+/// Lays the chassis root in the COMPACT form — the S06 §3.2 compact
+/// chassis variant (continuous nids; the T-CPT32 seed): the seed's root
+/// record switched to FLAT_PLAIN over the chassis root data block, sized
+/// and linked to the (form-independent) `.`/`..` block — the same
+/// four-field treatment the extended chassis gives its root (the risk-1
+/// FLAT_PLAIN resolution applies per chassis, not per record form). A
+/// compact record spans ONE slot, so the extended seed's second-half
+/// bytes behind it are cleared: no compact image carries that cross-form
+/// leftover, and the cleared slot keeps the staging self-consistent.
+fn lay_compact_root(disk: &ErofsMemoryDisk) {
+    let mut root = INODE_CPT_TEMPLATE;
+    put_le_u16(
+        &mut root,
+        offset_of!(RawInodeCompact, i_format),
+        chassis_i_format(InodeVersion::Compact, DataLayout::FlatPlain),
+    );
+    put_le_u32(&mut root, offset_of!(RawInodeCompact, i_size), CHASSIS_ROOT_DIR_SIZE as u32);
+    put_le_u32(&mut root, offset_of!(RawInodeCompact, i_u), CHASSIS_ROOT_DATA_BLK);
+    put_le_u16(&mut root, offset_of!(RawInodeCompact, i_nlink), 2);
+    write_inode_at(disk, CHASSIS_ROOT_NID, &root);
+    let iloc = inode_location(&staged_super_block(disk), CHASSIS_ROOT_NID) as usize;
+    let cleared = [0u8; size_of::<RawInodeExtended>() - size_of::<RawInodeCompact>()];
+    disk.stage_bytes(iloc + size_of::<RawInodeCompact>(), &cleared);
+}
+
+/// Row 1, giant seconds — the extended root's `i_mtime` set to
+/// 1 << 63 (§5.5 "le64 高位置 1"): the le64 domain carries through the
+/// `Duration` decode unchanged (F6), and the statx exit's `as i64`
+/// truncation emits the SAME BIT PATTERN as a negative tv_sec —
+/// saturation or an error exit would drift the bit-pattern-level parity
+/// (matrix §3.1 giant-timestamp row). Expected mount Ok; the
+/// inode/mod.rs suite pins the decoded snapshot and the exit pattern.
+pub(super) fn fx_time_giant_seconds() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_root_inode(disk, |root| {
+            put_le_u64(root, offset_of!(RawInodeExtended, i_mtime), 1u64 << 63);
+        });
+    })
+}
+
+/// Row 2, giant nsec — `i_mtime_nsec` = 2_000_000_000 (§5.5's spelling;
+/// ≥ 1e9, the malformed-images-only domain). aster normalizes through
+/// `duration_from_parts` into `Duration::new(2, 0)` — the same time
+/// quantity spelled as the legal timespec — while Linux passes the raw
+/// pair through (an illegal-but-verbatim tv_nsec of 2e9, inside
+/// [1e9, 2^31)); the F6n REGISTERED DRIFT (T-011 §4 example
+/// semantics), asserted at aster's normalized value. Expected mount Ok.
+pub(super) fn fx_time_giant_nsec() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        patch_root_inode(disk, |root| {
+            put_le_u32(root, offset_of!(RawInodeExtended, i_mtime_nsec), 2_000_000_000);
+        });
+    })
+}
+
+/// Row 3, the compact ctime synthesis path — the compact chassis
+/// (`lay_compact_root`) plus the family's ONE superblock patch:
+/// `build_time` = 1 << 63. A compact record carries no time field; all
+/// three metadata times synthesize from `sb.build_time` (D10/G-M17),
+/// which makes this image the compact half of the giant-seconds
+/// bit-pattern assertion — its only reachable host on a compact image
+/// (§5.5's "标签行未列,非虚构" note). Expected mount Ok (no gate
+/// consumes build_time).
+pub(super) fn fx_time_compact_ctime() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        lay_compact_root(disk);
+        let mut sb = staged_super_block_record(disk);
+        put_le_u64(&mut sb, offset_of!(RawSuperBlock, build_time), 1u64 << 63);
+        write_super_block(disk, &sb);
     })
 }
 
