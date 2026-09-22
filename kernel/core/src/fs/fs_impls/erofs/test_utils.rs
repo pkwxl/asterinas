@@ -85,8 +85,8 @@ use super::{
     Erofs,
     fs::DeviceTable,
     inode::{
-        AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, ISLOT_BITS,
-        I_DATALAYOUT_BIT, I_VERSION_BIT, InodeDesc, InodeVersion, RawDirent, RawInodeCompact,
+        AddrState, ChunkGeometry, DataGeometry, DataLayout, FileKind, I_DATALAYOUT_BIT,
+        I_VERSION_BIT, ISLOT_BITS, InodeDesc, InodeVersion, RawDirent, RawInodeCompact,
         RawInodeExtended, inode_location,
     },
     prelude::*,
@@ -881,7 +881,7 @@ const CHASSIS_ROOT_NDIRENTS: usize = 2;
 /// The packed name area of the chassis root block: "." then ".."
 /// (three 0x2E bytes — no separators; the nameoff chain carries the
 /// lengths, the block tail beyond i_size stays zero).
-const CHASSIS_ROOT_NAMES: &[u8] = &[b'.', b'.', b'.'];
+const CHASSIS_ROOT_NAMES: &[u8] = b"...";
 
 /// The root directory byte size: the dirent array plus the packed
 /// names (write_dirents lays the names right behind the array).
@@ -930,10 +930,22 @@ fn stage_healthy_chassis(disk: &ErofsMemoryDisk) {
     // Superblock first — `write_inode_at` addresses through the
     // staged record (meta_blkaddr = 1 lands here).
     let mut sb = SB_TEMPLATE;
-    put_le_u16(&mut sb, offset_of!(RawSuperBlock, root_nid), CHASSIS_ROOT_NID as u16);
+    put_le_u16(
+        &mut sb,
+        offset_of!(RawSuperBlock, root_nid),
+        CHASSIS_ROOT_NID as u16,
+    );
     put_le_u64(&mut sb, offset_of!(RawSuperBlock, inos), CHASSIS_INO_SLOTS);
-    put_le_u32(&mut sb, offset_of!(RawSuperBlock, blocks), CHASSIS_NR_BLOCKS);
-    put_le_u32(&mut sb, offset_of!(RawSuperBlock, meta_blkaddr), CHASSIS_META_BLKADDR);
+    put_le_u32(
+        &mut sb,
+        offset_of!(RawSuperBlock, blocks),
+        CHASSIS_NR_BLOCKS,
+    );
+    put_le_u32(
+        &mut sb,
+        offset_of!(RawSuperBlock, meta_blkaddr),
+        CHASSIS_META_BLKADDR,
+    );
     write_super_block(disk, &sb);
 
     // Root inode at nid 0 -> iloc 4096: FLAT_PLAIN over the root
@@ -945,8 +957,16 @@ fn stage_healthy_chassis(disk: &ErofsMemoryDisk) {
         offset_of!(RawInodeExtended, i_format),
         chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
     );
-    put_le_u64(&mut root, offset_of!(RawInodeExtended, i_size), CHASSIS_ROOT_DIR_SIZE);
-    put_le_u32(&mut root, offset_of!(RawInodeExtended, i_u), CHASSIS_ROOT_DATA_BLK);
+    put_le_u64(
+        &mut root,
+        offset_of!(RawInodeExtended, i_size),
+        CHASSIS_ROOT_DIR_SIZE,
+    );
+    put_le_u32(
+        &mut root,
+        offset_of!(RawInodeExtended, i_u),
+        CHASSIS_ROOT_DATA_BLK,
+    );
     put_le_u32(&mut root, offset_of!(RawInodeExtended, i_nlink), 2);
     write_inode_at(disk, CHASSIS_ROOT_NID, &root);
 
@@ -958,7 +978,12 @@ fn stage_healthy_chassis(disk: &ErofsMemoryDisk) {
     let dot = chassis_dirent(CHASSIS_ROOT_NID, array_len as u16);
     let dot_dot = chassis_dirent(CHASSIS_ROOT_NID, array_len as u16 + 1);
     let entries = [dot, dot_dot].concat();
-    write_dirents(disk, CHASSIS_ROOT_DATA_BLK as u64, &entries, CHASSIS_ROOT_NAMES);
+    write_dirents(
+        disk,
+        CHASSIS_ROOT_DATA_BLK as u64,
+        &entries,
+        CHASSIS_ROOT_NAMES,
+    );
 }
 
 /// A staged image plus its mount attempt (S06 §4.3): the FX-*
@@ -967,6 +992,22 @@ fn stage_healthy_chassis(disk: &ErofsMemoryDisk) {
 /// `Erofs::open` result — mount-Ok forms unwrap through
 /// [`ErofsFixture::mounted`], rejection forms assert `open` with
 /// `assert_errno!`.
+/// A staged image plus its mount attempt (S06 §4.3): the FX-*
+/// builder family (S04+) hands its host one value carrying both the
+/// disk (for inspection and post-mount rewrites) and the
+/// `Erofs::open` result — mount-Ok forms unwrap through
+/// [`ErofsFixture::mounted`], rejection forms assert `open` with
+/// `assert_errno!`.
+///
+/// The three rewrite-navigation fields (`disk`/`root_nid`/
+/// `meta_blkaddr`) have no reader as of S03 — the mount test
+/// consumes the image only through `open`. Their first consumers
+/// join with the S04+ FX builders (post-mount inspection, pre-mount
+/// rewrites, slot-offset navigation); once all three have readers
+/// this expectation goes unfulfilled and the attribute must be
+/// removed (the `fast_symlink_target` transitional-attribute
+/// discipline, `inode/mod.rs`).
+#[expect(dead_code)]
 pub(super) struct ErofsFixture {
     /// The staged memory disk.
     pub(super) disk: Arc<ErofsMemoryDisk>,
@@ -1006,8 +1047,8 @@ pub(super) fn healthy_fixture() -> ErofsFixture {
     stage_healthy_chassis(&disk);
     let open = Erofs::open(disk.clone() as Arc<dyn BlockDevice>, FsFlags::empty(), None);
     ErofsFixture {
-        open,
         disk,
+        open,
         root_nid: CHASSIS_ROOT_NID,
         meta_blkaddr: u64::from(CHASSIS_META_BLKADDR),
     }
@@ -1517,8 +1558,14 @@ mod tests {
             get_le_u16(&root, offset_of!(RawInodeExtended, i_format)),
             chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain)
         );
-        assert_eq!(get_le_u64(&root, offset_of!(RawInodeExtended, i_size)), CHASSIS_ROOT_DIR_SIZE);
-        assert_eq!(get_le_u32(&root, offset_of!(RawInodeExtended, i_u)), CHASSIS_ROOT_DATA_BLK);
+        assert_eq!(
+            get_le_u64(&root, offset_of!(RawInodeExtended, i_size)),
+            CHASSIS_ROOT_DIR_SIZE
+        );
+        assert_eq!(
+            get_le_u32(&root, offset_of!(RawInodeExtended, i_u)),
+            CHASSIS_ROOT_DATA_BLK
+        );
         assert_eq!(get_le_u32(&root, offset_of!(RawInodeExtended, i_nlink)), 2);
 
         // The `.`/`..` block: both nids at the root, the nameoff
@@ -1527,13 +1574,18 @@ mod tests {
         let base = CHASSIS_ROOT_DATA_BLK as usize * CHASSIS_BLOCK_SIZE;
         let array_end = CHASSIS_ROOT_NDIRENTS * size_of::<RawDirent>();
         let dot: RawDirent = disk.segment().read_val(base).unwrap();
-        let dot_dot: RawDirent = disk.segment().read_val(base + size_of::<RawDirent>()).unwrap();
+        let dot_dot: RawDirent = disk
+            .segment()
+            .read_val(base + size_of::<RawDirent>())
+            .unwrap();
         assert_eq!(u64::from_le(dot.nid), CHASSIS_ROOT_NID);
         assert_eq!(u64::from_le(dot_dot.nid), CHASSIS_ROOT_NID);
         assert_eq!(u16::from_le(dot.nameoff) as usize, array_end);
         assert_eq!(u16::from_le(dot_dot.nameoff) as usize, array_end + 1);
         let mut names = [0u8; CHASSIS_ROOT_NAMES.len()];
-        disk.segment().read_bytes(base + array_end, &mut names).unwrap();
+        disk.segment()
+            .read_bytes(base + array_end, &mut names)
+            .unwrap();
         assert_eq!(&names, CHASSIS_ROOT_NAMES);
     }
 }

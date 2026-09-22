@@ -82,9 +82,18 @@ use crate::vm::page_cache::PageCache;
 // erofs_fs.h:451) — a plain `#[repr(C)]` would fail the size
 // assertion below. This is the only packed structure on the erofs
 // main column.
+//
+// Declared at erofs scope (`pub(in crate::fs::fs_impls::erofs)`,
+// AUTO-DECISION: T-027 S03) because the ktest fixture face names
+// the type — `test_utils.rs` patches the `DIRENT_TEMPLATE` seed
+// through `offset_of!` on the raw record — and a `pub(super)`
+// declaration cannot be re-exported beyond `inode` (E0365); the
+// same declaration/re-export split as `DataBackend` (`data.rs`,
+// re-exported at `inode/mod.rs`). The `dir` module itself stays
+// private; production consumers are unchanged.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct RawDirent {
+pub(in crate::fs::fs_impls::erofs) struct RawDirent {
     /// The target inode number; no bound or existence check of any
     /// kind — iget is the backstop.
     pub nid: u64, // @0  __le64

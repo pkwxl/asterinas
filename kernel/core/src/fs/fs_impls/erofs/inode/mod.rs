@@ -130,7 +130,10 @@ use self::data::{ChunkGeometry, DataGeometry};
 // seed through `offset_of!` on the raw record (the zero-hand-
 // copied-offset discipline), which needs the type nameable at
 // erofs scope. cfg-gated for the same reason as the geometry
-// re-export above.
+// re-export above. The declaration in `dir.rs` accordingly
+// carries `pub(in crate::fs::fs_impls::erofs)` — a `pub(super)`
+// declaration cannot be re-exported beyond `inode` (E0365), the
+// same declaration/re-export split as `DataBackend` above.
 #[cfg(ktest)]
 pub(super) use self::dir::RawDirent;
 use self::{
