@@ -165,7 +165,9 @@ mod tests {
     use crate::fs::fs_impls::erofs::{
         Erofs,
         inode::{DataLayout, InodeVersion},
-        test_utils::{assert_errno, fx_name_non_utf8_symlink_target, ktest_lnk_desc, ktest_super_block},
+        test_utils::{
+            assert_errno, fx_name_non_utf8_symlink_target, ktest_lnk_desc, ktest_super_block,
+        },
     };
 
     /// Three-element criterion vectors (SYM-06/SYM-07, `docs/T-013/

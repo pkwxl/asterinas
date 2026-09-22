@@ -1980,8 +1980,8 @@ pub(super) fn fx_name_non_utf8_symlink_target() -> ErofsFixture {
             &[
                 dirent_record(CHASSIS_ROOT_NID, 72, 2),
                 dirent_record(CHASSIS_ROOT_NID, 73, 2),
-                dirent_record(2, 75, 7),  // "fastbad" @ [75, 82)
-                dirent_record(6, 82, 7),  // "fastgood" @ [82, 90)
+                dirent_record(6, 75, 7),  // "fastbad" @ [75, 82)
+                dirent_record(2, 82, 7),  // "fastgood" @ [82, 90)
                 dirent_record(10, 90, 7), // "slowbad" @ [90, 97)
                 dirent_record(14, 97, 7), // "slowgood" @ [97, 105)
             ],
