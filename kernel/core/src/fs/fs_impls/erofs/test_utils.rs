@@ -110,6 +110,19 @@
 //!   every form mounts Ok and the guards fire at `iget`; the
 //!   assertion suite lives in `inode/mod.rs` (the D1 host rule).
 //!
+//! * **T-027 S09, the FX-INODE data-defense family**: three named
+//!   constructors finishing §5.2 (rows 7/8/11) — the giant
+//!   FLAT_PLAIN i_size (2^32 + 100, the T-013 §11 truncation-angle
+//!   value), the exact-boundary slot whose inline payload exactly
+//!   fills a block (nid 126, i_size == bs — the cross-block guard's
+//!   pass corner), and the cross-block slot's slow symlink (nid 127,
+//!   one byte past the fast-criterion boundary: the map layer says
+//!   EUCLEAN, the registered VmIo-boundary drift exits EINVAL).
+//!   These forms mount Ok AND iget Ok — the defenses fire on the
+//!   read path; the suites live in `inode/data.rs` and
+//!   `inode/symlink.rs` (the D1 host rule), the first FX suites to
+//!   drive the full mounted chain through the read API.
+//!
 //! The vector suite for `utils` lives inside `utils.rs` itself (pure
 //! functions need no disk fixtures); the dirent/symlink vector suites
 //! of T-024/S04 live in their implementation files the same way.
@@ -2391,6 +2404,157 @@ pub(super) fn fx_inode_kind_layout_cross() -> ErofsFixture {
         });
         lay_extended_child_at(disk, 6, |record| {
             patch_chunk_child(record, unknown_chunk_format_bit(), Some(S_IFIFO));
+        });
+    })
+}
+
+// ===========================================================================
+// T-027 S09: the FX-INODE data-defense family (S06 §5.2 rows 7/8/11,
+// matrix §1.6 label row IMG-CRAFT-INODE serving the §4.1/§4.2 read
+// rows and the §4.3 INLINE row). Three named constructors whose
+// crafted CHILD records pass every mount and iget gate — the
+// defenses fire on the READ path (map_blocks through the page
+// cache). The suites live in `inode/data.rs` and `inode/symlink.rs`
+// (the D1 host rule): this slice is the first FX family whose
+// assertion surface drives the full mounted chain (chassis →
+// `Erofs::open` → iget → page cache → map_blocks) through the
+// read API.
+//
+// AUTO-DECISION: the giant-size assertion surface = first/mid-page
+// content fidelity (the le64 domain carried whole — a u32 collapse
+// of size would shrink npages and the first page's valid window, so
+// the full-page pattern read is the distinguishing face) plus the
+// tail page's device-bound EINVAL (RD2②: the tail's data block 5 +
+// 2^20 lies past the 32-block device; aster EINVAL vs Linux EIO,
+// the registered drift value). The §4.2 zero-fill half is NOT
+// reachable on a mounted crafted image — the tail page's data block
+// is necessarily out of device — and stays with its real hosts (the
+// initramfs mmap rows; the T-025 S05-IF-2 direct-construction
+// vector). Rejected: shrinking the size to keep the tail in-device
+// (breaks the T-013 §11 value 2^32+100); asserting the request log
+// on the data.rs side (implementation detail, no matrix row).
+//
+// AUTO-DECISION: the expected payload bytes single-source through
+// the exported `chassis_nonzero_pattern` formula — staged by the
+// builders, re-derived by the suites. Rejected: a per-suite formula
+// copy (a second truth); a read-back oracle over `disk.segment()`
+// (would restate the iloc geometry these builders already own).
+// ===========================================================================
+
+/// The deterministic nonzero payload byte at inline offset `i` —
+/// always in [1, 255], so any zero-fill mixing into an asserted
+/// window fails loudly. Staged by the S09 builders below; re-derived
+/// by the data.rs suites as the expectation (the single source).
+pub(super) fn chassis_nonzero_pattern(i: usize) -> u8 {
+    (i % 255) as u8 + 1
+}
+
+/// Stages one full block of the pattern at block `blk`.
+fn stage_nonzero_pattern_block(disk: &ErofsMemoryDisk, blk: u32) {
+    let payload: Vec<u8> = (0..CHASSIS_BLOCK_SIZE)
+        .map(chassis_nonzero_pattern)
+        .collect();
+    disk.stage_bytes(blk as usize * CHASSIS_BLOCK_SIZE, &payload);
+}
+
+/// Row 11 — the giant FLAT_PLAIN i_size truncation angle: nid 2 is a
+/// healthy REG × FLAT_PLAIN child with i_size = 2^32 + 100 (the
+/// T-013 §11 fixture value; an le64-only domain — compact's le32
+/// cannot express it, G7). Data blocks 5 and 10 (free chassis
+/// blocks behind the root data block 4) carry the pattern: page 0
+/// maps block 5, page la = 5·bs maps block 10 (the u64 full-domain
+/// pa arithmetic), and the tail page (la = 2^32) would read block
+/// 5 + 2^20 — past the 32-block device, the RD2② face. i_u keeps a
+/// real data block: the crafted image stays a legal flat mapping of
+/// a (device-oversized) regular file.
+pub(super) fn fx_inode_giant_i_size() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        stage_nonzero_pattern_block(disk, 5);
+        stage_nonzero_pattern_block(disk, 10);
+        lay_extended_child_at(disk, 2, |record| {
+            put_le_u16(
+                record,
+                offset_of!(RawInodeExtended, i_format),
+                chassis_i_format(InodeVersion::Extended, DataLayout::FlatPlain),
+            );
+            let mode_off = offset_of!(RawInodeExtended, i_mode);
+            let mode = get_le_u16(record, mode_off);
+            put_le_u16(record, mode_off, (mode & !S_IFMT) | S_IFREG);
+            put_le_u64(
+                record,
+                offset_of!(RawInodeExtended, i_size),
+                (1u64 << 32) + 100,
+            );
+            put_le_u32(record, offset_of!(RawInodeExtended, i_u), 5);
+            put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
+        });
+    })
+}
+
+/// Row 7 — the exact-boundary slot with a full-block inline payload:
+/// nid 126's record ends exactly at the block boundary (iloc 8128 +
+/// 64 = 8192), so the FLAT_INLINE payload starts AT the block-2 base
+/// with i_size == bs (4096): the cross-block guard's exact-boundary
+/// PASS corner (blkoff(m_pa) + m_plen == bs, here 0 + 4096 — the
+/// "i_size 恰占满 inode 尾至块界" reading of §5.2). The payload is
+/// the whole pattern block 2 — the exact-boundary slot geometry puts
+/// the record's last byte on the block edge and the payload start on
+/// the next block's base (the record itself stays inside block 1);
+/// i_u keeps the seed's 0xFFFFFFFF, the FlatInline convention of an
+/// inline-only file (the C1 root's own bytes, consumed by no MAPPED
+/// arm at this size).
+pub(super) fn fx_inode_exact_boundary_full_inline() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        stage_nonzero_pattern_block(disk, 2);
+        lay_extended_child_at(disk, RD1_EXACT_BOUNDARY_NID, |record| {
+            put_le_u16(
+                record,
+                offset_of!(RawInodeExtended, i_format),
+                chassis_i_format(InodeVersion::Extended, DataLayout::FlatInline),
+            );
+            let mode_off = offset_of!(RawInodeExtended, i_mode);
+            let mode = get_le_u16(record, mode_off);
+            put_le_u16(record, mode_off, (mode & !S_IFMT) | S_IFREG);
+            put_le_u64(
+                record,
+                offset_of!(RawInodeExtended, i_size),
+                CHASSIS_BLOCK_SIZE as u64,
+            );
+            put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
+        });
+    })
+}
+
+/// Row 8 — the cross-block slot × slow LNK: nid 127's record spans
+/// [8160, 8224) (the RD1 cross-block slot), and the child is an LNK ×
+/// FLAT_INLINE whose size is exactly ONE PAST the fast-criterion
+/// boundary — derived, not spelled: `round_up(inline_start, bs) −
+/// inline_start + 1` with inline_start = 8224, i.e. 4065. Both
+/// boundaries trip on the same byte: the criterion sends the payload
+/// down the slow DataBacked arm (8224 + 4065 > 12288), and the
+/// map-layer guard rejects the inline tail before any fetch (blkoff
+/// 32 + 4065 > 4096) — production EUCLEAN (matrix §4.3 "跨块 →
+/// EUCLEAN"), which the framework VmIo boundary folds to EINVAL (the
+/// registered drift, T-025 S06 §3; the suites assert the aster
+/// value). No payload is staged: the guard fires first.
+pub(super) fn fx_inode_cross_block_slow_symlink() -> ErofsFixture {
+    rewritten_chassis(|disk| {
+        let sb = staged_super_block(disk);
+        let inline_start =
+            inode_location(&sb, RD1_CROSS_BLOCK_NID) + size_of::<RawInodeExtended>() as u64;
+        let bs = CHASSIS_BLOCK_SIZE as u64;
+        let size = inline_start.div_ceil(bs) * bs - inline_start + 1;
+        lay_extended_child_at(disk, RD1_CROSS_BLOCK_NID, |record| {
+            put_le_u16(
+                record,
+                offset_of!(RawInodeExtended, i_format),
+                chassis_i_format(InodeVersion::Extended, DataLayout::FlatInline),
+            );
+            let mode_off = offset_of!(RawInodeExtended, i_mode);
+            let mode = get_le_u16(record, mode_off);
+            put_le_u16(record, mode_off, (mode & !S_IFMT) | S_IFLNK);
+            put_le_u64(record, offset_of!(RawInodeExtended, i_size), size);
+            put_le_u32(record, offset_of!(RawInodeExtended, i_nlink), 1);
         });
     })
 }

@@ -166,7 +166,8 @@ mod tests {
         Erofs,
         inode::{DataLayout, InodeVersion},
         test_utils::{
-            assert_errno, fx_name_non_utf8_symlink_target, ktest_lnk_desc, ktest_super_block,
+            RD1_CROSS_BLOCK_NID, assert_errno, fx_inode_cross_block_slow_symlink,
+            fx_name_non_utf8_symlink_target, ktest_lnk_desc, ktest_super_block,
         },
     };
 
@@ -392,6 +393,40 @@ mod tests {
             root.lookup("slowbad").unwrap().read_link(),
             Errno::EIO,
             "G-N02: the slow DataBacked arm likewise"
+        );
+    }
+
+    /// T-027 S09 (FX-INODE row 8 of S06 §5.2; matrix §4.3): the
+    /// cross-block slot × slow symlink — nid 127's record spans
+    /// [8160, 8224), and the LNK × FLAT_INLINE child's size is one
+    /// byte past the fast-criterion boundary (8224 + 4065 > 12288),
+    /// so the payload takes the slow DataBacked arm and read_link
+    /// walks the page cache into `map_blocks`, whose cross-block
+    /// inline guard fires BEFORE any fetch (blkoff 32 + 4065 >
+    /// 4096): production EUCLEAN per matrix §4.3 — folded to EINVAL
+    /// by the framework VmIo boundary, the registered drift (T-025
+    /// S06 §3; the same exit the direct-construction vector
+    /// `slow_lnk_inline_cross_block_euclean_exit` pins), asserted at
+    /// the aster value. The request log proves the
+    /// guard-before-fetch order on the mounted chain: no new device
+    /// request between iget and the rejected readlink.
+    #[ktest]
+    fn cross_block_slot_slow_symlink_inline_exit() {
+        let fixture = fx_inode_cross_block_slow_symlink();
+        let fs = fixture.mounted();
+        let inode = fs.iget(RD1_CROSS_BLOCK_NID).unwrap();
+        assert_eq!(inode.kind(), FileKind::Lnk);
+
+        let nr_requests_after_iget = fixture.disk.requests().len();
+        assert_errno!(
+            inode.read_link(),
+            Errno::EINVAL,
+            "the cross-block inline target: production EUCLEAN, the registered VmIo-boundary drift"
+        );
+        assert_eq!(
+            fixture.disk.requests().len(),
+            nr_requests_after_iget,
+            "the cross-block guard fires before any payload fetch"
         );
     }
 }

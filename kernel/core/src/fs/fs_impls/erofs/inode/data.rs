@@ -832,15 +832,18 @@ mod tests {
     use align_ext::AlignExt;
     use aster_block::{SECTOR_SIZE, bio::BioType};
     use io_util::IoError;
-    use ostd::prelude::*;
+    use ostd::{mm::io::Fallible, prelude::*};
 
     use super::*;
     use crate::fs::fs_impls::erofs::{
         Erofs,
         fs::DeviceTable,
+        inode::FileKind,
         test_utils::{
-            BioRequest, ErofsMemoryDisk, ktest_bio_trio, ktest_data_geometry, ktest_flat_geometry,
-            ktest_flatdev_table, ktest_fs_on, ktest_single_device_table, ktest_super_block,
+            BioRequest, ErofsMemoryDisk, RD1_EXACT_BOUNDARY_NID, assert_errno,
+            chassis_nonzero_pattern, fx_inode_exact_boundary_full_inline, fx_inode_giant_i_size,
+            ktest_bio_trio, ktest_data_geometry, ktest_flat_geometry, ktest_flatdev_table,
+            ktest_fs_on, ktest_single_device_table, ktest_super_block,
         },
     };
 
@@ -1833,5 +1836,84 @@ mod tests {
         };
         let backend = DataBackend::new(fs.self_ref().clone(), fs.block_device().clone(), geom, 4);
         assert_eq!(backend.npages, 4);
+    }
+
+    // ------------------------------------------------------------------
+    // The T-027 S09 mounted-chain suite (FX-INODE data-defense rows
+    // 11 and 7 of S06 §5.2; matrix §1.6 IMG-CRAFT-INODE): crafted
+    // child records staged over the healthy chassis and mounted
+    // through the production `Erofs::open` — the first FX suites
+    // whose assertion surface is the READ path (read_at → page
+    // cache → submit_read_bio → map_blocks), not a mount or iget
+    // door.
+    // ------------------------------------------------------------------
+
+    /// T-027 S09 (FX-INODE row 11; matrix §4.1/§4.2 + RD2②): the
+    /// giant FLAT_PLAIN i_size = 2^32 + 100 — the le64 domain
+    /// carried whole through decode → geometry collapse → mapping.
+    /// Pages 0 and 5·bs (data blocks 5 and 10) read back the staged
+    /// pattern byte-exact — a u32 collapse of the size would shrink
+    /// npages to 1 and page 0's window to 100 bytes, so the two
+    /// full-page pattern reads are the distinguishing face (the
+    /// page-5 read also pins the u64 pa arithmetic `raw·bs + la`
+    /// deep inside the domain). The tail page (la = 2^32) maps data
+    /// block 5 + 2^20 — past the 32-block device: the framework
+    /// byte-channel bound rejects before any fetch, EINVAL — the
+    /// RD2② registered drift value (aster EINVAL / Linux EIO),
+    /// asserted unfolded.
+    #[ktest]
+    fn giant_i_size_read_path_full_domain() {
+        let fixture = fx_inode_giant_i_size();
+        let fs = fixture.mounted();
+        let inode = fs.iget(2).unwrap();
+        assert_eq!(inode.kind(), FileKind::Reg);
+        assert_eq!(inode.desc().size, (1u64 << 32) + 100);
+
+        // In-device pages: full-window pattern reads (matrix §4.1
+        // read-content parity).
+        for la in [0usize, 5 * PAGE_SIZE] {
+            let mut buf = [0u8; PAGE_SIZE];
+            let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+            assert_eq!(inode.read_at(la, &mut writer).unwrap(), PAGE_SIZE, "la {la}");
+            for (i, b) in buf.iter().enumerate() {
+                assert_eq!(*b, chassis_nonzero_pattern(i), "la {la} byte {i}");
+            }
+        }
+
+        // The tail page past the device bound (RD2②).
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+        assert_errno!(
+            inode.read_at(1usize << 32, &mut writer),
+            Errno::EINVAL,
+            "the giant tail page maps block 5 + 2^20, past the 32-block device"
+        );
+    }
+
+    /// T-027 S09 (FX-INODE row 7; matrix §4.3): the exact-boundary
+    /// slot's full-block inline payload — nid 126's record ends
+    /// exactly at the block edge (8128 + 64 = 8192), the FLAT_INLINE
+    /// payload starts at the block-2 base with i_size == bs: the
+    /// cross-block guard's exact-boundary PASS corner
+    /// (blkoff(m_pa) + m_plen == bs — 0 + 4096, the "inline 载荷截
+    /// i_size" full-block reading). The whole page is payload (the
+    /// copy clamps to i_size = PAGE; the zero tail-fill has length
+    /// 0), and the pattern is nonzero everywhere, so the byte-exact
+    /// read proves the content fidelity AND the absence of zero-fill
+    /// mixing in one pass.
+    #[ktest]
+    fn exact_boundary_full_inline_block_maps() {
+        let fixture = fx_inode_exact_boundary_full_inline();
+        let fs = fixture.mounted();
+        let inode = fs.iget(RD1_EXACT_BOUNDARY_NID).unwrap();
+        assert_eq!(inode.kind(), FileKind::Reg);
+        assert_eq!(inode.desc().size, PAGE_SIZE as u64);
+
+        let mut buf = [0u8; PAGE_SIZE];
+        let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+        assert_eq!(inode.read_at(0, &mut writer).unwrap(), PAGE_SIZE);
+        for (i, b) in buf.iter().enumerate() {
+            assert_eq!(*b, chassis_nonzero_pattern(i), "byte {i}");
+        }
     }
 }
