@@ -2073,12 +2073,15 @@ mod tests {
     use ostd::prelude::ktest;
 
     use super::*;
-    use crate::fs::fs_impls::erofs::test_utils::{
-        assert_errno, fx_xattr_acl_value_malformed, fx_xattr_dead_index_entries,
-        fx_xattr_empty_name_entry, fx_xattr_entry_beyond_remaining, fx_xattr_glued_acl_name_entries,
-        fx_xattr_header_size_overrun, fx_xattr_non_utf8_names, fx_xattr_symlink_host_user,
+    use crate::fs::{
+        fs_impls::erofs::test_utils::{
+            assert_errno, fx_xattr_acl_value_malformed, fx_xattr_dead_index_entries,
+            fx_xattr_empty_name_entry, fx_xattr_entry_beyond_remaining,
+            fx_xattr_glued_acl_name_entries, fx_xattr_header_size_overrun, fx_xattr_non_utf8_names,
+            fx_xattr_symlink_host_user,
+        },
+        vfs::file_system::FsFlags,
     };
-    use crate::fs::vfs::file_system::FsFlags;
 
     /// get through the inherent face over a kernel buffer — the
     /// writer conversion every ktest consumer of the chain spells.
@@ -2116,7 +2119,7 @@ mod tests {
         let mut buf = [0u8; 16];
         assert_errno!(get_attr(&inode, "user.", &mut buf), Errno::EINVAL);
         assert_errno!(get_attr(&inode, "user.x", &mut buf), Errno::ENODATA);
-        let control = fs.iget(4).unwrap();
+        let control = fs.iget(6).unwrap();
         assert_eq!(get_attr(&control, "user.ctrl", &mut buf).unwrap(), 7);
         assert_eq!(&buf[..7], b"ctrlval");
     }
@@ -2190,8 +2193,11 @@ mod tests {
         let mut buf = [0u8; 16];
         assert_errno!(get_attr(&inode, "user.x", &mut buf), Errno::ENODATA);
         let mut list_buf = [0u8; 32];
-        assert_eq!(list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(), 0);
-        let control = fs.iget(4).unwrap();
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            0
+        );
+        let control = fs.iget(6).unwrap();
         assert_eq!(get_attr(&control, "user.ok", &mut buf).unwrap(), 2);
         assert_eq!(&buf[..2], b"v0");
     }
@@ -2247,14 +2253,15 @@ mod tests {
 
     /// T-027 S12 (§6.3 X45/X46, 值域畸形/空值): the acl value-domain
     /// legs, one child each (an acl get parses the FIRST index-matching
-    /// entry). The three-code split with the production order
+    /// entry; the children sit four slots apart — the ibody's room
+    /// rule). The three-code split with the production order
     /// preserved: nid 2 carries a_version 1 on a MISALIGNED body —
     /// EOPNOTSUPP, the version door before the alignment judgement
-    /// (nid 8 is the same shape with version 2 and answers EINVAL —
+    /// (nid 14 is the same shape with version 2 and answers EINVAL —
     /// the order face pinned by the pair); the short and the EMPTY
     /// values answer EINVAL (the 0-length half — the same on-disk
     /// empty value is a legal Ok(0) on the generic user channel, nid
-    /// 16: two channels, two codes); the unknown tag and the
+    /// 30: two channels, two codes); the unknown tag and the
     /// undefined −1 id fail at their own entries (EINVAL); the pure
     /// version-2 header is "legal but empty" → ENODATA.
     #[ktest]
@@ -2262,21 +2269,16 @@ mod tests {
         let fixture = fx_xattr_acl_value_malformed();
         let fs = fixture.mounted();
         let mut buf = [0u8; 64];
-        let mut acl = |nid: u64| {
-            get_attr(
-                &fs.iget(nid).unwrap(),
-                "system.posix_acl_access",
-                &mut buf,
-            )
-        };
+        let mut acl =
+            |nid: u64| get_attr(&fs.iget(nid).unwrap(), "system.posix_acl_access", &mut buf);
         assert_errno!(acl(2), Errno::EOPNOTSUPP, "version door before alignment");
-        assert_errno!(acl(4), Errno::EINVAL, "value shorter than the header");
-        assert_errno!(acl(6), Errno::EINVAL, "the empty acl value");
-        assert_errno!(acl(8), Errno::EINVAL, "(size - 4) not a multiple of 8");
-        assert_errno!(acl(10), Errno::EINVAL, "unknown acl tag");
-        assert_errno!(acl(12), Errno::EINVAL, "the undefined -1 acl id");
-        assert_errno!(acl(14), Errno::ENODATA, "a pure header is absent");
-        let generic = fs.iget(16).unwrap();
+        assert_errno!(acl(6), Errno::EINVAL, "value shorter than the header");
+        assert_errno!(acl(10), Errno::EINVAL, "the empty acl value");
+        assert_errno!(acl(14), Errno::EINVAL, "(size - 4) not a multiple of 8");
+        assert_errno!(acl(18), Errno::EINVAL, "unknown acl tag");
+        assert_errno!(acl(22), Errno::EINVAL, "the undefined -1 acl id");
+        assert_errno!(acl(26), Errno::ENODATA, "a pure header is absent");
+        let generic = fs.iget(30).unwrap();
         assert_eq!(
             get_attr(&generic, "user.empty", &mut buf).unwrap(),
             0,
@@ -2305,7 +2307,10 @@ mod tests {
         assert_eq!(get_attr(&inode, "trusted.x", &mut buf).unwrap(), 2);
         assert_eq!(&buf[..2], b"tv");
         let mut list_buf = [0u8; 32];
-        assert_eq!(list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(), 7);
+        assert_eq!(
+            list_attr(&inode, XattrNamespace::User, &mut list_buf).unwrap(),
+            7
+        );
         assert_eq!(&list_buf[..7], b"user.x\0");
         assert_eq!(inode.read_link().unwrap(), "ok-target");
 

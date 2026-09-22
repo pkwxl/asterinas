@@ -3002,7 +3002,12 @@ fn switch_type_segment(record: &mut [u8; 64], segment: u16) {
 /// deliberately mismatch it against the staged bytes), and `ibody`
 /// stages at suffix_xattr_start = iloc + 64 (the production base
 /// point, never recomputed here). The staged bytes must fit the
-/// 4-slot child spacing (the `lay_fast_symlink_at` room rule).
+/// 4-slot child spacing (the `lay_fast_symlink_at` room rule), and
+/// SIBLINGS must sit at least four slots away (nid + 4): slots are
+/// 32 bytes (`ISLOT_BITS` = 5), so an extended record fills the two
+/// slots of nid and nid + 1 and a child at nid + 2 would stage its
+/// record exactly over this ibody, silently rewriting it (the first
+/// driver run's EINVAL root — see S12 index §7).
 fn lay_xattr_child_at(
     disk: &ErofsMemoryDisk,
     nid: u64,
@@ -3023,7 +3028,10 @@ fn lay_xattr_child_at(
     // The 4-slot child spacing (the `lay_fast_symlink_at` room rule)
     // leaves 64 bytes behind the record for the ibody.
     let room = (4 << ISLOT_BITS) - size_of::<RawInodeExtended>();
-    assert!(ibody.len() <= room, "the ibody must fit the 4-slot child spacing");
+    assert!(
+        ibody.len() <= room,
+        "the ibody must fit the 4-slot child spacing"
+    );
     disk.stage_bytes(ibody_pos, ibody);
 }
 
@@ -3045,13 +3053,20 @@ fn patch_reg_record(record: &mut [u8; 64]) {
 /// Lays the standard ibody child: [`patch_reg_record`] plus the ibody
 /// area sized to the staged bytes (the well-formed geometry).
 fn lay_xattr_reg_child_at(disk: &ErofsMemoryDisk, nid: u64, ibody: &[u8]) {
-    lay_xattr_child_at(disk, nid, icount_for_ibody(ibody.len()), patch_reg_record, ibody);
+    lay_xattr_child_at(
+        disk,
+        nid,
+        icount_for_ibody(ibody.len()),
+        patch_reg_record,
+        ibody,
+    );
 }
 
 /// Row 6 (§6.1 W-X03) — the empty-name entry: nid 2 carries a REAL
 /// user entry with e_name_len = 0 and a one-byte value (the marker
 /// ≠ 0: the entry demonstrably exists on disk), plus the healthy
-/// "ctrl" control child at nid 4. get("user.") answers EINVAL at the
+/// "ctrl" control child at nid 6 (four slots behind — the ibody's
+/// room rule). get("user.") answers EINVAL at the
 /// name-resolution gate (the per-FS W-X03 patch — the parse layer,
 /// F38), the control hits (the walk is healthy), and the empty-name
 /// entry matches no query (its suffix length 0 can never equal a
@@ -3064,7 +3079,7 @@ pub(super) fn fx_xattr_empty_name_entry() -> ErofsFixture {
         lay_xattr_reg_child_at(disk, 2, &crafted);
         let mut control = ibody_header(0, 0).to_vec();
         control.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"ctrl", b"ctrlval"));
-        lay_xattr_reg_child_at(disk, 4, &control);
+        lay_xattr_reg_child_at(disk, 6, &control);
     })
 }
 
@@ -3117,7 +3132,8 @@ pub(super) fn fx_xattr_dead_index_entries() -> ErofsFixture {
 /// face; the bytes there are the disk's zeros), the inline walk is
 /// empty, and the overrun ids (both 0) resolve through the chassis
 /// xattr_blkaddr 0 to the block-0 zero bytes — dead entries,
-/// exhaustion. The healthy "ok" control child at nid 4 separates the
+/// exhaustion. The healthy "ok" control child at nid 6 (four slots
+/// behind, keeping the overrun-id zeros real) separates the
 /// X23 empty-walk ENODATA from a staging bug. Suite: `xattr.rs`.
 pub(super) fn fx_xattr_header_size_overrun() -> ErofsFixture {
     rewritten_chassis(|disk| {
@@ -3128,7 +3144,7 @@ pub(super) fn fx_xattr_header_size_overrun() -> ErofsFixture {
         lay_xattr_child_at(disk, 2, 2, patch_reg_record, &ibody);
         let mut control = ibody_header(0, 0).to_vec();
         control.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"ok", b"v0"));
-        lay_xattr_reg_child_at(disk, 4, &control);
+        lay_xattr_reg_child_at(disk, 6, &control);
     })
 }
 
@@ -3165,30 +3181,28 @@ pub(super) fn fx_xattr_non_utf8_names() -> ErofsFixture {
     rewritten_chassis(|disk| {
         let mut ibody = ibody_header(0, 0).to_vec();
         ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"ok", b"v0"));
-        ibody.extend_from_slice(&xattr_entry_bytes(
-            XATTR_INDEX_USER,
-            &[0xFF, 0x80],
-            b"v1",
-        ));
+        ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, &[0xFF, 0x80], b"v1"));
         lay_xattr_reg_child_at(disk, 2, &ibody);
     })
 }
 
 /// Row 12 (§6.3 X45/X46, 值域畸形/空值) — the acl value-domain legs,
 /// one child each (an acl get parses the FIRST index-matching entry —
-/// one outcome per inode), plus the generic-channel empty-value dual:
+/// one outcome per inode), spaced four slots apart (nid + 4: the
+/// ibody's room rule — a +2 sibling's record would land exactly on
+/// the previous ibody), plus the generic-channel empty-value dual:
 ///
 /// * nid 2: a_version 1 on a MISALIGNED 9-byte body → EOPNOTSUPP (the
-///   version door BEFORE the alignment judgement; nid 8 is the same
+///   version door BEFORE the alignment judgement; nid 14 is the same
 ///   shape with version 2 → EINVAL — the pair pins the order face);
-/// * nid 4: a 2-byte body → EINVAL (shorter than the header);
-/// * nid 6: the EMPTY value → EINVAL (the 0-length half — the acl
-///   channel; the generic channel's Ok(0) dual is nid 16);
-/// * nid 8: version 2 on the misaligned 9-byte body → EINVAL;
-/// * nid 10: unknown tag 0x0003 → EINVAL (at its own entry);
-/// * nid 12: ACL_USER (0x0002) carrying the −1 undefined id → EINVAL;
-/// * nid 14: the pure version-2 header → "legal but empty" ENODATA;
-/// * nid 16: a user entry "empty" with a 0-length value → Ok(0) (the
+/// * nid 6: a 2-byte body → EINVAL (shorter than the header);
+/// * nid 10: the EMPTY value → EINVAL (the 0-length half — the acl
+///   channel; the generic channel's Ok(0) dual is nid 30);
+/// * nid 14: version 2 on the misaligned 9-byte body → EINVAL;
+/// * nid 18: unknown tag 0x0003 → EINVAL (at its own entry);
+/// * nid 22: ACL_USER (0x0002) carrying the −1 undefined id → EINVAL;
+/// * nid 26: the pure version-2 header → "legal but empty" ENODATA;
+/// * nid 30: a user entry "empty" with a 0-length value → Ok(0) (the
 ///   same on-disk empty value through the generic face — two
 ///   channels, two codes).
 ///
@@ -3197,34 +3211,42 @@ pub(super) fn fx_xattr_acl_value_malformed() -> ErofsFixture {
     rewritten_chassis(|disk| {
         let acl_child = |disk: &ErofsMemoryDisk, nid: u64, value: &[u8]| {
             let mut ibody = ibody_header(0, 0).to_vec();
-            ibody.extend_from_slice(&xattr_entry_bytes(
-                XATTR_INDEX_POSIX_ACL_ACCESS,
-                b"",
-                value,
-            ));
+            ibody.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_POSIX_ACL_ACCESS, b"", value));
             lay_xattr_reg_child_at(disk, nid, &ibody);
         };
         // a_version = 1 (le32) + a misaligned 5-byte tail: the version
         // door fires before the alignment judgement.
-        acl_child(disk, 2, &[0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00]);
+        acl_child(
+            disk,
+            2,
+            &[0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00],
+        );
         // Shorter than the 4-byte header.
-        acl_child(disk, 4, &[0x02, 0x00]);
+        acl_child(disk, 6, &[0x02, 0x00]);
         // The empty value (the acl-channel half of the 0-length form).
-        acl_child(disk, 6, &[]);
+        acl_child(disk, 10, &[]);
         // a_version = 2 + the same misaligned 5-byte tail.
-        acl_child(disk, 8, &[0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00]);
+        acl_child(
+            disk,
+            14,
+            &[0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00],
+        );
         // Version 2 + one record with the unknown tag 0x0003.
-        let unknown_tag = [0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00];
-        acl_child(disk, 10, &unknown_tag);
+        let unknown_tag = [
+            0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        acl_child(disk, 18, &unknown_tag);
         // Version 2 + ACL_USER (0x0002) with e_id = 0xFFFFFFFF.
-        let undef_id = [0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x06, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
-        acl_child(disk, 12, &undef_id);
+        let undef_id = [
+            0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x06, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        acl_child(disk, 22, &undef_id);
         // The pure version-2 header: count 0 → "legal but empty".
-        acl_child(disk, 14, &[0x02, 0x00, 0x00, 0x00]);
+        acl_child(disk, 26, &[0x02, 0x00, 0x00, 0x00]);
         // The generic-channel empty-value dual: user "empty", value 0.
         let mut generic = ibody_header(0, 0).to_vec();
         generic.extend_from_slice(&xattr_entry_bytes(XATTR_INDEX_USER, b"empty", b""));
-        lay_xattr_reg_child_at(disk, 16, &generic);
+        lay_xattr_reg_child_at(disk, 30, &generic);
     })
 }
 
@@ -3268,9 +3290,8 @@ pub(super) fn fx_xattr_symlink_host_user() -> ErofsFixture {
         // The fast-symlink target behind the ibody area — the very
         // position the fast/slow criterion and `read_link` consume.
         let sb = staged_super_block(disk);
-        let inline_start = inode_location(&sb, 2)
-            + size_of::<RawInodeExtended>() as u64
-            + ibody.len() as u64;
+        let inline_start =
+            inode_location(&sb, 2) + size_of::<RawInodeExtended>() as u64 + ibody.len() as u64;
         disk.stage_bytes(inline_start as usize, target);
     })
 }
