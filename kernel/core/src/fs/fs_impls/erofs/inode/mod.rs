@@ -2086,8 +2086,8 @@ mod tests {
     use super::*;
     use crate::{
         fs::fs_impls::erofs::test_utils::{
-            BioRequest, ErofsMemoryDisk, RD1_CROSS_BLOCK_NID, RD1_EXACT_BOUNDARY_NID,
-            assert_errno, fx_inode_bogus_mode, fx_inode_chunk_format, fx_inode_cross_block_slot,
+            BioRequest, ErofsMemoryDisk, RD1_CROSS_BLOCK_NID, RD1_EXACT_BOUNDARY_NID, assert_errno,
+            fx_inode_bogus_mode, fx_inode_chunk_format, fx_inode_cross_block_slot,
             fx_inode_datalayout_reserved, fx_inode_exact_boundary_slot, fx_inode_ifmt_high_bits,
             fx_inode_kind_layout_cross, fx_inode_negative_size, fx_time_compact_ctime,
             fx_time_giant_nsec, fx_time_giant_seconds, ktest_bio_trio, ktest_flat_geometry,
@@ -2923,7 +2923,7 @@ mod tests {
     /// first. The single-point read (RD0) decodes the record whole:
     /// every staged field survives byte-exact, including one witness
     /// from EACH 32-byte half (i_size @8 in the first, i_mtime @32 in
-    /// the second — the half a mis-spliced read would corrupt).
+    /// the second — the half a wrongly spliced read would corrupt).
     #[ktest]
     fn cross_block_slot_splice_decodes_record() {
         let fixture = fx_inode_cross_block_slot();

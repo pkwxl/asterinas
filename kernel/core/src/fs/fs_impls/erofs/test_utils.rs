@@ -141,10 +141,10 @@ use super::{
     Erofs,
     fs::DeviceTable,
     inode::{
-        AddrState, CHUNK_FORMAT_ALL, CHUNK_FORMAT_INDEXES, ChunkGeometry, DataGeometry,
-        DataLayout, FileKind, I_ALL, I_DATALAYOUT_BIT, I_VERSION_BIT, INODE_DATALAYOUT_MAX,
-        ISLOT_BITS, InodeDesc, InodeVersion, RawDirent, RawInodeCompact, RawInodeExtended,
-        S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, inode_location,
+        AddrState, CHUNK_FORMAT_ALL, CHUNK_FORMAT_INDEXES, ChunkGeometry, DataGeometry, DataLayout,
+        FileKind, I_ALL, I_DATALAYOUT_BIT, I_VERSION_BIT, INODE_DATALAYOUT_MAX, ISLOT_BITS,
+        InodeDesc, InodeVersion, RawDirent, RawInodeCompact, RawInodeExtended, S_IFIFO, S_IFLNK,
+        S_IFMT, S_IFREG, inode_location,
     },
     prelude::*,
     super_block::{
