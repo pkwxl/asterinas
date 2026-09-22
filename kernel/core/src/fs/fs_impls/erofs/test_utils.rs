@@ -2056,8 +2056,16 @@ fn lay_compact_root(disk: &ErofsMemoryDisk) {
         offset_of!(RawInodeCompact, i_format),
         chassis_i_format(InodeVersion::Compact, DataLayout::FlatPlain),
     );
-    put_le_u32(&mut root, offset_of!(RawInodeCompact, i_size), CHASSIS_ROOT_DIR_SIZE as u32);
-    put_le_u32(&mut root, offset_of!(RawInodeCompact, i_u), CHASSIS_ROOT_DATA_BLK);
+    put_le_u32(
+        &mut root,
+        offset_of!(RawInodeCompact, i_size),
+        CHASSIS_ROOT_DIR_SIZE as u32,
+    );
+    put_le_u32(
+        &mut root,
+        offset_of!(RawInodeCompact, i_u),
+        CHASSIS_ROOT_DATA_BLK,
+    );
     put_le_u16(&mut root, offset_of!(RawInodeCompact, i_nlink), 2);
     write_inode_at(disk, CHASSIS_ROOT_NID, &root);
     let iloc = inode_location(&staged_super_block(disk), CHASSIS_ROOT_NID) as usize;
@@ -2090,7 +2098,11 @@ pub(super) fn fx_time_giant_seconds() -> ErofsFixture {
 pub(super) fn fx_time_giant_nsec() -> ErofsFixture {
     rewritten_chassis(|disk| {
         patch_root_inode(disk, |root| {
-            put_le_u32(root, offset_of!(RawInodeExtended, i_mtime_nsec), 2_000_000_000);
+            put_le_u32(
+                root,
+                offset_of!(RawInodeExtended, i_mtime_nsec),
+                2_000_000_000,
+            );
         });
     })
 }
