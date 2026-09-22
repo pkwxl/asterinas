@@ -690,7 +690,7 @@ const INODE_EXT_TEMPLATE: [u8; 64] = [
 /// chassis).
 // First consumer since T-027 S03: the `chassis_staging_shape`
 // smoke cross-locks the seed's i_format word against the compose
-// helper (the S02-era `#[expect(dead_code)]` came off with it).
+// helper — the S02-era dead-code expectation came off with it.
 // Compact chassis staging itself arrives with the S07 FX-TIME
 // suites.
 const INODE_CPT_TEMPLATE: [u8; 32] = [
