@@ -76,7 +76,7 @@
 #define EROFS_FLATDEV_TOTAL_BLOCKS 25ULL /* MD8: 12 (main) + 13 (blob) */
 
 /*
- * C1 uuid = EROFS_UUID_BASE (test/initramfs/Makefile:77), byte for
+ * C1 uuid = EROFS_UUID_BASE (test/initramfs/Makefile:78), byte for
  * byte. The XOR-fold expectation below is mechanically regenerated
  * from these bytes -- never stored as a value table.
  */
