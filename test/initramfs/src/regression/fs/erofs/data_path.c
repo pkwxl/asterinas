@@ -2,8 +2,9 @@
 
 /*
  * erofs uncompressed data-path assertions (T-020/S13; matrix sec. 4.1-4.5
- * healthy halves + sec. 7.3 G-O06 + C11 main-only out-of-bounds EIO --
- * S05 sec. 3 file #11).
+ * healthy halves + sec. 7.3 G-O06 + C11 main-only out-of-bounds EIO) +
+ * sec. 3.1 D7/D12 chunk-image statx halves (T-033/S03) -- S05 sec. 3
+ * file #11.
  *
  * Faces and carriers:
  *   - buffered-read faces on the persistent init mount MNT = /erofs
@@ -33,14 +34,23 @@
  *     T-018/S08: main = 12 blocks, mapped = 12, blob = 13 blocks);
  *   - MD10/MD13: C11 main image mounted main-only -- metadata resolves
  *     from the 12-block main device while every data chunk shifts beyond
- *     its end -> data read EIO.
+ *     its end -> data read EIO;
+ *   - sec. 3.1 D7/D12 chunk-image statx halves (T-033/S03): st_size +
+ *     st_blocks over the regular/ size ladder on the self-mounted C12
+ *     and D1 carriers -- metadata-only assertions, no content read
+ *     (S05 sec. 3 #11 service-row extension, revision T-033/S01;
+ *     expected values frozen in docs/T-033/S02/index.md sec. 2).
  *
  * Guards: MNT tests use EROFS_SKIP_IF_NO_INIT_MNT() (mount-success
  * evidence, S05 sec. 6 extension 2); C12/D1/C11 tests use the self-mount
  * class guard EROFS_SKIP_IF_NO_DEV() (device present AND erofs
  * registered, extension 1) and mount/umount the single self-mount point
  * serially inside the FN_TEST. The init mount point is never unmounted
- * or remounted.
+ * or remounted. The two statx cases stack EROFS_SKIP_IF_NO_INIT_MNT()
+ * on top as the namei-activation proxy but deliberately carry NO
+ * EROFS_SKIP_IF_NO_DATA_FACE() guard: statx settles nr_sectors at
+ * inode-decode time and never reads the chunk index (S05 sec. 3 #11,
+ * revision T-033/S01).
  *
  * Expected values are frozen from the baseline BEFORE the erofs
  * implementation exists. Registered-difference assertions carry their
@@ -58,13 +68,16 @@
  * plus the head-4K formula probe (the T-018/S07 sec. 2 anchor-② form
  * faces), never a full-file compare.
  *
- * Face boundaries (no overlap with sibling files): the statx DIOALIGN
- * non-advertising face (X14/W-N02/W-P03 same batch) belongs to
- * inode_stat.c; the llseek SEEK_DATA/HOLE/oversized-offset faces
- * (W-N09) belong to readdir.c; the write-family EROFS panorama belongs
- * to write_ero_fs.c (this file carries one face-inline open(O_WRONLY)
- * negative per the S05 sec. 7.2 sample); the crafted cross-block inline
- * image (EUCLEAN defense) rides FX-INODE on the ktest half.
+ * Face boundaries (no overlap with sibling files): the D7/D12 statx
+ * formula faces are split by image kind -- flat halves in inode_stat.c
+ * (#7, MNT + vdd), chunk halves here (#11, vdp/vdq self-mounts,
+ * revision T-033/S01); the statx DIOALIGN non-advertising face
+ * (X14/W-N02/W-P03 same batch) belongs to inode_stat.c; the llseek
+ * SEEK_DATA/HOLE/oversized-offset faces (W-N09) belong to readdir.c;
+ * the write-family EROFS panorama belongs to write_ero_fs.c (this file
+ * carries one face-inline open(O_WRONLY) negative per the S05 sec. 7.2
+ * sample); the crafted cross-block inline image (EUCLEAN defense)
+ * rides FX-INODE on the ktest half.
  *
  * Sources (never re-derive locally): matrix sec. 4.1/4.2/4.3/4.4/4.5
  * and sec. 7.3 (docs/R-01/phase-docs/a-analysis/r1-baseline-matrix.md)
@@ -80,6 +93,7 @@
 #include "erofs_common.h"
 
 #include <linux/fiemap.h>
+#include <linux/stat.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -87,6 +101,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 /*
@@ -143,6 +158,23 @@
 
 #define EROFS_REG_DIR EROFS_INIT_MNT "/regular"
 #define EROFS_SELF_REG EROFS_SELF_MNT "/regular"
+
+/*
+ * AUTO-DECISION: ero_statx is a local static twin of the inode_stat.c
+ * helper -- same raw syscall(SYS_statx) + <linux/stat.h> UAPI form
+ * (S09 AUTO-DECISION ④; this host's glibc ships no struct statx
+ * wrapper) -- rather than a lift into erofs_common.h: per-file static
+ * helpers/constants are the established pattern in this directory
+ * (EROFS_IMG_BS is likewise defined per file), and lifting would touch
+ * the #7 carrier file for zero behavioral gain. (Test-writing choice;
+ * no expected value moves.)
+ */
+static int ero_statx(const char *path, int at_flags, unsigned int mask,
+		     struct statx *stx)
+{
+	memset(stx, 0, sizeof(*stx));
+	return (int)syscall(SYS_statx, AT_FDCWD, path, at_flags, mask, stx);
+}
 
 /*
  * Compare `len` bytes of `buf` against the content formula window
@@ -636,6 +668,87 @@ FN_TEST(data_path_chunk4b_crossblk_content)
 END_TEST()
 
 /*
+ * Matrix sec. 3.1 D7/D12 (parity), chunk-image statx halves on the
+ * self-mounted C12 (4-byte chunk entries): the regular/ size ladder's
+ * st_size/st_blocks faces, file by file. The whole staged tree is
+ * CHUNK_BASED on this image, so every ladder entry decodes through
+ * the chunk inode path and D12 lands the generic !nblks branch --
+ * st_blocks = round_up(i_size, bs) >> 9, the same formula and values
+ * as the flat face carried by inode_stat.c (#7, MNT + vdd). The
+ * halves are asserted on independent carriers/assertion points on
+ * purpose (docs/T-033/S01/index.md sec. 3): a future chunk-side
+ * accounting drift (e.g. units-based bookkeeping) turns this case red
+ * while the flat face stays green. Expected values are the frozen
+ * table of docs/T-033/S02/index.md sec. 2 (blocks = ceil(size/4096) x
+ * 8, 512B sectors); the 16588B and sparse rows are the granularity-
+ * promoted entries that actually separate the two accountings
+ * (docs/T-033/S02/index.md sec. 3). Metadata face only: no content
+ * read or EOF probe of any kind (sparse content distortion,
+ * T-018/S07 sec. 3 / T-018 report sec. 3-2).
+ *
+ * AUTO-DECISION: the case asserts st_size alongside st_blocks (D7
+ * riding the same statx call) instead of blocks-only -- the S09 sec.
+ * 4-③ original pointer named both faces (size/blocks), S13 landed
+ * only the vdq/vdo size halves, so this closes the vdp D7 gap at zero
+ * marginal cost and makes the assertion list reconcile 1:1 with the
+ * S02 sec. 2 table (both columns). (Assertion-face choice; no
+ * expected value moves.)
+ */
+FN_TEST(data_path_chunk4b_statx_size_blocks)
+{
+	static const struct {
+		const char *name;
+		unsigned long long size;
+		unsigned long long blocks;
+	} rows[] = {
+		{ "empty_file.bin", 0, 0 },
+		{ "file_1b.bin", 1, 8 },
+		{ "inline_64b.bin", 64, 8 },
+		{ "content_anchor.txt", 200, 8 },
+		{ "inline_4095b.bin", 4095, 8 },
+		{ "flat_4096b.bin", 4096, 8 },
+		{ "flat_4097b.bin", 4097, 16 },
+		{ "flat_16k_plus_100b.bin", 16588, 40 },
+		{ "sparse_hole.bin", 401408, 784 },
+	};
+	struct statx stx;
+	char path[256];
+	size_t i;
+
+	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CHUNK4B);
+	/*
+	 * Activation-boundary guard (T-023/S08): the statx assertions
+	 * below resolve paths through the mounted tree -- the namei/
+	 * lookup domain (T-024). SKIP until /erofs content is
+	 * reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Deliberately NO DATA_FACE guard here (unlike the content
+	 * case above): statx consumes the inode decode only --
+	 * nr_sectors is settled at decode time and the chunk index is
+	 * never read -- so this case activates with the namei/statx
+	 * face and never waits on the data-read half (S05 sec. 3 #11,
+	 * revision T-033/S01).
+	 */
+	ero_ensure_self_mnt();
+
+	TEST_SUCC(mount(EROFS_DEV_CHUNK4B, EROFS_SELF_MNT, "erofs", 0, NULL));
+	for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+		snprintf(path, sizeof(path), "%s/%s", EROFS_SELF_REG,
+			 rows[i].name);
+		TEST_SUCC(ero_statx(path, AT_SYMLINK_NOFOLLOW,
+				    STATX_BASIC_STATS, &stx));
+		/* D7/X7: st_size = i_size. */
+		TEST_RES(stx.stx_size, _ret == rows[i].size);
+		/* D12/X10: st_blocks = round_up(i_size, bs) >> 9. */
+		TEST_RES(stx.stx_blocks, _ret == rows[i].blocks);
+	}
+	TEST_SUCC(umount(EROFS_SELF_MNT));
+}
+END_TEST()
+
+/*
  * Matrix sec. 7.3 G-O06 (parity) + sec. 4.1 8-byte chunk face: D1
  * (concat) self-mounted WITHOUT any device= option (deployment form
  * 甲, T-016/S02 sec. 5.1) -- every data chunk entry is dev1/blob-local
@@ -737,6 +850,72 @@ FN_TEST(data_path_concat_sparse_hole_form_face)
 						   EROFS_SPARSE_HOLE_UNIT),
 			 _ret == 0);
 		TEST_SUCC(close(fd));
+	}
+	TEST_SUCC(umount(EROFS_SELF_MNT));
+}
+END_TEST()
+
+/*
+ * Matrix sec. 3.1 D7/D12 (parity), chunk-image statx halves on the
+ * self-mounted D1 concat (8-byte chunk entries, deployment form 甲):
+ * the same regular/ size ladder's st_size/st_blocks faces as the C12
+ * case above -- same formula, same frozen values
+ * (docs/T-033/S02/index.md sec. 2), independent carrier/assertion
+ * point. The concat geometry (dev1/blob-local chunks, G-O06 shift) is
+ * invisible to this face: the D12 accounting inputs are i_size and the
+ * 4k image block size only, never the chunk index. The vdq st_size
+ * assertions here ride the statx channel (X7), complementing the
+ * existing fstat-form assertions in the two content cases above; the
+ * sparse row asserts metadata only -- no content read (T-018/S07
+ * sec. 3 distortion, incl. the C11/D1 chunk0 beyond-device-end form).
+ */
+FN_TEST(data_path_concat_statx_size_blocks)
+{
+	static const struct {
+		const char *name;
+		unsigned long long size;
+		unsigned long long blocks;
+	} rows[] = {
+		{ "empty_file.bin", 0, 0 },
+		{ "file_1b.bin", 1, 8 },
+		{ "inline_64b.bin", 64, 8 },
+		{ "content_anchor.txt", 200, 8 },
+		{ "inline_4095b.bin", 4095, 8 },
+		{ "flat_4096b.bin", 4096, 8 },
+		{ "flat_4097b.bin", 4097, 16 },
+		{ "flat_16k_plus_100b.bin", 16588, 40 },
+		{ "sparse_hole.bin", 401408, 784 },
+	};
+	struct statx stx;
+	char path[256];
+	size_t i;
+
+	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_CONCAT);
+	/*
+	 * Activation-boundary guard (T-023/S08): the statx assertions
+	 * below resolve paths through the mounted tree -- the namei/
+	 * lookup domain (T-024). SKIP until /erofs content is
+	 * reachable.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
+	/*
+	 * Deliberately NO DATA_FACE guard here (same rationale as the
+	 * C12 statx case above: statx settles nr_sectors at
+	 * inode-decode time and never reads the chunk index; S05
+	 * sec. 3 #11, revision T-033/S01).
+	 */
+	ero_ensure_self_mnt();
+
+	TEST_SUCC(mount(EROFS_DEV_CONCAT, EROFS_SELF_MNT, "erofs", 0, NULL));
+	for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+		snprintf(path, sizeof(path), "%s/%s", EROFS_SELF_REG,
+			 rows[i].name);
+		TEST_SUCC(ero_statx(path, AT_SYMLINK_NOFOLLOW,
+				    STATX_BASIC_STATS, &stx));
+		/* D7/X7: st_size = i_size. */
+		TEST_RES(stx.stx_size, _ret == rows[i].size);
+		/* D12/X10: st_blocks = round_up(i_size, bs) >> 9. */
+		TEST_RES(stx.stx_blocks, _ret == rows[i].blocks);
 	}
 	TEST_SUCC(umount(EROFS_SELF_MNT));
 }
