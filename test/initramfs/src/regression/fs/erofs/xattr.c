@@ -733,8 +733,7 @@ FN_TEST(xattr_list_e2big_eager_gate)
 			     sizeof(seg1_buf)),
 		   E2BIG);
 	/* Eager gate: the user buffer is never written. */
-	TEST_RES(xv_matches_ch(seg1_buf, sizeof(seg1_buf), 'Z'),
-		 _ret == 0);
+	TEST_RES(xv_matches_ch(seg1_buf, sizeof(seg1_buf), 'Z'), _ret == 0);
 }
 END_TEST()
 

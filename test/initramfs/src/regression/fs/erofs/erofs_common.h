@@ -369,7 +369,7 @@ static inline int ero_check_content_path(const char *path, size_t size)
  */
 #define EROFS_XATTR_BIGLIST_NAMES 400
 #define EROFS_XATTR_BIGLIST_NAME_LEN 174 /* incl. "user.", excl. NUL */
-#define EROFS_XATTR_BIGLIST_TOTAL 70000  /* sum of (name_len + 1) */
+#define EROFS_XATTR_BIGLIST_TOTAL 70000 /* sum of (name_len + 1) */
 
 /*
  * Write name(i) -- EROFS_XATTR_BIGLIST_NAME_LEN bytes plus a NUL --
@@ -390,8 +390,7 @@ static inline void ero_xattr_biglist_name(char *dst, size_t i)
 	dst[k++] = (char)('0' + (i / 10) % 10);
 	dst[k++] = (char)('0' + i % 10);
 	dst[k++] = '-';
-	memset(dst + k, 'a' + (int)(i % 26),
-	       EROFS_XATTR_BIGLIST_NAME_LEN - k);
+	memset(dst + k, 'a' + (int)(i % 26), EROFS_XATTR_BIGLIST_NAME_LEN - k);
 	dst[EROFS_XATTR_BIGLIST_NAME_LEN] = '\0';
 }
 
