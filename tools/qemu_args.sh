@@ -81,12 +81,13 @@ if [ "$1" = "riscv" ]; then
     # `/dev/vda`, `/dev/vdb`, and `/dev/vdc`, respectively. RISC-V virtio-mmio
     # block devices are discovered in reverse command-line order, so list them in
     # the reverse of the desired device-node order.
-    # Conditionally-attached erofs images (x5..x19) are likewise listed in
+    # Conditionally-attached erofs images (x5..x20) are likewise listed in
     # reverse device order below. Guest vd letters are assigned sequentially
     # by device registration order (starting from /dev/vda), NOT by qemu drive
-    # id: with the 18 virtio disks of an erofs-only riscv boot they land on
-    # /dev/vdd../dev/vdr; /dev/vdf../dev/vdt only materializes when two more
+    # id: with the 19 virtio disks of an erofs-only riscv boot they land on
+    # /dev/vdd../dev/vds; /dev/vdf../dev/vdv only materializes when two more
     # virtio disks (e.g. the x86 xfstests pair x3/x4) precede them.
+    # (x20 = erofs_xattr_biglist.img, the T-032 crafted W-X07 carrier.)
     # TODO: Once UUID-based mounting is implemented, this strict ordering will no longer be required.
     EROFS_RISCV_EXTRA=""
     if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
@@ -106,6 +107,8 @@ if [ "$1" = "riscv" ]; then
             -drive if=none,format=raw,id=x17,file=./test/initramfs/build/erofs_chunk4b.img \
             -drive if=none,format=raw,id=x18,file=./test/initramfs/build/erofs_flatdev_concat.img \
             -drive if=none,format=raw,id=x19,file=./test/initramfs/build/erofs_flatdev_badtag.img \
+            -drive if=none,format=raw,id=x20,file=./test/initramfs/build/erofs_xattr_biglist.img \
+            -device virtio-blk-device,drive=x20 \
             -device virtio-blk-device,drive=x19 \
             -device virtio-blk-device,drive=x18 \
             -device virtio-blk-device,drive=x17 \
@@ -198,6 +201,7 @@ if [ "$1" = "tdx" ]; then
         -drive if=none,format=raw,id=x17,file=./test/initramfs/build/erofs_chunk4b.img \
         -drive if=none,format=raw,id=x18,file=./test/initramfs/build/erofs_flatdev_concat.img \
         -drive if=none,format=raw,id=x19,file=./test/initramfs/build/erofs_flatdev_badtag.img \
+        -drive if=none,format=raw,id=x20,file=./test/initramfs/build/erofs_xattr_biglist.img \
         -device virtio-blk-pci,bus=pcie.0,addr=0xc,drive=x5,serial=verofsbase,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
         -device virtio-blk-pci,bus=pcie.0,addr=0xd,drive=x6,serial=verofsblob,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
         -device virtio-blk-pci,bus=pcie.0,addr=0xe,drive=x7,serial=verofscpt,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
@@ -213,6 +217,7 @@ if [ "$1" = "tdx" ]; then
         -device virtio-blk-pci,bus=pcie.0,addr=0x18,drive=x17,serial=verofschunk4b,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
         -device virtio-blk-pci,bus=pcie.0,addr=0x19,drive=x18,serial=verofsconcat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
         -device virtio-blk-pci,bus=pcie.0,addr=0x1a,drive=x19,serial=verofsbadtag,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x1b,drive=x20,serial=verofsxbig,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off \
     "
     fi
     echo $QEMU_ARGS
@@ -262,6 +267,7 @@ if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
     -drive if=none,format=raw,id=x17,file=./test/initramfs/build/erofs_chunk4b.img \
     -drive if=none,format=raw,id=x18,file=./test/initramfs/build/erofs_flatdev_concat.img \
     -drive if=none,format=raw,id=x19,file=./test/initramfs/build/erofs_flatdev_badtag.img \
+    -drive if=none,format=raw,id=x20,file=./test/initramfs/build/erofs_xattr_biglist.img \
 "
 fi
 
@@ -344,6 +350,7 @@ if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
         -device virtio-blk-device,drive=x17,serial=verofschunk4b \
         -device virtio-blk-device,drive=x18,serial=verofsconcat \
         -device virtio-blk-device,drive=x19,serial=verofsbadtag \
+        -device virtio-blk-device,drive=x20,serial=verofsxbig \
     "
     else
         QEMU_ARGS="$QEMU_ARGS \
@@ -362,6 +369,7 @@ if [ "$ATTACH_EROFS_IMAGES" = "true" ]; then
         -device virtio-blk-pci,bus=pcie.0,addr=0x18,drive=x17,serial=verofschunk4b,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
         -device virtio-blk-pci,bus=pcie.0,addr=0x19,drive=x18,serial=verofsconcat,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
         -device virtio-blk-pci,bus=pcie.0,addr=0x1a,drive=x19,serial=verofsbadtag,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
+        -device virtio-blk-pci,bus=pcie.0,addr=0x1b,drive=x20,serial=verofsxbig,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off$IOMMU_DEV_EXTRA \
     "
     fi
 fi

@@ -66,13 +66,18 @@ EROFS_BLOB_IMAGE := $(BUILD_DIR)/erofs_blob.img
 EROFS_CHUNK4B_IMAGE := $(BUILD_DIR)/erofs_chunk4b.img
 EROFS_FLATDEV_CONCAT_IMAGE := $(BUILD_DIR)/erofs_flatdev_concat.img
 EROFS_FLATDEV_BADTAG_IMAGE := $(BUILD_DIR)/erofs_flatdev_badtag.img
+# T-032: crafted W-X07/XAT-38 big-list carrier (>65536B single-inode
+# name list; healthy mkfs cannot ingest it -- host-kernel listxattr
+# enumeration hard limit. Adjudication: docs/T-032/S02/index.md §2.4).
+EROFS_XATTR_BIGLIST_CRAFT := $(CUR_DIR)/erofs_xattr_biglist_craft.py
+EROFS_XATTR_BIGLIST_IMAGE := $(BUILD_DIR)/erofs_xattr_biglist.img
 EROFS_ALL_IMAGES := $(EROFS_BASE_IMAGE) $(EROFS_BASE_CPT_IMAGE) \
     $(EROFS_UUID0_IMAGE) $(EROFS_BS512_IMAGE) $(EROFS_BS1024_IMAGE) \
     $(EROFS_BS2048_IMAGE) $(EROFS_COMP_LZ4_IMAGE) \
     $(EROFS_XATTR_SHARED_ALL_IMAGE) $(EROFS_XATTR_NONE_IMAGE) \
     $(EROFS_PREFIX_IMAGE) $(EROFS_FLATDEV_IMAGE) $(EROFS_BLOB_IMAGE) \
     $(EROFS_CHUNK4B_IMAGE) $(EROFS_FLATDEV_CONCAT_IMAGE) \
-    $(EROFS_FLATDEV_BADTAG_IMAGE)
+    $(EROFS_FLATDEV_BADTAG_IMAGE) $(EROFS_XATTR_BIGLIST_IMAGE)
 # Interface constants (single source: docs/T-016/analysis.md §1;
 # blueprint: docs/T-016/S03/index.md §2.2).
 EROFS_UUID_BASE := e2e4f0c8-1a2b-4c3d-9e8f-5a6b7c8d9e0f
@@ -82,6 +87,10 @@ EROFS_XATTR_PREFIX := user.erofs_test.lpx.
 EROFS_FLATDEV_CHUNKSIZE := 4096
 EROFS_CHUNK4B_CHUNKSIZE := 32768
 EROFS_DEVT_SLOTOFF := 9
+# T-032: fixed UUID for the crafted big-list image (continues the
+# e2e4f0c8- family; single source for the value lives HERE -- the
+# craft script only consumes it via --uuid).
+EROFS_UUID_XATTR_BIGLIST := e2e4f0c8-1a2b-4c3d-9e8f-5a6b7c8d9e11
 
 # Include benchmark, if BENCHMARK is set.
 ifeq ($(BENCHMARK), none)
@@ -262,6 +271,13 @@ $(XFSTESTS_SCRATCH_IMAGE):
 # the stage tree) -> D1/D2 derived images. Version gate (erofs-utils 1.7.1)
 # rides the stage self-checks.
 #
+# The 16th product (EROFS-XATTR-BIGLIST, T-032) is NOT part of that
+# chain: it is crafted by erofs_xattr_biglist_craft.py through its own
+# self-contained pipeline (scratch tree + mkfs base + transform) and
+# reads neither erofs_tree/ nor the shared stage, so the 15 mkfs-family
+# digests stay untouched. Its own version gate (erofs-utils 1.7.1)
+# rides the craft script self-check.
+#
 # The dependency set lists files and directories, NOT symlinks: make stats
 # prerequisites through symlinks, and the deliberately dangling pattern
 # symlinks under erofs_tree/symlink/ (256B single-component targets >
@@ -338,6 +354,18 @@ $(EROFS_FLATDEV_BADTAG_IMAGE): $(EROFS_FLATDEV_IMAGE)
 # the field so the image tests a bad tag, not a broken checksum
 # (single-source formula: kernel-side checksummed_len()).
 	@python3 $(EROFS_SB_CSUM_FIX) $@
+
+# T-032: crafted W-X07/XAT-38 big-list carrier -- template-transform
+# (mkfs 374-name base -> re-emit the 400-name file unit -> SB patch +
+# crc32c recompute). Not a plain mkfs rule: a healthy mkfs cannot
+# ingest a >65536B single-inode name list (host-kernel listxattr
+# enumeration hard limit, tolerance-independent), so the XAT-38
+# crafted branch applies (docs/T-032/S02/index.md §2.4). The output
+# is byte-deterministic (fixed UUID, zeroed build times): its digest
+# gate is literal equality, not the SB-whitelist form.
+$(EROFS_XATTR_BIGLIST_IMAGE): $(EROFS_XATTR_BIGLIST_CRAFT)
+	@mkdir -p $(BUILD_DIR)
+	@python3 $(EROFS_XATTR_BIGLIST_CRAFT) --uuid $(EROFS_UUID_XATTR_BIGLIST) $@
 
 .PHONY: format
 format:

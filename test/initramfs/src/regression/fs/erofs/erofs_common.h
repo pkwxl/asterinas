@@ -57,12 +57,15 @@
 
 /*
  * Device path constants. The letters follow the erofs single-run
- * 18-disk complement (3 resident + 15 erofs disks); single source =
- * docs/T-020/S01/index.md §3.2 (errata chain: docs/T-019/S04/index.md
- * §6). Under the 20-disk co-existence complement every letter shifts by
- * two (vdf-vdt) and this whole block is invalid -- running the binaries
- * in that form is undefined behavior (T-020/S01 §3.1). Macro names are
- * image-semantic and map 1:1 to slot ids; do not hand-drift them.
+ * 19-disk complement (3 resident + 16 erofs disks; the 16th is the
+ * T-032 crafted big-list image); single source = docs/T-020/S01/
+ * index.md §3.2 for x5..x19 (errata chain: docs/T-019/S04/index.md
+ * §6) and docs/T-032/S02/index.md §5 + r1-baseline-matrix §9.2
+ * (revision T-032) for x20/vds. Under the 21-disk co-existence
+ * complement every letter shifts by two (vdf-vdv) and this whole
+ * block is invalid -- running the binaries in that form is undefined
+ * behavior (T-020/S01 §3.1). Macro names are image-semantic and map
+ * 1:1 to slot ids; do not hand-drift them.
  */
 #define EROFS_DEV_BASE "/dev/vdd" /* x5  C1  base (uniform-extended) */
 #define EROFS_DEV_BLOB "/dev/vde" /* x6  C11 attached blob (device=) */
@@ -80,6 +83,10 @@
 #define EROFS_DEV_CHUNK4B "/dev/vdp" /* x17 C12 chunk4b */
 #define EROFS_DEV_CONCAT "/dev/vdq" /* x18 D1  flatdev_concat */
 #define EROFS_DEV_BADTAG "/dev/vdr" /* x19 D2  flatdev_badtag */
+/* x20 C13 xattr_biglist -- W-X07/XAT-38 segments 2+3 carrier (T-032),
+ * crafted (template-transform; healthy mkfs cannot ingest a >65536B
+ * name list). Single source: docs/T-032/S02/index.md §2.4/§5. */
+#define EROFS_DEV_XATTR_BIGLIST "/dev/vds"
 
 /*
  * Self-guard predicate family (S05 §6, single point of implementation).
@@ -346,6 +353,46 @@ static inline int ero_check_content_path(const char *path, size_t size)
 	rc = ero_check_content_fd(fd, size);
 	close(fd);
 	return rc;
+}
+
+/*
+ * W-X07/XAT-38 big-list name formula (T-032; single source:
+ * docs/T-032/S02/index.md §4 -- the host material builder, the image
+ * craft script erofs_xattr_biglist_craft.py, and this helper are
+ * three same-formula implementations; never re-derive locally):
+ *   name(i) = "user." + "%04d"(i) + "-" + pad(i)*164,
+ *   pad(i) = 'a' + (i % 26), i in [0, EROFS_XATTR_BIGLIST_NAMES)
+ * Full name length 174B (175B per name incl. NUL as the listxattr
+ * contribution); the sum over all 400 names is exactly
+ * EROFS_XATTR_BIGLIST_TOTAL = 70000; entry value "V"; file body 'b'.
+ * The host entry on the crafted image is /xattr_biglist.bin.
+ */
+#define EROFS_XATTR_BIGLIST_NAMES 400
+#define EROFS_XATTR_BIGLIST_NAME_LEN 174 /* incl. "user.", excl. NUL */
+#define EROFS_XATTR_BIGLIST_TOTAL 70000  /* sum of (name_len + 1) */
+
+/*
+ * Write name(i) -- EROFS_XATTR_BIGLIST_NAME_LEN bytes plus a NUL --
+ * into dst. Hand-rolled formatting on purpose: this header's
+ * conventions avoid stdio (see ero_fs_registered).
+ */
+static inline void ero_xattr_biglist_name(char *dst, size_t i)
+{
+	size_t k = 0;
+
+	dst[k++] = 'u';
+	dst[k++] = 's';
+	dst[k++] = 'e';
+	dst[k++] = 'r';
+	dst[k++] = '.';
+	dst[k++] = (char)('0' + (i / 1000) % 10);
+	dst[k++] = (char)('0' + (i / 100) % 10);
+	dst[k++] = (char)('0' + (i / 10) % 10);
+	dst[k++] = (char)('0' + i % 10);
+	dst[k++] = '-';
+	memset(dst + k, 'a' + (int)(i % 26),
+	       EROFS_XATTR_BIGLIST_NAME_LEN - k);
+	dst[EROFS_XATTR_BIGLIST_NAME_LEN] = '\0';
 }
 
 /*
