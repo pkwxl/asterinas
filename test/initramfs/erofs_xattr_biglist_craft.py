@@ -98,13 +98,21 @@ def crc32c(data: bytes) -> int:
 
 def version_gate() -> None:
     """mkfs.erofs version gate, bound to 1.7.1 (erofs_stage.sh #1 shape)."""
+    # Single-pipe capture (stderr -> stdout, write order) mirrors the
+    # shell "2>&1" capture of erofs_env_check.sh [E1]: 1.7.1 prints the
+    # usage to stderr but the "mkfs.erofs 1.7.1" version line to stdout
+    # LAST, so write-order merge ends with the version line. Capturing
+    # the two pipes separately and concatenating stdout + stderr puts
+    # the whole usage after the version line and the "tail line" ends up
+    # being the compressor list -- unparseable (T-032/S03 B1 fix).
     try:
-        r = subprocess.run(["mkfs.erofs"], capture_output=True, text=True)
+        r = subprocess.run(["mkfs.erofs"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True)
     except FileNotFoundError:
         die("mkfs.erofs ABSENT (erofs-utils not installed)")
     if r.returncode == 0:
         die("mkfs.erofs no-arg call exited 0 (expected usage, rc != 0)")
-    lines = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.strip()]
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     tail = lines[-1] if lines else ""
     versions = re.findall(r"[0-9]+(?:\.[0-9]+)+", tail)
     found = versions[-1] if versions else ""
