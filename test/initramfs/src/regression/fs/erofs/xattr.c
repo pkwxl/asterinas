@@ -2,7 +2,8 @@
 
 /*
  * erofs xattr assertions (T-020/S14; matrix sec. 6.1/6.2/6.4/6.5/6.6
- * healthy halves -- S05 sec. 3 file #12).
+ * healthy halves -- S05 sec. 3 file #12; W-X07 E2BIG three-segment
+ * family added by T-032/S04).
  *
  * Faces and carriers:
  *   - get value matrix on the persistent init mount MNT = /erofs
@@ -26,6 +27,15 @@
  *     X34 two-phase size=0 totals, X36 undersized-buffer ERANGE with
  *     whole-batch discard (zero-touch); the acl hosts' list faces ride
  *     here as the W-X02 state-B registered difference;
+ *   - W-X07/XAT-38 E2BIG three-segment family (added T-032/S04):
+ *     segment 1 on an MNT host (small healthy list + list_len=70000
+ *     -> E2BIG, the eager syscall size gate ahead of any erofs
+ *     action); segments 2+3 on the self-mounted crafted big-list
+ *     image (x20/vds, one inode whose user.* name list totals 70000B
+ *     exactly -- a healthy mkfs cannot produce such a list, see the
+ *     segments-2+3 test header): list_len=30000 -> ERANGE and the
+ *     exact-boundary list_len=65536 -> ERANGE, both whole-batch
+ *     zero-touch, plus the size=0 total cross-check (X34);
  *   - write family on MNT: W-X01 state-B EROFS for every resolvable
  *     name and flag form, F21 order negatives (flags/empty name/
  *     oversize value first), and the registered W-X05/W-X01 residues
@@ -44,7 +54,7 @@
  *     the on-disk prefix table, XAT-17 initramfs half).
  *
  * Guards: MNT tests use EROFS_SKIP_IF_NO_INIT_MNT() (mount-success
- * evidence, S05 sec. 6 extension 2); the four self-mount tests use
+ * evidence, S05 sec. 6 extension 2); the five self-mount tests use
  * EROFS_SKIP_IF_NO_DEV() (device present AND erofs registered,
  * extension 1) and mount/umount the single self-mount point serially
  * inside the FN_TEST. The init mount point is never unmounted or
@@ -62,9 +72,12 @@
  * write_ero_fs.c (this file carries the xattr-specific W-X01 face);
  * every crafted half rides the ktest FX-XATTR fixtures (T-015): entry
  * overrunning remaining, dead indexes, contradictory bloom, shared id
- * out of range, garbage prefix metadata, the XAT-17 prefix
- * concatenation negatives, and the E2BIG three-segment family (XAT-38,
- * no healthy-tree list is large enough); the G-X09 non-reg/dir half
+ * out of range, garbage prefix metadata, and the XAT-17 prefix
+ * concatenation negatives (revision T-032/S04: the E2BIG three-segment
+ * family XAT-38 no longer rides the ktest half -- that parking rested
+ * on an FX fixture face T-028/S11 sec. 6-1 disproved; it is carried by
+ * THIS file now, segment 1 on MNT and segments 2+3 on the crafted
+ * big-list image, see the W-X07 tests); the G-X09 non-reg/dir half
  * (user.* on symlink/device/fifo/socket hosts carrying a user.* entry)
  * needs symlink-host xattr material absent from the S01 tree and is
  * degraded to FX-XATTR per S05 sec. 8 case B -- this file carries only
@@ -81,7 +94,9 @@
  * state B / W-X04 / W-X05 / W-X08 registered differences); materials
  * T-016/S01 sec. 3.4/3.6 (hosts, names, values, chmod/chown faces);
  * image variants T-016/S02 sec. 2 (C8/C9/C10 mkfs forms; digest-pinned
- * by T-018).
+ * by T-018); W-X07 segment expectations and the big-list carrier:
+ * T-015/S07 XAT-38 row + T-032/S02 sec. 2.4/sec. 4 (name formula
+ * single source; the erofs_common.h helper is its C spelling).
  *
  * One first-ATTACH erratum is recorded inline (T-024/S06 round 3),
  * a premise correction at the framework level with the erofs side
@@ -669,6 +684,133 @@ FN_TEST(xattr_list_visibility_root)
 	 */
 	TEST_RES(xv_check_list(XV_MNT "/acl_file.bin", NULL, 0, 0), _ret == 0);
 	TEST_RES(xv_check_list(XV_MNT "/acl_dir", NULL, 0, 0), _ret == 0);
+}
+END_TEST()
+
+/*
+ * Matrix sec. 6.2 W-X07/XAT-38 segment 1 (registered difference): a
+ * small healthy list queried with list_len=70000 -> aster E2BIG. The
+ * syscall layer guards the size eagerly and strictly (list_len >
+ * XATTR_LIST_MAX 65536 -> E2BIG, ahead of namespace choice, writer
+ * construction, and path lookup alike -- erofs never acts on it);
+ * Linux clamps the size to XATTR_LIST_MAX and succeeds, returning the
+ * actual list length.
+ *
+ * AUTO-DECISION (segment-1 host): the matrix sample parameterizes a
+ * 100B list; no staged host totals exactly 100B, and the aster face
+ * (the eager size gate) is independent of the list length, so any
+ * healthy xattr host carries the segment. Chosen: the probe host
+ * xattr_user_short.bin (7B list); the Linux note below quotes the
+ * sample's "returns the actual length" shape with this host's actual
+ * length inline.
+ *
+ * Guard note: the E2BIG here is a pure syscall-layer gate that fires
+ * before any erofs xattr action, so -- like the write-family and fd
+ * tests above -- this test carries only the INIT_MNT guard, no
+ * EROFS_SKIP_IF_NO_XATTR_FACE().
+ */
+FN_TEST(xattr_list_e2big_eager_gate)
+{
+	/*
+	 * Real readable region of the full registered size: the eager
+	 * gate never reads it, but the handed-over region must still be
+	 * genuinely readable (same -Wstringop-overread staging shape as
+	 * the W-X01 F21 buffer below). sizeof() locks buffer and
+	 * syscall size together by construction.
+	 */
+	static char seg1_buf[70000];
+
+	EROFS_SKIP_IF_NO_INIT_MNT();
+
+	memset(seg1_buf, 0x5A, sizeof(seg1_buf));
+	/*
+	 * 登记差异(W-X07 segment 1): Linux clamps size to
+	 * XATTR_LIST_MAX and succeeds -- the sample's 100B list returns
+	 * 100; this host's 7B list ("user.v\0") would return 7; aster
+	 * answers E2BIG eagerly.
+	 */
+	TEST_ERRNO(listxattr(XV_MNT "/xattr_user_short.bin", seg1_buf,
+			     sizeof(seg1_buf)),
+		   E2BIG);
+	/* Eager gate: the user buffer is never written. */
+	TEST_RES(xv_matches_ch(seg1_buf, sizeof(seg1_buf), 'Z'),
+		 _ret == 0);
+}
+END_TEST()
+
+/*
+ * Matrix sec. 6.2 W-X07/XAT-38 segments 2+3 on the crafted big-list
+ * image C13 (x20/vds, T-032): one inode, /xattr_biglist.bin, whose
+ * user.* name list totals EROFS_XATTR_BIGLIST_TOTAL = 70000B exactly
+ * (400 names, formula single source erofs_common.h). A healthy mkfs
+ * cannot produce such a list -- ingest goes through llistxattr and
+ * the kernel listxattr face refuses to enumerate a list over
+ * XATTR_LIST_MAX (T-032/S02 sec. 2.4/7.4) -- which is exactly why
+ * the carrier is a template-transform crafted image.
+ *
+ * Segment 2 (parity, mid-size equal-outcome negative contrast):
+ * list_len=30000 -> aster ERANGE = Linux ERANGE. Segment 3
+ * (registered difference, post-erratum boundary instance):
+ * list_len=65536 -> aster ERANGE (the syscall strictly-greater gate
+ * 65536 > 65536 is false, so the FS X36 per-entry accumulation
+ * answers) vs Linux E2BIG (size clamped to XATTR_LIST_MAX is still
+ * too small -- promotion after clamping). Both ERANGEs discard the
+ * whole batch before any name read (zero-touch), and the size=0
+ * two-phase call pins the exact total.
+ */
+FN_TEST(xattr_list_biglist_erange_gates)
+{
+	static char seg2_buf[30000];
+	static char seg3_buf[65536];
+
+	EROFS_SKIP_IF_NO_DEV(EROFS_DEV_XATTR_BIGLIST);
+	/*
+	 * Activation-boundary guards, same shape as the other
+	 * self-mounted modulated-image tests: the probes below walk
+	 * into the mounted tree and read on-image xattrs -- the namei
+	 * domain (T-024) plus the xattr value face (T-026). SKIP until
+	 * the xattr face is served.
+	 */
+	EROFS_SKIP_IF_NO_INIT_MNT();
+	EROFS_SKIP_IF_NO_XATTR_FACE();
+	ero_ensure_self_mnt();
+
+	TEST_SUCC(mount(EROFS_DEV_XATTR_BIGLIST, EROFS_SELF_MNT, "erofs", 0,
+			NULL));
+
+	/*
+	 * X34 two-phase cross-evidence: size=0 returns the exact
+	 * would-write total (the formula sum, never re-derived).
+	 */
+	TEST_RES(listxattr(EROFS_SELF_MNT "/xattr_biglist.bin", NULL, 0),
+		 _ret == EROFS_XATTR_BIGLIST_TOTAL);
+
+	/*
+	 * Segment 2 (parity): undersized -> ERANGE (= Linux ERANGE,
+	 * the mid-size equal-outcome negative contrast).
+	 */
+	memset(seg2_buf, 0x5A, sizeof(seg2_buf));
+	TEST_ERRNO(listxattr(EROFS_SELF_MNT "/xattr_biglist.bin", seg2_buf,
+			     sizeof(seg2_buf)),
+		   ERANGE);
+	/* X36 whole-batch discard: the user buffer is untouched. */
+	TEST_RES(xv_matches_ch(seg2_buf, sizeof(seg2_buf), 'Z'), _ret == 0);
+
+	/*
+	 * 登记差异(W-X07 segment 3, post-erratum boundary): the
+	 * strictly-greater syscall gate 65536 > 65536 is false, so the
+	 * FS X36 accumulation answers ERANGE; Linux clamps size to
+	 * XATTR_LIST_MAX first and, still short of the 70000B list,
+	 * promotes to E2BIG.
+	 */
+	memset(seg3_buf, 0x5A, sizeof(seg3_buf));
+	TEST_ERRNO(listxattr(EROFS_SELF_MNT "/xattr_biglist.bin", seg3_buf,
+			     sizeof(seg3_buf)),
+		   ERANGE);
+	/* X36 whole-batch discard: the user buffer is untouched. */
+	TEST_RES(xv_matches_ch(seg3_buf, sizeof(seg3_buf), 'Z'), _ret == 0);
+
+	TEST_SUCC(umount(EROFS_SELF_MNT));
 }
 END_TEST()
 
